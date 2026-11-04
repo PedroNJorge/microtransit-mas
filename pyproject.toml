@@ -1,0 +1,7 @@
+[project]
+name = "microtransit-mas"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "spade>=4.1.4",
+]
