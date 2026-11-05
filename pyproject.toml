@@ -3,6 +3,7 @@ name = "microtransit-mas"
 version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
+    "networkx>=3.7",
     "pytest>=9.2.0",
     "spade>=4.1.4",
     "sqlalchemy[asyncio]>=2.1.8",

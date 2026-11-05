@@ -134,7 +134,7 @@ class MicrohubNode:
 
 @concept
 @dataclass
-class StagingPoint:
+class StagingPoint: # places to wait inbetween microhubs
     """Passive environmental object (managed by Environment, used by hubs)."""
     id: str
     location: str                       # node id or "x,y"
