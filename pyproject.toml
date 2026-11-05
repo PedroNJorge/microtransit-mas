@@ -3,5 +3,11 @@ name = "microtransit-mas"
 version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
+    "pytest>=9.2.0",
     "spade>=4.1.4",
+    "sqlalchemy[asyncio]>=2.1.8",
 ]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]        # pytest ≥ 7 has this built-in, no plugin needed
+testpaths = ["tests"]  # optional: where to look for tests
