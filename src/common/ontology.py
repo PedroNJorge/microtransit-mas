@@ -548,8 +548,8 @@ def _convert(tp, value, strict: bool = False):
         return from_dict(tp, value, strict)
     if isinstance(tp, type) and issubclass(tp, Enum):
         return tp(value)
-    if tp is int and isinstance(value, bool):
-        raise ValueError("bool passed for int field")
+    if tp in (int, float) and isinstance(value, bool):
+        raise ValueError("bool passed for numeric field")
     if tp is float and isinstance(value, (int, float)) and not isinstance(value, bool):
         return float(value)
     return value
