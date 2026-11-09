@@ -23,3 +23,15 @@ WIDEN_DETOUR = 300.0        # seconds of extra detour allowed on each retry
 VALUE_OF_TIME = 0.004       # EUR per second until pickup (= 14.40 EUR per hour of waiting)
 VALUE_OF_DETOUR = 0.004     # EUR per second of detour imposed on the riders
 VALUE_OF_REPUTATION = 0.25  # EUR per reputation point below the maximum (5)
+
+# ---- Driver (Milestone 6) --------------------------------------------------------------------
+T_PROVISIONAL = 60.0        # a bid's provisional lock expires after this (CC-02); must exceed
+                            # T_AWARD + network delay (GC-17)
+T_STATUS = 30.0             # DriverStatus heartbeat (DriverStatusProtocol)
+T_NO_SHOW = 120.0           # driver waits this long for a rider at the pickup (FE-05)
+T_REPOSITION = 30.0         # hub waits this long for an answer to a reposition request
+DWELL_PICKUP = 15.0         # seconds spent boarding riders
+DWELL_DROPOFF = 10.0        # seconds spent per drop-off
+DRIVER_BASE_COST = 2.0      # EUR fixed cost of taking a job (the driver's true cost c_i, see
+DRIVER_COST_PER_SECOND = 0.004   # docs/auction_mechanism.md) + EUR per second driven (empty or loaded)
+DRIVER_CAPACITY = 4

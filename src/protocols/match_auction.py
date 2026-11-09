@@ -135,7 +135,7 @@ class _Start(_AuctionState):
             rider_time_windows={r.request_id: [r.time_window_start, r.time_window_end] for r in reqs},
             passenger_count=len(reqs), auction_deadline=now + hub.t_auction, max_total_fare=reserve,
             max_detour=min(r.detour_tolerance for r in reqs) + ctx.attempt * hub.widen_detour,
-            attempt=ctx.attempt)
+            attempt=ctx.attempt, rider_jids=[ctx.rider_jids[r.request_id] for r in reqs])
         note(ctx, START, "auction opens", riders=len(reqs), reserve=reserve,
              max_detour=ctx.cfp.max_detour, deadline=round(ctx.cfp.auction_deadline, 1),
              pricing=hub.rules.pricing)
@@ -147,7 +147,7 @@ class _CfpSent(_AuctionState):
 
     async def step(self):
         ctx, hub = self.ctx, self.agent
-        ctx.recipients = list(hub.driver_jids)
+        ctx.recipients = hub.eligible_drivers(clock.now())          # CC-08
         for jid in ctx.recipients:
             await self.send(make_cfp(jid, ctx.cfp))
         note(ctx, CFP_SENT, "cfp sent", drivers=len(ctx.recipients))
@@ -205,6 +205,10 @@ class _Collecting(_AuctionState):
         ctx.responded.add(sender)
         # price is the driver's; the reputation is the hub's own view, never the driver's claim
         bid = replace(bid, driver_id=sender, reputation=hub.reputation_of(sender))
+        hub_eta = hub.hub_eta(sender, ctx.cfp.pickup_node, clock.now())
+        if hub_eta is not None and abs(hub_eta - bid.eta) > 1e-6:           # CC-10: the hub's ETA counts
+            note(ctx, COLLECTING_BIDS, "eta recomputed", driver=sender, claimed=bid.eta, hub=round(hub_eta, 1))
+            bid = replace(bid, eta=hub_eta)
         ctx.bids.append(bid)
         note(ctx, COLLECTING_BIDS, "bid", driver=sender, price=bid.price, eta=bid.eta,
              detour=bid.max_detour, rep=bid.reputation)

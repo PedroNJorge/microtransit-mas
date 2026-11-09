@@ -262,6 +262,9 @@ class CFP:
     max_detour: float = 0.0             # seconds
     attempt: int = 0
     constraints: Dict[str, float] = field(default_factory=dict)
+    # JID of each rider, aligned with rider_destinations AND with the key order of
+    # rider_time_windows (request ids). The winning driver needs them to run the trip.
+    rider_jids: List[str] = field(default_factory=list)
 
 
 @concept

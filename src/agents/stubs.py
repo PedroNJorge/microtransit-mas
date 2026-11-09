@@ -20,8 +20,8 @@ from agents.base_agent import BaseAgent
 from common import clock
 from common.messages import make_message, make_propose, make_refuse, make_request, make_template
 from common.ontology import (
-    AuctionOutcome, Bid, CFP, Escrow, EscrowRequest, MatchResult, Perf, Pool, Protocol, TripRequest,
-    parse_payload,
+    AuctionOutcome, Bid, CFP, DriverArriving, Escrow, EscrowRequest, MatchResult, Perf, Pool, Protocol,
+    RiderBoarded, RiderDroppedOff, RiderReady, Settlement, TripRequest, parse_payload,
 )
 from protocols.payment_common import bare
 
@@ -111,6 +111,20 @@ class _RiderListener(CyclicBehaviour):
             r.events.append(("refused", msg.body)); r.done.set()
         elif proto == Protocol.ESCROW:
             r.events.append(("escrow", payload if payload is not None else msg.body))
+        elif proto == Protocol.TRIP_EXECUTION:
+            if isinstance(payload, DriverArriving):
+                r.events.append(("arriving", payload))
+                if not r.no_show:
+                    await asyncio.sleep(clock.to_real(r.ready_after))
+                    await self.send(make_message(
+                        bare(msg.sender), Perf.INFORM, Protocol.TRIP_EXECUTION,
+                        RiderReady(payload.request_id, payload.pool_id, clock.now()), payload.pool_id))
+            elif isinstance(payload, RiderBoarded):
+                r.events.append(("boarded", payload))
+            elif isinstance(payload, RiderDroppedOff):
+                r.events.append(("dropped", payload)); r.trip_done.set()
+        elif proto == Protocol.SETTLEMENT and isinstance(payload, Settlement):
+            r.events.append(("settled", payload))
         elif proto == Protocol.MATCH_AUCTION and isinstance(payload, MatchResult):
             r.events.append(("matched", payload)); r.done.set()
         elif proto == Protocol.MATCH_AUCTION and isinstance(payload, AuctionOutcome):
@@ -121,12 +135,15 @@ class ScriptedRider(BaseAgent):
     role = "rider"
 
     def __init__(self, jid: str, password: str, hub_jid: str = "", payment_jid: Optional[str] = None,
-                 request: Optional[TripRequest] = None, auto_request: bool = True, **kwargs):
+                 request: Optional[TripRequest] = None, auto_request: bool = True,
+                 no_show: bool = False, ready_after: float = 5.0, **kwargs):
         super().__init__(jid, password, **kwargs)
         self.hub_jid, self.payment_jid, self.request = hub_jid, payment_jid, request
         self.auto_request = auto_request
         self.events: List[Tuple[str, object]] = []
         self.done = asyncio.Event()
+        self.trip_done = asyncio.Event()
+        self.no_show, self.ready_after = no_show, ready_after
 
     def kinds(self) -> List[str]:
         return [k for k, _ in self.events]
@@ -139,6 +156,8 @@ class ScriptedRider(BaseAgent):
         self.add_behaviour(_RiderListener(), make_template(Protocol.TRIP_REQUEST))
         self.add_behaviour(_RiderListener(), make_template(Protocol.ESCROW))
         self.add_behaviour(_RiderListener(), make_template(Protocol.MATCH_AUCTION))
+        self.add_behaviour(_RiderListener(), make_template(Protocol.TRIP_EXECUTION))
+        self.add_behaviour(_RiderListener(), make_template(Protocol.SETTLEMENT))
         if self.auto_request and self.request:
             self.send_request()
 
