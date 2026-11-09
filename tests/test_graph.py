@@ -257,28 +257,37 @@ def test_route_through_chains_legs():
         net.route_through([])
 
 
-def test_detour_seconds_and_ratio():
+def test_detour_seconds_and_tolerance_check():
     net = grid()
     stops = ["n1_1", "n1_4", "n4_4", "n4_1"]
     assert net.detour_seconds("n1_1", "n1_4", stops) == 0
     # shared: 3 + 3 + 3 blocks = 540 s; direct n1_1 -> n4_1: 3 blocks = 180 s
     assert net.detour_seconds("n1_1", "n4_1", stops) == 360
-    assert net.detour_ratio("n1_1", "n4_1", stops) == pytest.approx(2.0)
-    assert net.detour_ratio("n1_1", "n1_4", stops) == 0
+    assert net.detour_within("n1_1", "n4_1", stops, tolerance=360)        # boundary is inclusive
+    assert not net.detour_within("n1_1", "n4_1", stops, tolerance=359.9)
+    assert net.detour_within("n1_1", "n1_4", stops, tolerance=0)
     with pytest.raises(ValueError):
-        net.detour_ratio("n4_1", "n1_1", stops)                # wrong order
+        net.detour_seconds("n4_1", "n1_1", stops)                # wrong order
     with pytest.raises(ValueError):
-        net.detour_ratio("n1_1", "n0_0", stops)                # not in stops
+        net.detour_seconds("n1_1", "n0_0", stops)                # not in stops
+    assert not hasattr(net, "detour_ratio")                      # seconds only, by design
 
 
-def test_detour_unreachable_is_none_or_inf():
+def test_zero_direct_time_is_not_a_problem():
+    net = grid()
+    stops = ["n1_1", "n1_1", "n1_3"]                             # origin == dest: direct = 0
+    assert net.detour_seconds("n1_1", "n1_1", stops) == 0
+    assert net.detour_within("n1_1", "n1_1", stops, tolerance=0)
+
+
+def test_detour_unreachable_is_none_and_not_within():
     net = make_net()
     net.add_node("Y", 0, 0)
     net.add_road("C", "Y", 10, bidirectional=False)
     assert net.detour_seconds("A", "Y", ["A", "C", "Y"]) is not None
     net.add_disruption(closure("d", ["C|Y"]))
     assert net.detour_seconds("A", "Y", ["A", "C", "Y"], t=5) is None
-    assert net.detour_ratio("A", "Y", ["A", "C", "Y"], t=5) == math.inf
+    assert not net.detour_within("A", "Y", ["A", "C", "Y"], tolerance=1e9, t=5)
 
 
 def test_best_stop_order_is_deterministic_and_dedupes():

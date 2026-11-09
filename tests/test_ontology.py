@@ -29,12 +29,12 @@ from common import messages as m
 # ------------------------------------------------------------------
 
 def _request(rid="req1", rider="rider1"):
-    return TripRequest(rid, rider, "hubA", "home1", 0.0, 600.0, 1.5, 12.0, True, False, 5.0)
+    return TripRequest(rid, rider, "hubA", "home1", 0.0, 600.0, 180.0, 12.0, True, False, 5.0)
 
 
 def _bid(**kw):
     base = dict(bid_id="b1", driver_id="d1", pool_id="p1", price=8.5, eta=120.0,
-                max_detour=1.2, capacity_available=3)
+                max_detour=120.0, capacity_available=3)
     base.update(kw)
     return Bid(**base)
 
