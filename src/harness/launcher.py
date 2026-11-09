@@ -104,6 +104,10 @@ class Harness:
                 network=self.network,
                 subscribers=[s.jid for s in sc.roster() if s.role in ("microhub", "driver")],
                 t_traffic=sc.t_traffic, full_every=sc.full_every)
+        if spec.role == "microhub":
+            kwargs.update(
+                network=self.network, payment_jid=sc.jid("payment"),
+                driver_jids=[s.jid for s in sc.roster() if s.role == "driver"])
         return AGENT_CLASSES[spec.role](spec.jid, sc.xmpp.password, port=sc.xmpp.port, **kwargs)
 
     async def start(self) -> None:
