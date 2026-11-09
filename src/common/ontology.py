@@ -64,6 +64,7 @@ class Protocol:
 class Perf:
     """FIPA-ACL performatives used in this system."""
     REQUEST = "request"
+    AGREE = "agree"          # TripRequestProtocol: the hub will process the request
     CFP = "cfp"
     PROPOSE = "propose"
     REFUSE = "refuse"
@@ -119,6 +120,8 @@ class FailureReason(str, Enum):
     TIMEOUT = "TIMEOUT"
     OUTBID = "OUTBID"          # losing bidder in a successful auction
     NO_BIDS = "NO_BIDS"        # auction closed with zero valid bids
+    INVALID_BID = "INVALID_BID"  # bid rejected by the hub's validity checks (GC-09 still
+                                 # requires every bidder to be answered)
 
 
 # ==========================================
