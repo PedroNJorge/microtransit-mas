@@ -134,7 +134,7 @@ class MicrohubNode:
 
 @concept
 @dataclass
-class StagingPoint: # places to wait inbetween microhubs
+class StagingPoint:
     """Passive environmental object (managed by Environment, used by hubs)."""
     id: str
     location: str                       # node id or "x,y"
@@ -456,12 +456,23 @@ class Rating:
 @concept
 @dataclass
 class TrafficUpdate:
-    """FULL snapshot of every edge's base travel time (not a delta). Disruptions are
-    an overlay: effective_time = edge_weights[e] * severity (or blocked if closed),
-    persisting until Disruption.end_time regardless of later snapshots."""
+    """Base travel times of road edges. Receivers apply it by OVERWRITING the listed edges.
+
+    full_snapshot=True  : edge_weights lists EVERY edge (a receiver may replace its state).
+    full_snapshot=False : DELTA. edge_weights lists only edges whose base time changed since
+                          the previous update (possibly empty); a receiver that has not yet
+                          seen a full snapshot must wait for one (the Environment sends one
+                          on first contact and every `full_every` updates).
+    Edge keys are the network's wire ids ("a|b"); the network class defines the convention.
+
+    Disruptions are an overlay and independent of these updates:
+    effective_time = edge_weights[e] * severity (or blocked if closed), persisting until
+    Disruption.end_time regardless of later updates.
+    """
     update_id: str
     timestamp: float
-    edge_weights: Dict[str, float]      # "nodeA|nodeB" -> travel time
+    edge_weights: Dict[str, float]      # "nodeA|nodeB" -> travel time (s)
+    full_snapshot: bool = True
 
 
 @concept
