@@ -22,8 +22,14 @@ Schema (all sections but "graph" and "hubs" are optional):
   "drivers": {"count": 2, "start_hubs": ["hub_trindade"]},   # default: round-robin over hubs
   "riders":  {"count": 2},
   "environment": {"t_traffic": 60, "full_every": 10},
+  "payment": {"rider_balance": 100.0, "subsidy_discount": 0.5,
+              "subsidy_budget": null, "hold_max": 7200},
   "seed": 42
 }
+payment: rider_balance = wallet each rider gets on their first escrow request (simulation
+endowment); subsidy_discount = share of the fare rebated to subsidy-eligible riders;
+subsidy_budget = size of the subsidy fund (null = unlimited); hold_max = sim seconds after
+which an unsettled escrow is returned to the rider.
 Unknown keys are rejected (a typo must not silently fall back to a default).
 """
 import json
@@ -31,7 +37,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
-from common.settings import FULL_SNAPSHOT_EVERY, T_TRAFFIC
+from common.settings import FULL_SNAPSHOT_EVERY, SUBSIDY_DISCOUNT, T_ESCROW_HOLD_MAX, T_TRAFFIC
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]       # <root>/src/harness/scenario.py
 DEFAULT_SCENARIO = PROJECT_ROOT / "config" / "scenario.json"
@@ -73,6 +79,10 @@ class Scenario:
     n_riders: int = 2
     t_traffic: float = T_TRAFFIC
     full_every: int = FULL_SNAPSHOT_EVERY
+    rider_balance: float = 100.0
+    subsidy_discount: float = SUBSIDY_DISCOUNT
+    subsidy_budget: Optional[float] = None
+    escrow_hold_max: float = T_ESCROW_HOLD_MAX
     seed: int = 42
     source: Optional[Path] = None              # file it was loaded from (None: from_dict)
 
@@ -84,7 +94,10 @@ class Scenario:
         """Every agent of the scenario, in a sensible start order (the Environment last, so
         its recipients already exist when the first traffic update goes out)."""
         specs: List[AgentSpec] = []
-        for role in ("payment", "regulator", "reputation"):
+        specs.append(AgentSpec("payment", "payment", self.jid("payment"), {
+            "default_rider_balance": self.rider_balance, "subsidy_discount": self.subsidy_discount,
+            "subsidy_budget": self.subsidy_budget, "hold_max": self.escrow_hold_max}))
+        for role in ("regulator", "reputation"):
             specs.append(AgentSpec(role, role, self.jid(role)))
         for hid in self.hub_ids:
             specs.append(AgentSpec("microhub", hid, self.jid(hid), {"hub_id": hid}))
@@ -123,7 +136,7 @@ class Scenario:
     @classmethod
     def from_dict(cls, data: dict, default_name: str = "scenario") -> "Scenario":
         _only_keys(data, {"name", "xmpp", "clock", "graph", "hubs", "drivers", "riders",
-                          "environment", "seed"}, "scenario")
+                          "environment", "payment", "seed"}, "scenario")
         for required in ("graph", "hubs"):
             if required not in data:
                 raise ScenarioError(f"scenario: missing required key {required!r}")
@@ -172,6 +185,20 @@ class Scenario:
         e = dict(data.get("environment", {}))
         _only_keys(e, {"t_traffic", "full_every"}, "environment")
 
+        p = dict(data.get("payment", {}))
+        _only_keys(p, {"rider_balance", "subsidy_discount", "subsidy_budget", "hold_max"}, "payment")
+        discount = _num(p.get("subsidy_discount", SUBSIDY_DISCOUNT), "payment.subsidy_discount")
+        if not 0.0 <= discount <= 1.0:
+            raise ScenarioError(f"payment.subsidy_discount must be in [0, 1] (got {discount})")
+        budget = p.get("subsidy_budget")
+        if budget is not None:
+            budget = _num(budget, "payment.subsidy_budget")
+            if budget < 0:
+                raise ScenarioError("payment.subsidy_budget must be >= 0 or null")
+        rider_balance = _num(p.get("rider_balance", 100.0), "payment.rider_balance")
+        if rider_balance < 0:
+            raise ScenarioError("payment.rider_balance must be >= 0")
+
         return cls(name=str(data.get("name", default_name)), graph_path=graph_path,
                    hub_ids=hub_ids, xmpp=xmpp, speed=speed, n_drivers=n_drivers,
                    driver_start_hubs=list(start_hubs), n_riders=n_riders,
@@ -179,6 +206,10 @@ class Scenario:
                                   positive=True),
                    full_every=_int(e.get("full_every", FULL_SNAPSHOT_EVERY),
                                    "environment.full_every", 1),
+                   rider_balance=rider_balance, subsidy_discount=discount,
+                   subsidy_budget=budget,
+                   escrow_hold_max=_num(p.get("hold_max", T_ESCROW_HOLD_MAX), "payment.hold_max",
+                                        positive=True),
                    seed=_int(data.get("seed", 42), "seed", 0))
 
 

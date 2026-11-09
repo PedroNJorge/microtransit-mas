@@ -327,6 +327,10 @@ class TripCompleted:
     rider_ids: List[str]
     completed_at: float
     distance_km: float = 0.0
+    # Final PRE-subsidy fare per rider (MatchResult.rider_fares). Escrow is taken before the
+    # auction, so it holds an upper bound; Payment charges THIS and returns the rest.
+    # Empty -> charge each rider's full held amount.
+    rider_fares: Dict[str, float] = field(default_factory=dict)
 
 
 # TripExecutionProtocol: per-rider granularity (pooled riders board/alight separately).
@@ -398,8 +402,11 @@ class EscrowRequest:
     request_id: str
     rider_id: str
     pool_id: str
-    amount: float
+    amount: float                       # upper bound the rider may be charged (held in full)
     subsidy_eligible: bool = False
+    hub_id: str = ""                    # hub to notify (escrow_confirmed / escrow_failed) and the
+                                        # only agent allowed to settle or refund this escrow.
+                                        # Empty: nobody is notified (standalone use / tests).
 
 
 @concept
@@ -420,9 +427,23 @@ class Settlement:
     escrow_id: str
     driver_id: str
     driver_payout: float
-    subsidy_applied: float = 0.0
+    subsidy_applied: float = 0.0        # rebate credited to the rider's wallet; paid from the
+                                        # subsidy fund, never taken from the driver's payout
     platform_fee: float = 0.0           # MVP: always 0. If non-zero it is recorded but not
                                         # disbursed (no Platform/Treasury agent yet).
+    excess_returned: float = 0.0        # part of the hold not charged (held - fare), returned
+
+
+@concept
+@dataclass
+class SettlementComplete:
+    """Payment -> Hub: every escrow named in TripCompleted has been settled."""
+    pool_id: str
+    driver_id: str
+    escrow_ids: List[str]
+    total_paid: float                   # to the driver
+    total_subsidy: float                # rebated to riders
+    total_returned: float               # unused hold returned to riders
 
 
 @concept

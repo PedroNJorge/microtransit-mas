@@ -20,12 +20,16 @@ def _port_open(port):
 
 
 @pytest.fixture(scope="session")
-def xmpp_server():
-    """Throw-away in-memory SPADE XMPP server on non-default ports.
-    Agents must pass port=XMPP_PORT."""
+def xmpp_server(tmp_path_factory):
+    """Throw-away SPADE XMPP server on non-default ports. Agents must pass port=XMPP_PORT.
+
+    The account database is a temporary FILE, not `--memory`: with --memory the server keeps
+    accounts in an in-memory SQLite database that can end up empty on another connection
+    ("no such table: credentials"), after which every new agent hangs while connecting."""
+    db = tmp_path_factory.mktemp("xmpp") / "server.db"
     proc = subprocess.Popen(
-        [sys.executable, "-m", "spade.cli", "run", "--host", "localhost", "--memory",
-         "--client_port", str(XMPP_PORT), "--server_port", str(SERVER_PORT)],
+        [sys.executable, "-m", "spade.cli", "run", "--host", "localhost", "--db", str(db),
+         "--purge", "--client_port", str(XMPP_PORT), "--server_port", str(SERVER_PORT)],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     for _ in range(100):
         if _port_open(XMPP_PORT):

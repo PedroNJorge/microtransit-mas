@@ -110,6 +110,12 @@ def test_resolve_by_name_jid_and_role():
     ({"environment": {"t_traffic": 0}}, "t_traffic"),
     ({"environment": {"full_every": 0}}, "full_every"),
     ({"seed": -1}, "seed"),
+    ({"payment": {"rider_balanse": 5}}, "unknown keys"),
+    ({"payment": {"subsidy_discount": 1.5}}, "subsidy_discount"),
+    ({"payment": {"subsidy_discount": -0.1}}, "subsidy_discount"),
+    ({"payment": {"subsidy_budget": -1}}, "subsidy_budget"),
+    ({"payment": {"rider_balance": -1}}, "rider_balance"),
+    ({"payment": {"hold_max": 0}}, "hold_max"),
     ({"graph": "config/nope.json"}, "Graph file not found"),
 ])
 def test_invalid_scenarios_are_rejected(patch, msg):
@@ -138,3 +144,15 @@ def test_absolute_graph_path_and_name_default(tmp_path):
     f.write_text(json.dumps({"graph": str(GRAPH), "hubs": [HUBS[0]]}))
     s = Scenario.load(f)
     assert s.graph_path == Path(GRAPH) and s.name == "mine"
+
+
+def test_payment_section_defaults_and_roster_kwargs():
+    pay = next(r for r in make().roster() if r.role == "payment")
+    assert pay.kwargs == {"default_rider_balance": 100.0, "subsidy_discount": 0.5,
+                          "subsidy_budget": None, "hold_max": 7200.0}
+    s = make(payment={"rider_balance": 30, "subsidy_discount": 0.25, "subsidy_budget": 500,
+                      "hold_max": 600})
+    pay = next(r for r in s.roster() if r.role == "payment")
+    assert pay.kwargs == {"default_rider_balance": 30.0, "subsidy_discount": 0.25,
+                          "subsidy_budget": 500.0, "hold_max": 600.0}
+    assert [r.role for r in s.roster()][:3] == ["payment", "regulator", "reputation"]

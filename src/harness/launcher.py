@@ -8,8 +8,8 @@ Start every agent of a scenario, keep them running, stop them cleanly.
     python -m harness.launcher --run-for 30            # stop by itself after 30 real seconds
     python -m harness.launcher --no-server             # use an XMPP server you started yourself
 
-XMPP server: if nothing listens on xmpp.port the launcher starts SPADE's in-memory server
-(`python -m spade.cli run --memory`) and stops it on exit. Pass --no-server to disable that.
+XMPP server: if nothing listens on xmpp.port the launcher starts SPADE's server with a temporary
+database file (`python -m spade.cli run --db ...`) and stops it on exit. Pass --no-server to disable that.
 
 Start order: payment, regulator, reputation, hubs, drivers, riders, environment (last, so its
 subscribers exist when the first TrafficUpdate goes out). Stop order is the reverse.
@@ -19,8 +19,10 @@ import argparse
 import asyncio
 import logging
 import signal
+import shutil
 import socket
 import sys
+import tempfile
 from typing import Dict, List, Optional, Sequence
 
 from agents.base_agent import BaseAgent
@@ -49,6 +51,7 @@ class Harness:
         self.agents: Dict[str, BaseAgent] = {}          # jid -> agent, in start order
         self.network: Optional[TransitNetwork] = None
         self._server: Optional[asyncio.subprocess.Process] = None
+        self._server_dir: Optional[str] = None
 
     # ---- XMPP server -----------------------------------------------------------------
     async def ensure_server(self, wait: float = 20.0) -> None:
@@ -57,9 +60,14 @@ class Harness:
             return
         if not self.start_server:
             raise RuntimeError(f"No XMPP server on {x.host}:{x.port} (and --no-server is set)")
-        logger.info("Starting in-memory XMPP server on %s:%d", x.host, x.port)
+        logger.info("Starting XMPP server on %s:%d", x.host, x.port)
+        # Accounts live in a temporary FILE database, not `--memory`: the in-memory SQLite
+        # database can end up empty on another connection ("no such table: credentials") and
+        # then every new agent hangs while connecting.
+        self._server_dir = tempfile.mkdtemp(prefix="mas-xmpp-")
         self._server = await asyncio.create_subprocess_exec(
-            sys.executable, "-m", "spade.cli", "run", "--host", x.host, "--memory",
+            sys.executable, "-m", "spade.cli", "run", "--host", x.host,
+            "--db", f"{self._server_dir}/server.db", "--purge",
             "--client_port", str(x.port), "--server_port", str(x.server_port),
             stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
             start_new_session=True)
@@ -83,6 +91,9 @@ class Harness:
                 self._server.kill()
                 await self._server.wait()
         self._server = None
+        if self._server_dir:
+            shutil.rmtree(self._server_dir, ignore_errors=True)
+            self._server_dir = None
 
     # ---- agents ---------------------------------------------------------------------
     def build_agent(self, spec: AgentSpec) -> BaseAgent:
