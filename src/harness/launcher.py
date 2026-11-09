@@ -104,6 +104,9 @@ class Harness:
                 network=self.network,
                 subscribers=[s.jid for s in sc.roster() if s.role in ("microhub", "driver")],
                 t_traffic=sc.t_traffic, full_every=sc.full_every)
+        if spec.role == "driver":
+            kwargs.update(network=self.network, payment_jid=sc.jid("payment"),
+                          hub_jids=[s.jid for s in sc.roster() if s.role == "microhub"])
         if spec.role == "microhub":
             kwargs.update(
                 network=self.network, payment_jid=sc.jid("payment"),
