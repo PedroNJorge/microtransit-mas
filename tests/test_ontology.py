@@ -358,3 +358,13 @@ def test_template_matches_only_intended_messages():
     assert not tpl.match(m.make_propose("hub@x", _bid(pool_id="p2")))            # other auction
     assert not tpl.match(m.make_refuse("hub@x", "p1", "locked"))                 # other performative
     assert not tpl.match(m.make_inform("x@y", Protocol.ESCROW, SAMPLES["Escrow"], "p1"))
+
+
+def test_traffic_update_delta_roundtrip():
+    full = SAMPLES["TrafficUpdate"]
+    assert full.full_snapshot is True                         # default: backwards compatible
+    delta = TrafficUpdate("tu2", 120.0, {"a|b": 33.0}, full_snapshot=False)
+    out = deserialize(serialize(delta), TrafficUpdate, strict=True)
+    assert out == delta and out.full_snapshot is False
+    empty = TrafficUpdate("tu3", 180.0, {}, full_snapshot=False)
+    assert deserialize(serialize(empty), TrafficUpdate) == empty
