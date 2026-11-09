@@ -19,7 +19,7 @@ from common.ontology import (
     TripFailed, RepositionRequest, EscrowRequest, Escrow, Settlement, Refund,
     Rating, TrafficUpdate, Disruption, AuditReport, Penalty, OverflowRequest,
     DemandForecast, EscrowStatus, DriverState, PoolStatus, DisruptionType,
-    FailureReason,
+    FailureReason, Ping, Pong,
 )
 from common import messages as m
 
@@ -72,6 +72,8 @@ SAMPLES = {
     "Penalty": Penalty("hubA", "fare cap violation", 50.0),
     "OverflowRequest": OverflowRequest("hubA", FailureReason.HUB_FAILED, [_request()]),
     "DemandForecast": DemandForecast("hubA", 0.0, 900.0, 12.5),
+    "Ping": Ping("ping-1", 10.0),
+    "Pong": Pong("ping-1", "hub_trindade@localhost", "microhub", 10.0, 10.2),
 }
 
 
@@ -368,3 +370,18 @@ def test_traffic_update_delta_roundtrip():
     assert out == delta and out.full_snapshot is False
     empty = TrafficUpdate("tu3", 180.0, {}, full_snapshot=False)
     assert deserialize(serialize(empty), TrafficUpdate) == empty
+
+
+def test_ping_pong_helpers_thread_and_reply():
+    ping = Ping("ping-7", 3.0)
+    req = m.make_ping("hub@x", ping)
+    assert req.get_metadata("performative") == Perf.REQUEST
+    assert req.get_metadata("protocol") == Protocol.HEARTBEAT
+    assert req.thread == "ping-7" and parse_payload(req, strict=True) == ping
+    req.sender = "tester@x"
+    pong = Pong("ping-7", "hub@x", "microhub", 3.0, 3.1)
+    rep = m.make_pong(req, pong)
+    assert str(rep.to) == "tester@x" and rep.thread == "ping-7"
+    assert rep.get_metadata("performative") == Perf.INFORM
+    assert rep.get_metadata("protocol") == Protocol.HEARTBEAT
+    assert parse_payload(rep, strict=True) == pong

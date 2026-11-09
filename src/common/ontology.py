@@ -58,6 +58,7 @@ class Protocol:
     DISRUPTION = "DisruptionProtocol"
     INTER_HUB = "InterHubCoordinationProtocol"
     DEMAND_FORECAST = "DemandForecastProtocol"
+    HEARTBEAT = "HeartbeatProtocol"                 # ping/pong liveness check (every agent)
 
 
 class Perf:
@@ -506,6 +507,27 @@ class Penalty:
     target_id: str
     reason: str
     amount: float
+
+
+# --- Heartbeat (every agent answers) --------------------------------------
+
+@concept
+@dataclass
+class Ping:
+    """Anyone -> Agent: request(Ping). thread == ping_id."""
+    ping_id: str
+    sent_at: float                      # sim time
+
+
+@concept
+@dataclass
+class Pong:
+    """Agent -> sender: inform(Pong), same thread. Proves the agent is up and its role."""
+    ping_id: str
+    agent_id: str                       # the agent's JID
+    role: str                           # rider, driver, microhub, payment, ...
+    ping_sent_at: float                 # echoed from Ping.sent_at
+    replied_at: float                   # sim time
 
 
 # --- Inter-hub -------------------------------------------------------------

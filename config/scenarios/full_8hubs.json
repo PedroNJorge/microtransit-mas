@@ -1,0 +1,11 @@
+{
+  "name": "full-8hubs",
+  "xmpp": {"host": "localhost", "port": 5222, "server_port": 5269, "password": "dev-password"},
+  "clock": {"speed": 60},
+  "graph": "config/porto_graph.json",
+  "hubs": "all",
+  "drivers": {"count": 4},
+  "riders": {"count": 4},
+  "environment": {"t_traffic": 60, "full_every": 10},
+  "seed": 42
+}

@@ -42,9 +42,9 @@ import logging
 import math
 from typing import Callable, Dict, Iterable, List, Optional, Protocol as TypingProtocol
 
-from spade.agent import Agent
 from spade.behaviour import OneShotBehaviour, PeriodicBehaviour
 
+from agents.base_agent import BaseAgent
 from common import clock
 from common.messages import make_inform
 from common.ontology import Protocol, TrafficUpdate
@@ -94,7 +94,9 @@ class SendFullSnapshot(OneShotBehaviour):
                                     thread=update.update_id))
 
 
-class EnvironmentAgent(Agent):
+class EnvironmentAgent(BaseAgent):
+    role = "environment"
+
     def __init__(self, jid: str, password: str, network: TrafficNetwork,
                  subscribers: Optional[Iterable[str]] = None,
                  t_traffic: float = T_TRAFFIC,
@@ -177,4 +179,5 @@ class EnvironmentAgent(Agent):
 
     # ---- lifecycle -----------------------------------------------------------------
     async def setup(self):
+        await super().setup()                 # answers pings
         self.add_behaviour(TrafficUpdateBehaviour(period=clock.to_real(self.t_traffic)))
