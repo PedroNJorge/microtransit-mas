@@ -58,6 +58,7 @@ class Protocol:
     DISRUPTION = "DisruptionProtocol"
     INTER_HUB = "InterHubCoordinationProtocol"
     DEMAND_FORECAST = "DemandForecastProtocol"
+    HEARTBEAT = "HeartbeatProtocol"                 # ping/pong liveness check (every agent)
 
 
 class Perf:
@@ -152,7 +153,7 @@ class TripRequest:
     destination_home: str
     time_window_start: float
     time_window_end: float
-    detour_tolerance: float
+    detour_tolerance: float             # SECONDS of extra ride time accepted vs a direct trip
     max_fare: float
     pooling_willingness: bool
     subsidy_eligibility: bool
@@ -240,7 +241,7 @@ class PoolProposal:
     shared_route: List[str]
     split_fare: float
     estimated_wait: float
-    added_detour: float = 0.0
+    added_detour: float = 0.0           # seconds of extra ride time for this rider
 
 
 @concept
@@ -255,7 +256,7 @@ class CFP:
     passenger_count: int
     auction_deadline: float
     max_total_fare: float                        # min(rider max_fares, policy cap)
-    max_detour: float = 0.0
+    max_detour: float = 0.0             # seconds
     attempt: int = 0
     constraints: Dict[str, float] = field(default_factory=dict)
 
@@ -268,7 +269,7 @@ class Bid:
     pool_id: str
     price: float
     eta: float
-    max_detour: float
+    max_detour: float                   # seconds
     capacity_available: int
     attempt: int = 0                    # auction retry number (FE-01); same pool_id on retry
     provisional: bool = True            # wire-level always True; becomes firm only on
@@ -506,6 +507,27 @@ class Penalty:
     target_id: str
     reason: str
     amount: float
+
+
+# --- Heartbeat (every agent answers) --------------------------------------
+
+@concept
+@dataclass
+class Ping:
+    """Anyone -> Agent: request(Ping). thread == ping_id."""
+    ping_id: str
+    sent_at: float                      # sim time
+
+
+@concept
+@dataclass
+class Pong:
+    """Agent -> sender: inform(Pong), same thread. Proves the agent is up and its role."""
+    ping_id: str
+    agent_id: str                       # the agent's JID
+    role: str                           # rider, driver, microhub, payment, ...
+    ping_sent_at: float                 # echoed from Ping.sent_at
+    replied_at: float                   # sim time
 
 
 # --- Inter-hub -------------------------------------------------------------

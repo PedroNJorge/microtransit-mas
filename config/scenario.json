@@ -1,0 +1,11 @@
+{
+  "name": "dev-4hubs",
+  "xmpp": {"host": "localhost", "port": 5222, "server_port": 5269, "password": "dev-password"},
+  "clock": {"speed": 60},
+  "graph": "config/porto_graph.json",
+  "hubs": ["hub_trindade", "hub_campanha", "hub_casa_da_musica", "hub_senhora_da_hora"],
+  "drivers": {"count": 2},
+  "riders": {"count": 2},
+  "environment": {"t_traffic": 60, "full_every": 10},
+  "seed": 42
+}

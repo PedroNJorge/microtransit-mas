@@ -19,7 +19,7 @@ from common.ontology import (
     TripFailed, RepositionRequest, EscrowRequest, Escrow, Settlement, Refund,
     Rating, TrafficUpdate, Disruption, AuditReport, Penalty, OverflowRequest,
     DemandForecast, EscrowStatus, DriverState, PoolStatus, DisruptionType,
-    FailureReason,
+    FailureReason, Ping, Pong,
 )
 from common import messages as m
 
@@ -29,12 +29,12 @@ from common import messages as m
 # ------------------------------------------------------------------
 
 def _request(rid="req1", rider="rider1"):
-    return TripRequest(rid, rider, "hubA", "home1", 0.0, 600.0, 1.5, 12.0, True, False, 5.0)
+    return TripRequest(rid, rider, "hubA", "home1", 0.0, 600.0, 180.0, 12.0, True, False, 5.0)
 
 
 def _bid(**kw):
     base = dict(bid_id="b1", driver_id="d1", pool_id="p1", price=8.5, eta=120.0,
-                max_detour=1.2, capacity_available=3)
+                max_detour=120.0, capacity_available=3)
     base.update(kw)
     return Bid(**base)
 
@@ -72,6 +72,8 @@ SAMPLES = {
     "Penalty": Penalty("hubA", "fare cap violation", 50.0),
     "OverflowRequest": OverflowRequest("hubA", FailureReason.HUB_FAILED, [_request()]),
     "DemandForecast": DemandForecast("hubA", 0.0, 900.0, 12.5),
+    "Ping": Ping("ping-1", 10.0),
+    "Pong": Pong("ping-1", "hub_trindade@localhost", "microhub", 10.0, 10.2),
 }
 
 
@@ -368,3 +370,18 @@ def test_traffic_update_delta_roundtrip():
     assert out == delta and out.full_snapshot is False
     empty = TrafficUpdate("tu3", 180.0, {}, full_snapshot=False)
     assert deserialize(serialize(empty), TrafficUpdate) == empty
+
+
+def test_ping_pong_helpers_thread_and_reply():
+    ping = Ping("ping-7", 3.0)
+    req = m.make_ping("hub@x", ping)
+    assert req.get_metadata("performative") == Perf.REQUEST
+    assert req.get_metadata("protocol") == Protocol.HEARTBEAT
+    assert req.thread == "ping-7" and parse_payload(req, strict=True) == ping
+    req.sender = "tester@x"
+    pong = Pong("ping-7", "hub@x", "microhub", 3.0, 3.1)
+    rep = m.make_pong(req, pong)
+    assert str(rep.to) == "tester@x" and rep.thread == "ping-7"
+    assert rep.get_metadata("performative") == Perf.INFORM
+    assert rep.get_metadata("protocol") == Protocol.HEARTBEAT
+    assert parse_payload(rep, strict=True) == pong

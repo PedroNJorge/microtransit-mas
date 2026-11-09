@@ -16,7 +16,7 @@ from spade.template import Template
 
 from common.ontology import (
     ONTOLOGY, Perf, Protocol, create_message,
-    CFP, Bid, MatchResult, AuctionOutcome, FailureReason, PoolProposal,
+    CFP, Bid, MatchResult, AuctionOutcome, FailureReason, PoolProposal, Ping, Pong,
 )
 
 
@@ -107,6 +107,20 @@ def make_pool_proposal(to: str, proposal: PoolProposal) -> Message:
     """Hub -> Rider."""
     return make_message(to, Perf.PROPOSE, Protocol.POOL_FORMATION, proposal,
                         thread=proposal.pool_id)
+
+
+# ------------------------------------------------------------------
+# HeartbeatProtocol (thread == ping_id)
+# ------------------------------------------------------------------
+
+def make_ping(to: str, ping: Ping) -> Message:
+    """Anyone -> Agent."""
+    return make_message(to, Perf.REQUEST, Protocol.HEARTBEAT, ping, thread=ping.ping_id)
+
+
+def make_pong(ping_msg: Message, pong: Pong) -> Message:
+    """Agent -> the sender of `ping_msg`."""
+    return make_reply(ping_msg, Perf.INFORM, pong, Protocol.HEARTBEAT)
 
 
 # ------------------------------------------------------------------

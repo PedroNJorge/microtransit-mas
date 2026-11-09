@@ -363,8 +363,9 @@ class TransitNetwork:
 
     def detour_seconds(self, origin: str, dest: str, stops: List[str],
                        t: float = 0.0) -> Optional[float]:
-        """Extra ride time (s) for a rider on the shared route `stops` versus going direct.
-        None if either is unreachable."""
+        """Extra ride time in SECONDS for a rider on the shared route `stops` versus going
+        direct (compare with TripRequest.detour_tolerance, also seconds). None if either is
+        unreachable. Detours are absolute seconds, never ratios: no division, no 0/0."""
         if origin not in stops or dest not in stops:
             raise ValueError("origin and dest must both be in stops")
         i, j = stops.index(origin), stops.index(dest)
@@ -376,15 +377,12 @@ class TransitNetwork:
             return None
         return shared[1] - direct
 
-    def detour_ratio(self, origin: str, dest: str, stops: List[str], t: float = 0.0) -> float:
-        """(shared - direct) / direct; inf if unreachable or direct == 0. Compare with
-        TripRequest.detour_tolerance (decide and document whether that is a ratio or seconds;
-        use detour_seconds() for the absolute version)."""
+    def detour_within(self, origin: str, dest: str, stops: List[str], tolerance: float,
+                      t: float = 0.0) -> bool:
+        """True if the rider's extra ride time on the shared route is <= tolerance (seconds,
+        i.e. TripRequest.detour_tolerance). False if either leg is unreachable at t."""
         extra = self.detour_seconds(origin, dest, stops, t)
-        direct = self.travel_time(origin, dest, t)
-        if extra is None or direct == 0 or math.isinf(direct):
-            return math.inf
-        return extra / direct
+        return extra is not None and extra <= tolerance
 
     def best_stop_order(self, pickup: str, dropoffs: List[str], t: float = 0.0
                         ) -> Optional[Tuple[List[str], float]]:
