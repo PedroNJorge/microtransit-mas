@@ -49,6 +49,9 @@ async def test_harness_starts_everyone_and_all_answer_pings(xmpp_server):
         assert by_jid["hub_trindade@localhost"] == "microhub"
         assert h.agents["driver_01@localhost"].start_hub == "hub_trindade"
         assert h.agents["hub_campanha@localhost"].hub_id == "hub_campanha"
+        pay = h.agents["payment@localhost"]                           # configured from the scenario
+        assert pay.ledger.default_rider_balance == 100.0 and pay.ledger.subsidy_discount == 0.5
+        assert pay.ledger.unlimited_subsidy and pay.hold_max == 7200.0
     assert not h.agents                                               # stopped and cleared
 
 
@@ -149,6 +152,12 @@ def test_manual_ping_reaches_a_running_system(tmp_path):
                                 str(f)], capture_output=True, text=True, timeout=60,
                                env=_env(), cwd=PROJECT_ROOT)
         assert every.returncode == 0, every.stdout + every.stderr
+        # the payment demo against the running system (scenario found through the marker)
+        demo = subprocess.run([sys.executable, "-m", "harness.demo_payment", "--live"],
+                              capture_output=True, text=True, timeout=90, env=_env(),
+                              cwd=PROJECT_ROOT)
+        assert demo.returncode == 0, demo.stdout + demo.stderr
+        assert "ALL CHECKS PASSED" in demo.stdout and "      FAIL " not in demo.stdout
         # no --scenario: ping finds the running launcher's scenario through the marker
         implicit = subprocess.run([sys.executable, "-m", "harness.ping", "--all"],
                                   capture_output=True, text=True, timeout=60, env=_env(),
@@ -166,3 +175,18 @@ def test_manual_ping_reaches_a_running_system(tmp_path):
         except subprocess.TimeoutExpired:
             launcher.kill()
     assert not (tmp_path / "run" / "active_scenario.json").exists()       # cleaned on exit
+
+
+def test_payment_demo_standalone_checks_the_balances(tmp_path):
+    f = _scenario_file(tmp_path, _free_port(), _free_port())
+    p = subprocess.run([sys.executable, "-m", "harness.demo_payment", "--scenario", str(f)],
+                       capture_output=True, text=True, timeout=90, env=_env(), cwd=PROJECT_ROOT)
+    assert p.returncode == 0, p.stdout + p.stderr
+    assert "ALL CHECKS PASSED" in p.stdout and "      FAIL " not in p.stdout
+    assert "driver was paid exactly 21.00" in p.stdout and "books balance: True" in p.stdout
+
+
+def test_payment_demo_live_needs_a_running_launcher(tmp_path):
+    p = subprocess.run([sys.executable, "-m", "harness.demo_payment", "--live"],
+                       capture_output=True, text=True, timeout=30, env=_env(), cwd=PROJECT_ROOT)
+    assert p.returncode == 2 and "start `python -m harness.launcher` first" in p.stderr
