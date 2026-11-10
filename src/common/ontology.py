@@ -221,6 +221,7 @@ class ReputationScore:
     score: float                        # bounded [1, 5]
     num_ratings: int                    # evidence count (publish only above threshold)
     updated_at: float = 0.0
+    pending_settlement: bool = False    # ID-07: some counted rating was published before settlement
 
     def __post_init__(self):
         if not 1 <= self.score <= 5:
@@ -526,6 +527,38 @@ class AuditReport:
     zone_service_share: Dict[str, float]
     fare_violations: int
     compliant: bool
+
+
+@concept
+@dataclass
+class AuditRequest:
+    """Regulator -> Hub: request(audit_logs, time_period)."""
+    audit_id: str
+    period_start: float
+    period_end: float
+
+
+@concept
+@dataclass
+class AuditTrip:
+    """One awarded (or failed) pool in a hub's log."""
+    pool_id: str
+    awarded_at: float
+    final_fare: float                   # 0 when unmatched
+    matched: bool
+    zone: str = ""                      # destination zone (equity reporting)
+    driver_id: str = ""
+
+
+@concept
+@dataclass
+class AuditData:
+    """Hub -> Regulator: inform(audit_data, trip_logs, fare_data)."""
+    audit_id: str
+    hub_id: str
+    period_start: float
+    period_end: float
+    trips: List[AuditTrip] = field(default_factory=list)
 
 
 @concept

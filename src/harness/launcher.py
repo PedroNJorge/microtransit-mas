@@ -105,18 +105,25 @@ class Harness:
                 subscribers=[s.jid for s in sc.roster() if s.role in ("microhub", "driver")],
                 t_traffic=sc.t_traffic, full_every=sc.full_every)
         hubs = [x for x in sc.roster() if x.role == "microhub"]
+        drivers = [x for x in sc.roster() if x.role == "driver"]
+        if spec.role == "regulator":
+            kwargs.update(hub_jids=[x.jid for x in hubs], driver_jids=[x.jid for x in drivers],
+                          payment_jid=sc.jid("payment"))
+        if spec.role == "payment":
+            kwargs.update(reputation_jid=sc.jid("reputation"), regulator_jid=sc.jid("regulator"))
         if spec.role == "rider":
             kwargs.update(network=self.network, payment_jid=sc.jid("payment"),
                           reputation_jid=sc.jid("reputation"), hub_jids={x.name: x.jid for x in hubs})
         if spec.role == "reputation":
-            kwargs.update(hub_jids=[x.jid for x in hubs])
+            kwargs.update(hub_jids=[x.jid for x in hubs], payment_jid=sc.jid("payment"))
         if spec.role == "driver":
             kwargs.update(network=self.network, payment_jid=sc.jid("payment"),
+                          regulator_jid=sc.jid("regulator"), reputation_jid=sc.jid("reputation"),
                           hub_jids=[s.jid for s in sc.roster() if s.role == "microhub"])
         if spec.role == "microhub":
             kwargs.update(
                 network=self.network, payment_jid=sc.jid("payment"), reputation_jid=sc.jid("reputation"),
-                driver_jids=[s.jid for s in sc.roster() if s.role == "driver"])
+                regulator_jid=sc.jid("regulator"), driver_jids=[s.jid for s in sc.roster() if s.role == "driver"])
         return AGENT_CLASSES[spec.role](spec.jid, sc.xmpp.password, port=sc.xmpp.port, **kwargs)
 
     async def start(self) -> None:

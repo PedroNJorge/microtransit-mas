@@ -127,8 +127,9 @@ class _Start(_AuctionState):
         ctx.started_at = now
         reqs = ctx.pool.requests
         reserve = min(r.max_fare for r in reqs) * len(reqs)     # an equal split never exceeds any max_fare
-        if hub.fare_cap is not None:
-            reserve = min(reserve, hub.fare_cap)
+        cap = hub.current_fare_cap(now)                          # RI-01: a bid above the cap cannot win
+        if cap is not None:
+            reserve = min(reserve, cap)
         ctx.cfp = CFP(
             pool_id=ctx.pool_id, hub_id=hub.hub_id, pickup_node=hub.hub_id,
             rider_destinations=[r.destination_home for r in reqs],

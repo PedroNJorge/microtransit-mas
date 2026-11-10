@@ -56,14 +56,17 @@ class _Receive(State):
 
 
 class _Handle(State):
-    def __init__(self, ctx: _Context, handler: Handler):
+    def __init__(self, ctx: _Context, handler: Handler, before=None):
         super().__init__()
         self.ctx = ctx
         self.handler = handler
+        self.before = before
 
     async def run(self):
         msg = self.ctx.msg
         try:
+            if self.before is not None:
+                await self.before(self.agent)               # e.g. a queued-settlement backlog (FE-08)
             self.ctx.outbox = list(self.handler(self.agent, msg))
         except Exception as e:                          # see module docstring
             logger.exception("%s: handler failed on message from %s", self.agent.jid, msg.sender)
@@ -89,14 +92,15 @@ class _Reply(State):
 class ServerFSM(FSMBehaviour):
     """RECEIVE -> HANDLE -> REPLY loop around `handler`. Register it with a Template."""
 
-    def __init__(self, handler: Handler):
+    def __init__(self, handler: Handler, before=None):
         self._handler = handler
+        self._before = before
         super().__init__()
 
     def setup(self):
         ctx = _Context()
         self.add_state(RECEIVE, _Receive(ctx), initial=True)
-        self.add_state(HANDLE, _Handle(ctx, self._handler))
+        self.add_state(HANDLE, _Handle(ctx, self._handler, self._before))
         self.add_state(REPLY, _Reply(ctx))
         self.add_transition(RECEIVE, RECEIVE)
         self.add_transition(RECEIVE, HANDLE)

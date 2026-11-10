@@ -34,17 +34,18 @@ import logging
 import math
 import uuid
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence
+from typing import Callable, Dict, List, Optional, Sequence
 
 from spade.behaviour import CyclicBehaviour, OneShotBehaviour
 
 from agents.base_agent import BaseAgent
 from common import clock
 from common.auction import ceil_cents
+from common.policy import PolicyBook
 from common.lock import DriverLock, LockReason, LockState
 from common.messages import make_inform, make_message, make_propose, make_refuse, make_template
 from common.ontology import (
-    AuctionOutcome, Bid, CFP, DriverArriving, DriverState, DriverStatus, FailureReason, MatchResult,
+    AuctionOutcome, Bid, CFP, Policy, Rating, DriverArriving, DriverState, DriverStatus, FailureReason, MatchResult,
     Perf, Protocol, RepositionRequest, RiderBoarded, RiderDroppedOff, RiderReady, Settlement,
     TripCompleted, TripFailed, parse_payload,
 )
@@ -142,6 +143,53 @@ class SettlementReceiver(CyclicBehaviour):
             self.agent.payouts.append(s)
 
 
+class PolicyReceiver(CyclicBehaviour):
+    """PolicyProtocol (RI-04). The fare cap reaches the driver through the CFP reserve; the driver
+    only acknowledges, and refuses what it cannot accept (stale, conflicting, malformed, not from the Regulator)."""
+
+    async def run(self):
+        msg = await self.receive(timeout=1)
+        if msg is None:
+            return
+        d = self.agent
+        try:
+            policy = parse_payload(msg, strict=True)
+            if not isinstance(policy, Policy):
+                raise ValueError("not a Policy")
+            if not d.regulator_jid or bare(msg.sender) != d.regulator_jid:
+                reason = "unknown_regulator"
+            else:
+                ack = d.policies.offer(policy)
+                reason = "" if ack.ok else ack.reason
+        except (ValueError, TypeError):
+            reason = "malformed"
+        await self.send(make_message(str(msg.sender), Perf.REFUSE if reason else Perf.AGREE,
+                                     Protocol.POLICY, reason or None, msg.thread))
+
+
+class CompletionReceiver(CyclicBehaviour):
+    """The hub marked the trip completed -> now (ID-08) the driver may rate the riders it drove."""
+
+    async def run(self):
+        msg = await self.receive(timeout=1)
+        if msg is None:
+            return
+        d = self.agent
+        try:
+            done = parse_payload(msg, strict=True)
+        except (ValueError, TypeError):
+            return
+        a = d.finished_trips.get(getattr(done, "pool_id", ""))
+        if not (isinstance(done, TripCompleted) and a is not None and bare(msg.sender) == a.hub
+                and done.pool_id not in d.rated and d.reputation_jid):
+            return
+        d.rated.add(done.pool_id)
+        for rider in a.dropped:
+            score = int(min(5, max(1, d.rate_riders_with(a))))
+            r = Rating(f"trip-{done.pool_id}", d.me, rider, score)
+            await self.send(make_inform(d.reputation_jid, Protocol.REPUTATION, r, r.trip_id))
+
+
 class TripRunner(OneShotBehaviour):
     """TripExecutionProtocol, driver side. Runs only while the lock is FIRM."""
 
@@ -184,7 +232,9 @@ class DriverAgent(BaseAgent):
                  cost_per_second: float = DRIVER_COST_PER_SECOND, t_provisional: float = T_PROVISIONAL,
                  t_status: float = T_STATUS, t_no_show: float = T_NO_SHOW,
                  dwell_pickup: float = DWELL_PICKUP, dwell_dropoff: float = DWELL_DROPOFF,
-                 payment_jid: Optional[str] = None, **kwargs):
+                 payment_jid: Optional[str] = None, regulator_jid: Optional[str] = None,
+                 reputation_jid: Optional[str] = None,
+                 rate_riders_with: Optional[Callable[['Assignment'], int]] = None, **kwargs):
         super().__init__(jid, password, **kwargs)
         self.start_hub = start_hub                    # hub id where this driver starts its shift
         self.network = network
@@ -194,6 +244,12 @@ class DriverAgent(BaseAgent):
         self.t_status, self.t_no_show = t_status, t_no_show
         self.dwell_pickup, self.dwell_dropoff = dwell_pickup, dwell_dropoff
         self.payment_jid = bare(payment_jid) if payment_jid else None
+        self.regulator_jid = bare(regulator_jid) if regulator_jid else None
+        self.reputation_jid = bare(reputation_jid) if reputation_jid else None
+        self.rate_riders_with = rate_riders_with or (lambda a: 5)
+        self.policies = PolicyBook()
+        self.finished_trips: Dict[str, Assignment] = {}
+        self.rated: set = set()
         self.location: str = start_hub
         self.activity = "idle"                        # idle | repositioning | to_pickup | on_trip | offline
         self.passengers = 0
@@ -213,6 +269,8 @@ class DriverAgent(BaseAgent):
         self.add_behaviour(Housekeeping())
         self.add_behaviour(RepositionHandler(), make_template(Protocol.REPOSITION, Perf.REQUEST))
         self.add_behaviour(SettlementReceiver(), make_template(Protocol.SETTLEMENT, Perf.INFORM))
+        self.add_behaviour(PolicyReceiver(), make_template(Protocol.POLICY, Perf.REQUEST))
+        self.add_behaviour(CompletionReceiver(), make_template(Protocol.TRIP_EXECUTION, Perf.INFORM))
 
     # ---- small helpers -------------------------------------------------------------------
     def log(self, text: str) -> None:
@@ -463,6 +521,7 @@ class DriverAgent(BaseAgent):
         self.lock.finish(pool, clock.now())
         self.offers.pop(pool, None)
         self.completed.append(pool)
+        self.finished_trips[pool] = a
         self.log(f"{pool} completed, idle at {self.location}")
 
     # ---- repositioning ------------------------------------------------------------------------
