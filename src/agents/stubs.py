@@ -21,7 +21,7 @@ from common import clock
 from common.messages import make_message, make_propose, make_refuse, make_request, make_template
 from common.ontology import (
     AuctionOutcome, Bid, CFP, DriverArriving, Escrow, EscrowRequest, MatchResult, Perf, Pool, Protocol,
-    RiderBoarded, RiderDroppedOff, RiderReady, Settlement, TripRequest, parse_payload,
+    PoolProposal, RiderBoarded, RiderDroppedOff, RiderReady, Settlement, TripRequest, parse_payload,
 )
 from protocols.payment_common import bare
 
@@ -103,12 +103,24 @@ class _RiderListener(CyclicBehaviour):
             payload = None
         if proto == Protocol.TRIP_REQUEST and perf == Perf.AGREE and isinstance(payload, Pool):
             r.events.append(("agree", payload))
-            if r.payment_jid:
-                esc = EscrowRequest(r.request.request_id, str(r.jid.bare), payload.pool_id,
-                                    r.request.max_fare, r.request.subsidy_eligibility, bare(r.hub_jid))
-                await self.send(make_request(r.payment_jid, Protocol.ESCROW, esc, r.request.request_id))
+        elif proto == Protocol.TRIP_REQUEST and perf == Perf.INFORM:
+            r.events.append(("queued", msg.body))
         elif proto == Protocol.TRIP_REQUEST:
             r.events.append(("refused", msg.body)); r.done.set()
+        elif proto == Protocol.POOL_FORMATION and isinstance(payload, PoolProposal):
+            r.events.append(("proposal", payload))
+            if not r.silent_on_proposal:
+                await self.send(make_message(bare(msg.sender), Perf.ACCEPT, Protocol.POOL_FORMATION, None,
+                                             payload.pool_id))
+        elif proto == Protocol.POOL_FORMATION and isinstance(payload, Pool):
+            if payload.status.value == "DISSOLVED":
+                r.events.append(("dissolved", payload)); r.done.set()
+            else:
+                r.events.append(("pool_confirmed", payload))
+                if r.payment_jid:
+                    esc = EscrowRequest(r.request.request_id, str(r.jid.bare), payload.pool_id,
+                                        r.request.max_fare, r.request.subsidy_eligibility, bare(r.hub_jid))
+                    await self.send(make_request(r.payment_jid, Protocol.ESCROW, esc, r.request.request_id))
         elif proto == Protocol.ESCROW:
             r.events.append(("escrow", payload if payload is not None else msg.body))
         elif proto == Protocol.TRIP_EXECUTION:
@@ -136,7 +148,8 @@ class ScriptedRider(BaseAgent):
 
     def __init__(self, jid: str, password: str, hub_jid: str = "", payment_jid: Optional[str] = None,
                  request: Optional[TripRequest] = None, auto_request: bool = True,
-                 no_show: bool = False, ready_after: float = 5.0, **kwargs):
+                 no_show: bool = False, ready_after: float = 5.0,
+                 silent_on_proposal: bool = False, **kwargs):
         super().__init__(jid, password, **kwargs)
         self.hub_jid, self.payment_jid, self.request = hub_jid, payment_jid, request
         self.auto_request = auto_request
@@ -144,6 +157,7 @@ class ScriptedRider(BaseAgent):
         self.done = asyncio.Event()
         self.trip_done = asyncio.Event()
         self.no_show, self.ready_after = no_show, ready_after
+        self.silent_on_proposal = silent_on_proposal
 
     def kinds(self) -> List[str]:
         return [k for k, _ in self.events]
@@ -154,6 +168,7 @@ class ScriptedRider(BaseAgent):
     async def setup(self):
         await super().setup()
         self.add_behaviour(_RiderListener(), make_template(Protocol.TRIP_REQUEST))
+        self.add_behaviour(_RiderListener(), make_template(Protocol.POOL_FORMATION))
         self.add_behaviour(_RiderListener(), make_template(Protocol.ESCROW))
         self.add_behaviour(_RiderListener(), make_template(Protocol.MATCH_AUCTION))
         self.add_behaviour(_RiderListener(), make_template(Protocol.TRIP_EXECUTION))
