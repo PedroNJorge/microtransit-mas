@@ -35,3 +35,11 @@ DWELL_DROPOFF = 10.0        # seconds spent per drop-off
 DRIVER_BASE_COST = 2.0      # EUR fixed cost of taking a job (the driver's true cost c_i, see
 DRIVER_COST_PER_SECOND = 0.004   # docs/auction_mechanism.md) + EUR per second driven (empty or loaded)
 DRIVER_CAPACITY = 4
+
+# ---- Rider / pool formation / reputation (Milestone 7) ------------------------------------------
+T_POOL_RESPONSE = 60.0      # a rider that does not answer a pool proposal within this is a reject
+T_RIDER_PATIENCE = 900.0    # a rider gives up waiting for a pool proposal / a match after this
+READY_DELAY = 10.0          # seconds a rider takes to walk to the car after "arriving"
+REPUTATION_PRIOR = 3.0      # score of an unrated driver (the auction's default_reputation)
+REPUTATION_PRIOR_WEIGHT = 2.0   # the prior counts as this many ratings (shrinks small samples)
+MIN_RATINGS = 1             # ratings needed before a score is published (M8 may raise it)

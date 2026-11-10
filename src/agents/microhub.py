@@ -28,16 +28,17 @@ from agents.base_agent import BaseAgent
 from common import clock
 from common.auction import AuctionRules
 from common.messages import (
-    make_auction_failed, make_inform, make_message, make_reject_proposal, make_reply, make_request,
-    make_template,
+    make_auction_failed, make_inform, make_message, make_pool_proposal, make_reject_proposal, make_reply,
+    make_request, make_template,
 )
 from common.ontology import (
     AuctionOutcome, DriverState, DriverStatus, Escrow, EscrowStatus, FailureReason, MatchResult, Perf,
-    Pool, PoolStatus, Protocol, SettlementComplete, TripCompleted, TripFailed, TripRequest, parse_payload,
+    Pool, PoolProposal, PoolStatus, Protocol, ReputationScore, SettlementComplete, TripCompleted, TripFailed,
+    TripRequest, parse_payload,
 )
 from common.settings import (
     AUCTION_PRICING, MAX_AUCTION_ATTEMPTS, T_AUCTION, T_AWARD, T_ESCROW, VALUE_OF_DETOUR,
-    T_STATUS, VALUE_OF_REPUTATION, VALUE_OF_TIME, WIDEN_DETOUR,
+    T_POOL_RESPONSE, T_STATUS, VALUE_OF_REPUTATION, VALUE_OF_TIME, WIDEN_DETOUR,
 )
 from protocols.match_auction import AuctionContext, MATCHED, MatchAuctionFSM, RETRY
 from protocols.payment_common import bare
@@ -51,10 +52,11 @@ class PoolRecord:
     rider_jids: Dict[str, str]                           # request_id -> rider JID
     escrows: Dict[str, str] = field(default_factory=dict)    # request_id -> escrow_id
     escrow_deadline: float = 0.0
-    state: str = "AWAITING_ESCROW"        # AWAITING_ESCROW | AUCTIONING | ASSIGNED | UNMATCHED | DISSOLVED
+    state: str = "PROPOSED"               # PROPOSED | AWAITING_ESCROW | AUCTIONING | ASSIGNED | UNMATCHED | DISSOLVED
                                           # | COMPLETED | DRIVER_FAILED | CANCELLED
     contexts: List[AuctionContext] = field(default_factory=list)
     no_shows: List[str] = field(default_factory=list)       # rider JIDs reported by the driver
+    proposal_deadline: float = 0.0
 
 
 class TripRequestReceiver(CyclicBehaviour):
@@ -78,8 +80,42 @@ class TripRequestReceiver(CyclicBehaviour):
             return
         rec = hub.open_pool(req, sender)
         await self.send(make_message(sender, Perf.AGREE, Protocol.TRIP_REQUEST, rec.pool, req.request_id))
-        if hub.payment_jid is None:
-            hub.start_auction(rec)
+        await self.send(make_message(sender, Perf.INFORM, Protocol.TRIP_REQUEST,
+                                     f"request_queued:{hub.batch_estimate():.0f}", req.request_id))
+        if hub.propose_pools:                                           # PoolFormationProtocol
+            await self.send(make_pool_proposal(sender, hub.proposal_for(rec, req)))
+        else:
+            hub.confirm_pool(rec)
+            if hub.payment_jid is None:
+                hub.start_auction(rec)
+
+
+class PoolResponses(CyclicBehaviour):
+    """PoolFormationProtocol, hub side: accept / reject / silence (= reject after T_pool_response)."""
+
+    async def run(self):
+        hub = self.agent
+        msg = await self.receive(timeout=1)
+        if msg is not None:
+            rec = hub.pools.get(msg.thread or "")
+            sender, perf = bare(msg.sender), msg.get_metadata("performative")
+            if rec is not None and rec.state == "PROPOSED" and sender in rec.rider_jids.values():
+                if perf == Perf.ACCEPT:
+                    hub.confirm_pool(rec)
+                    await self.send(make_inform(sender, Protocol.POOL_FORMATION, rec.pool, rec.pool.pool_id))
+                    if hub.payment_jid is None:
+                        hub.start_auction(rec)
+                elif perf == Perf.REJECT:
+                    hub.log(f"pool {rec.pool.pool_id} rejected by the rider ({msg.body})")
+                    await self.dissolve(rec, sender)
+        for rec in list(hub.pools.values()):
+            if rec.state == "PROPOSED" and clock.now() >= rec.proposal_deadline:
+                hub.log(f"pool {rec.pool.pool_id}: no answer to the proposal; dissolved")
+                await self.dissolve(rec, next(iter(rec.rider_jids.values())))
+
+    async def dissolve(self, rec: PoolRecord, rider: str):
+        rec.state, rec.pool.status = "DISSOLVED", PoolStatus.DISSOLVED
+        await self.send(make_inform(rider, Protocol.POOL_FORMATION, rec.pool, rec.pool.pool_id))
 
 
 class EscrowWatcher(CyclicBehaviour):
@@ -179,6 +215,10 @@ class TripReports(CyclicBehaviour):
         riders = [r for r in rep.rider_ids if r in match.rider_fares]           # never trust the driver's numbers
         rec.state, rec.pool.status = "COMPLETED", PoolStatus.COMPLETED
         hub.log(f"pool {rec.pool.pool_id} completed by {match.driver_id}; settling {len(riders)} rider(s)")
+        if hub.reputation_jid:                                  # trip registry: who may rate whom
+            await self.send(make_inform(hub.reputation_jid, Protocol.REPUTATION,
+                                        TripCompleted(rep.trip_id, rec.pool.pool_id, match.driver_id, riders,
+                                                      rep.completed_at), rec.pool.pool_id))
         if hub.payment_jid:
             await self.send(make_inform(
                 hub.payment_jid, Protocol.SETTLEMENT,
@@ -231,6 +271,25 @@ class SettlementReceiver(CyclicBehaviour):
             hub.log(f"pool {done.pool_id} settled: driver paid {done.total_paid:.2f}")
 
 
+class ReputationReceiver(CyclicBehaviour):
+    """reputation_update from the Reputation Agent -> the score the auction uses (never the driver's claim)."""
+
+    async def run(self):
+        msg = await self.receive(timeout=1)
+        if msg is None:
+            return
+        hub = self.agent
+        if bare(msg.sender) != hub.reputation_jid:
+            return
+        try:
+            score = parse_payload(msg, strict=True)
+        except (ValueError, TypeError):
+            return
+        if isinstance(score, ReputationScore):
+            hub.reputations[bare(score.agent_id)] = score.score
+            hub.log(f"reputation of {score.agent_id}: {score.score:.2f} ({score.num_ratings} ratings)")
+
+
 class LateBidHandler(CyclicBehaviour):
     """A bid for an auction that is no longer running gets an answer too (GC-09).
     Silent while the auction is live: the FSM itself handles those."""
@@ -257,7 +316,9 @@ class MicrohubAgent(BaseAgent):
                  payment_jid: Optional[str] = None, network=None, rules: Optional[AuctionRules] = None,
                  t_auction: float = T_AUCTION, t_award: float = T_AWARD, t_escrow: float = T_ESCROW,
                  max_attempts: int = MAX_AUCTION_ATTEMPTS, widen_detour: float = WIDEN_DETOUR,
-                 fare_cap: Optional[float] = None, t_status: float = T_STATUS, **kwargs):
+                 fare_cap: Optional[float] = None, t_status: float = T_STATUS,
+                 reputation_jid: Optional[str] = None, propose_pools: bool = True,
+                 t_pool_response: float = T_POOL_RESPONSE, **kwargs):
         super().__init__(jid, password, **kwargs)
         self.hub_id = hub_id                  # node id in the road network (== MicrohubNode.id)
         self.driver_jids: List[str] = [bare(j) for j in (driver_jids or [])]
@@ -274,6 +335,8 @@ class MicrohubAgent(BaseAgent):
         self.settlements: Dict[str, SettlementComplete] = {}
         self.registry: Dict[str, tuple] = {}            # driver JID -> (DriverStatus, received_at)
         self.t_status = t_status
+        self.reputation_jid = bare(reputation_jid) if reputation_jid else None
+        self.propose_pools, self.t_pool_response = propose_pools, t_pool_response
         self.finished: List[AuctionContext] = []
         self._seq = 0
 
@@ -333,10 +396,33 @@ class MicrohubAgent(BaseAgent):
         pool = Pool(f"{self.hub_id}-pool-{self._seq:04d}", self.hub_id, [req],
                     PoolStatus.LOCKED, clock.now())
         rec = PoolRecord(pool, {req.request_id: sender},
-                         escrow_deadline=clock.now() + self.t_escrow)
+                         proposal_deadline=clock.now() + self.t_pool_response)
         self.pools[pool.pool_id] = rec
         self.log(f"request {req.request_id} from {sender} -> {pool.pool_id}")
         return rec
+
+    def batch_estimate(self) -> float:
+        """Seconds until the pool is proposed (no batching window yet: pools are single trips)."""
+        return 0.0
+
+    def proposal_for(self, rec: PoolRecord, req: TripRequest) -> PoolProposal:
+        """What the rider is told before committing: the route, the fare CEILING (the reserve of
+        the auction, so the final fare can only be lower) and the expected wait."""
+        route, route_time = [self.hub_id, req.destination_home], 0.0
+        if self.network is not None:
+            planned = self.network.best_stop_order(self.hub_id, [req.destination_home], clock.now())
+            if planned:
+                route, route_time = planned
+        etas = [e for e in (self.hub_eta(j, self.hub_id, clock.now()) for j in self.eligible_drivers(clock.now()))
+                if e is not None]
+        wait = min(etas) if etas else 0.0
+        ceiling = req.max_fare if self.fare_cap is None else min(req.max_fare, self.fare_cap)
+        return PoolProposal(rec.pool.pool_id, req.request_id, route, ceiling, wait, 0.0)
+
+    def confirm_pool(self, rec: PoolRecord) -> None:
+        rec.state = "AWAITING_ESCROW"
+        rec.escrow_deadline = clock.now() + self.t_escrow
+        rec.pool.status = PoolStatus.LOCKED
 
     def start_auction(self, rec: PoolRecord, attempt: int = 0) -> None:
         rec.state = "AUCTIONING"
@@ -362,6 +448,9 @@ class MicrohubAgent(BaseAgent):
         await super().setup()
         self.add_behaviour(TripRequestReceiver(),
                            make_template(Protocol.TRIP_REQUEST, Perf.REQUEST))
+        self.add_behaviour(PoolResponses(), make_template(Protocol.POOL_FORMATION))
+        if self.reputation_jid:
+            self.add_behaviour(ReputationReceiver(), make_template(Protocol.REPUTATION, Perf.INFORM))
         self.add_behaviour(DriverStatusReceiver(), make_template(Protocol.DRIVER_STATUS, Perf.INFORM))
         self.add_behaviour(TripReports(), make_template(Protocol.TRIP_EXECUTION, Perf.INFORM))
         if self.payment_jid:
