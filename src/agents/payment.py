@@ -31,13 +31,15 @@ Policy
 import logging
 from collections import Counter
 
-from spade.behaviour import PeriodicBehaviour
+from spade.behaviour import CyclicBehaviour, PeriodicBehaviour
 
 from agents.base_agent import BaseAgent
 from common import clock
 from common.ledger import Ledger
-from common.messages import make_inform, make_template
-from common.ontology import FailureReason, Perf, Policy, Protocol, Refund
+from common.messages import make_inform, make_message, make_template
+from common.policy import PolicyBook
+from common.ontology import FailureReason, Perf, Policy, Protocol, Refund, parse_payload
+from protocols.payment_common import bare
 from common.settings import SUBSIDY_DISCOUNT, T_ESCROW_HOLD_MAX, T_ESCROW_SWEEP
 from protocols.escrow import EscrowFSM
 from protocols.refund import RefundFSM
@@ -61,13 +63,34 @@ class ExpirySweep(PeriodicBehaviour):
                 await self.send(make_inform(rec.hub, Protocol.REFUND, refund, rec.pool_id))
 
 
+class PolicyAck(CyclicBehaviour):
+    """PolicyProtocol (RI-04): the Regulator's subsidy rule; agree or refuse(reason)."""
+
+    async def run(self):
+        msg = await self.receive(timeout=1)
+        if msg is None:
+            return
+        pay = self.agent
+        try:
+            policy = parse_payload(msg, strict=True)
+            if not isinstance(policy, Policy):
+                raise ValueError("not a Policy")
+            ack = (pay.policies.offer(policy) if pay.regulator_jid and bare(msg.sender) == pay.regulator_jid
+                   else None)
+            reason = "unknown_regulator" if ack is None else ("" if ack.ok else ack.reason)
+        except (ValueError, TypeError):
+            reason = "malformed"
+        perf = Perf.REFUSE if reason else Perf.AGREE
+        await self.send(make_message(str(msg.sender), perf, Protocol.POLICY, reason or None, msg.thread))
+
+
 class PaymentAgent(BaseAgent):
     role = "payment"
 
     def __init__(self, jid: str, password: str, default_rider_balance=None,
                  subsidy_budget=None, subsidy_discount: float = SUBSIDY_DISCOUNT,
                  hold_max: float = T_ESCROW_HOLD_MAX, sweep_every: float = T_ESCROW_SWEEP,
-                 **kwargs):
+                 reputation_jid=None, regulator_jid=None, **kwargs):
         super().__init__(jid, password, **kwargs)
         if hold_max <= 0 or sweep_every <= 0:
             raise ValueError("hold_max and sweep_every must be > 0")
@@ -77,6 +100,10 @@ class PaymentAgent(BaseAgent):
         self.sweep_every = sweep_every
         self.policy_version = -1
         self.stats: Counter = Counter()
+        self.reputation_jid = bare(reputation_jid) if reputation_jid else None
+        self.regulator_jid = bare(regulator_jid) if regulator_jid else None
+        self.policies = PolicyBook()
+        self.settlement_open = None            # asyncio.Event: if set up and not set, settlements queue (FE-08)
 
     # ---- helpers -----------------------------------------------------------------------
     def account(self, agent_id: str) -> str:
@@ -94,6 +121,12 @@ class PaymentAgent(BaseAgent):
         self.policy_version = policy.version
         return True
 
+    def refresh_policy(self) -> None:
+        """Adopt the policy in force now (a policy may carry an effective_from in the future)."""
+        active = self.policies.active(clock.now())
+        if active is not None:
+            self.set_policy(active)
+
     # ---- lifecycle ---------------------------------------------------------------------
     async def setup(self):
         await super().setup()                                         # answers pings
@@ -101,3 +134,4 @@ class PaymentAgent(BaseAgent):
         self.add_behaviour(SettlementFSM(), make_template(Protocol.SETTLEMENT, Perf.INFORM))
         self.add_behaviour(RefundFSM(), make_template(Protocol.REFUND, Perf.REQUEST))
         self.add_behaviour(ExpirySweep(period=clock.to_real(self.sweep_every)))
+        self.add_behaviour(PolicyAck(), make_template(Protocol.POLICY, Perf.REQUEST))

@@ -43,3 +43,12 @@ READY_DELAY = 10.0          # seconds a rider takes to walk to the car after "ar
 REPUTATION_PRIOR = 3.0      # score of an unrated driver (the auction's default_reputation)
 REPUTATION_PRIOR_WEIGHT = 2.0   # the prior counts as this many ratings (shrinks small samples)
 MIN_RATINGS = 1             # ratings needed before a score is published (M8 may raise it)
+
+# ---- Reputation gate / Regulator (Milestone 8) -----------------------------------------------
+T_SETTLEMENT_MAX = 600.0    # ID-07: a rating is published unsettled (flagged) this long after the trip
+T_REPUTATION_SWEEP = 30.0   # how often Reputation checks for ratings whose deadline passed
+T_AUDIT = 3600.0            # Regulator audits every hub this often (RI-02)
+T_AUDIT_RESPONSE = 60.0     # a hub that does not answer an audit request in time is non-cooperative (RI-05)
+T_POLICY_ACK = 30.0         # the Regulator re-sends a policy to recipients that did not answer (RI-04)
+PENALTY_NON_COOPERATION = 50.0   # EUR
+PENALTY_FARE_VIOLATION = 10.0    # EUR per fare above the cap

@@ -27,14 +27,15 @@ from spade.behaviour import CyclicBehaviour
 from agents.base_agent import BaseAgent
 from common import clock
 from common.auction import AuctionRules
+from common.policy import PolicyBook
 from common.messages import (
     make_auction_failed, make_inform, make_message, make_pool_proposal, make_reject_proposal, make_reply,
     make_request, make_template,
 )
 from common.ontology import (
-    AuctionOutcome, DriverState, DriverStatus, Escrow, EscrowStatus, FailureReason, MatchResult, Perf,
-    Pool, PoolProposal, PoolStatus, Protocol, ReputationScore, SettlementComplete, TripCompleted, TripFailed,
-    TripRequest, parse_payload,
+    AuctionOutcome, AuditData, AuditReport, AuditRequest, AuditTrip, DriverState, DriverStatus, Escrow, EscrowStatus, FailureReason, MatchResult, Perf,
+    Penalty, Policy, Pool, Refund, PoolProposal, PoolStatus, Protocol, ReputationScore, SettlementComplete,
+    TripCompleted, TripFailed, TripRequest, parse_payload,
 )
 from common.settings import (
     AUCTION_PRICING, MAX_AUCTION_ATTEMPTS, T_AUCTION, T_AWARD, T_ESCROW, VALUE_OF_DETOUR,
@@ -218,7 +219,10 @@ class TripReports(CyclicBehaviour):
         if hub.reputation_jid:                                  # trip registry: who may rate whom
             await self.send(make_inform(hub.reputation_jid, Protocol.REPUTATION,
                                         TripCompleted(rep.trip_id, rec.pool.pool_id, match.driver_id, riders,
-                                                      rep.completed_at), rec.pool.pool_id))
+                                                      clock.now()), rec.pool.pool_id))
+        await self.send(make_inform(match.driver_id, Protocol.TRIP_EXECUTION,       # ID-08: now it may rate
+                                    TripCompleted(rep.trip_id, rec.pool.pool_id, match.driver_id, riders,
+                                                  clock.now()), rec.pool.pool_id))
         if hub.payment_jid:
             await self.send(make_inform(
                 hub.payment_jid, Protocol.SETTLEMENT,
@@ -287,7 +291,77 @@ class ReputationReceiver(CyclicBehaviour):
             return
         if isinstance(score, ReputationScore):
             hub.reputations[bare(score.agent_id)] = score.score
+            hub.reputation_flags[bare(score.agent_id)] = score.pending_settlement
             hub.log(f"reputation of {score.agent_id}: {score.score:.2f} ({score.num_ratings} ratings)")
+
+
+class RefundReceiver(CyclicBehaviour):
+    """Payment's confirmation that an escrow went back to the rider."""
+
+    async def run(self):
+        msg = await self.receive(timeout=1)
+        if msg is None or bare(msg.sender) != self.agent.payment_jid:
+            return
+        try:
+            back = parse_payload(msg, strict=True)
+        except (ValueError, TypeError):
+            return
+        if isinstance(back, Refund):
+            self.agent.refunds.append(back)
+
+
+class PolicyReceiver(CyclicBehaviour):
+    """PolicyProtocol (RI-04): acknowledge with agree, or refuse(reason). Only the Regulator's word counts."""
+
+    async def run(self):
+        msg = await self.receive(timeout=1)
+        if msg is None:
+            return
+        hub = self.agent
+        try:
+            policy = parse_payload(msg, strict=True)
+            if not isinstance(policy, Policy):
+                raise ValueError("not a Policy")
+            if not hub.regulator_jid or bare(msg.sender) != hub.regulator_jid:
+                reason = "unknown_regulator"
+            else:
+                ack = hub.policies.offer(policy)
+                reason = "" if ack.ok else ack.reason
+        except (ValueError, TypeError):
+            reason = "malformed"
+        if not reason:
+            hub.log(f"policy v{policy.version} acknowledged (cap {policy.fare_caps.get('max')}, "
+                    f"from t={policy.effective_from:.0f})")
+        await self.send(make_message(str(msg.sender), Perf.REFUSE if reason else Perf.AGREE,
+                                     Protocol.POLICY, reason or None, msg.thread))
+
+
+class AuditResponder(CyclicBehaviour):
+    """AuditProtocol (RI-05): answer the Regulator's audit request, and keep its verdicts."""
+
+    async def run(self):
+        msg = await self.receive(timeout=1)
+        if msg is None:
+            return
+        hub = self.agent
+        if not hub.regulator_jid or bare(msg.sender) != hub.regulator_jid:
+            return
+        try:
+            body = parse_payload(msg, strict=True)
+        except (ValueError, TypeError):
+            return
+        if isinstance(body, AuditRequest) and msg.get_metadata("performative") == Perf.REQUEST:
+            if not hub.audit_logs_available:
+                await self.send(make_message(str(msg.sender), Perf.REFUSE, Protocol.AUDIT, "logs_unavailable",
+                                             body.audit_id))
+            else:
+                await self.send(make_inform(str(msg.sender), Protocol.AUDIT, hub.audit_data(body), body.audit_id))
+        elif isinstance(body, AuditReport):
+            hub.audit_reports.append(body)
+            hub.log(f"audit {msg.thread}: {'passed' if body.compliant else 'NOT compliant'}")
+        elif isinstance(body, Penalty):
+            hub.penalties.append(body)
+            hub.log(f"penalty imposed: {body.reason} ({body.amount:.2f})")
 
 
 class LateBidHandler(CyclicBehaviour):
@@ -318,7 +392,8 @@ class MicrohubAgent(BaseAgent):
                  max_attempts: int = MAX_AUCTION_ATTEMPTS, widen_detour: float = WIDEN_DETOUR,
                  fare_cap: Optional[float] = None, t_status: float = T_STATUS,
                  reputation_jid: Optional[str] = None, propose_pools: bool = True,
-                 t_pool_response: float = T_POOL_RESPONSE, **kwargs):
+                 t_pool_response: float = T_POOL_RESPONSE, regulator_jid: Optional[str] = None,
+                 audit_logs_available: bool = True, **kwargs):
         super().__init__(jid, password, **kwargs)
         self.hub_id = hub_id                  # node id in the road network (== MicrohubNode.id)
         self.driver_jids: List[str] = [bare(j) for j in (driver_jids or [])]
@@ -337,6 +412,13 @@ class MicrohubAgent(BaseAgent):
         self.t_status = t_status
         self.reputation_jid = bare(reputation_jid) if reputation_jid else None
         self.propose_pools, self.t_pool_response = propose_pools, t_pool_response
+        self.regulator_jid = bare(regulator_jid) if regulator_jid else None
+        self.audit_logs_available = audit_logs_available
+        self.policies = PolicyBook()
+        self.audit_reports: List[AuditReport] = []
+        self.refunds: List[Refund] = []
+        self.penalties: List[Penalty] = []
+        self.reputation_flags: Dict[str, bool] = {}
         self.finished: List[AuctionContext] = []
         self._seq = 0
 
@@ -401,6 +483,27 @@ class MicrohubAgent(BaseAgent):
         self.log(f"request {req.request_id} from {sender} -> {pool.pool_id}")
         return rec
 
+    def current_fare_cap(self, now: Optional[float] = None) -> Optional[float]:
+        """RI-01: the tightest of the hub's own cap and the Regulator's policy in force now."""
+        caps = [c for c in (self.fare_cap, self.policies.fare_cap(clock.now() if now is None else now))
+                if c is not None]
+        return min(caps) if caps else None
+
+    def audit_data(self, req: AuditRequest) -> AuditData:
+        trips = []
+        for ctx in self.finished:
+            if not (req.period_start <= ctx.finished_at <= req.period_end) or ctx.outcome == "retry":
+                continue
+            dest = ctx.pool.requests[0].destination_home if ctx.pool.requests else ""
+            try:
+                zone = self.network.zone_of(dest) if self.network is not None else ""
+            except KeyError:
+                zone = ""
+            matched = ctx.outcome == "matched" and ctx.match is not None
+            trips.append(AuditTrip(ctx.pool_id, ctx.finished_at, ctx.match.final_fare if matched else 0.0,
+                                   matched, zone, ctx.match.driver_id if matched else ""))
+        return AuditData(req.audit_id, self.hub_id, req.period_start, req.period_end, trips)
+
     def batch_estimate(self) -> float:
         """Seconds until the pool is proposed (no batching window yet: pools are single trips)."""
         return 0.0
@@ -416,7 +519,8 @@ class MicrohubAgent(BaseAgent):
         etas = [e for e in (self.hub_eta(j, self.hub_id, clock.now()) for j in self.eligible_drivers(clock.now()))
                 if e is not None]
         wait = min(etas) if etas else 0.0
-        ceiling = req.max_fare if self.fare_cap is None else min(req.max_fare, self.fare_cap)
+        cap = self.current_fare_cap()
+        ceiling = req.max_fare if cap is None else min(req.max_fare, cap)
         return PoolProposal(rec.pool.pool_id, req.request_id, route, ceiling, wait, 0.0)
 
     def confirm_pool(self, rec: PoolRecord) -> None:
@@ -449,6 +553,8 @@ class MicrohubAgent(BaseAgent):
         self.add_behaviour(TripRequestReceiver(),
                            make_template(Protocol.TRIP_REQUEST, Perf.REQUEST))
         self.add_behaviour(PoolResponses(), make_template(Protocol.POOL_FORMATION))
+        self.add_behaviour(PolicyReceiver(), make_template(Protocol.POLICY, Perf.REQUEST))
+        self.add_behaviour(AuditResponder(), make_template(Protocol.AUDIT))
         if self.reputation_jid:
             self.add_behaviour(ReputationReceiver(), make_template(Protocol.REPUTATION, Perf.INFORM))
         self.add_behaviour(DriverStatusReceiver(), make_template(Protocol.DRIVER_STATUS, Perf.INFORM))
@@ -456,4 +562,5 @@ class MicrohubAgent(BaseAgent):
         if self.payment_jid:
             self.add_behaviour(EscrowWatcher(), make_template(Protocol.ESCROW))
             self.add_behaviour(SettlementReceiver(), make_template(Protocol.SETTLEMENT, Perf.INFORM))
+            self.add_behaviour(RefundReceiver(), make_template(Protocol.REFUND, Perf.INFORM))
         self.add_behaviour(LateBidHandler(), make_template(Protocol.MATCH_AUCTION, Perf.PROPOSE))

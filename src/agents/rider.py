@@ -39,7 +39,7 @@ from agents.base_agent import BaseAgent
 from common import clock
 from common.messages import make_inform, make_message, make_request, make_template
 from common.ontology import (
-    AuctionOutcome, DriverArriving, Escrow, EscrowRequest, FailureReason, MatchResult, Perf, Pool,
+    AuctionOutcome, DriverArriving, Escrow, Refund, EscrowRequest, FailureReason, MatchResult, Perf, Pool,
     PoolProposal, Protocol, Rating, RiderBoarded, RiderDroppedOff, RiderReady, Settlement, TripRequest,
     parse_payload,
 )
@@ -76,6 +76,7 @@ class TripRecord:
     match: Optional[MatchResult] = None
     escrow: Optional[Escrow] = None
     settlement: Optional[Settlement] = None
+    refund: Optional[Refund] = None
     outcome: str = ""                              # one of the constants above, "" while running
     reason: str = ""
     requested_at: float = 0.0
@@ -153,7 +154,7 @@ class RiderAgent(BaseAgent):
     async def setup(self):
         await super().setup()
         for proto in (Protocol.TRIP_REQUEST, Protocol.POOL_FORMATION, Protocol.ESCROW,
-                      Protocol.MATCH_AUCTION, Protocol.TRIP_EXECUTION, Protocol.SETTLEMENT):
+                      Protocol.MATCH_AUCTION, Protocol.TRIP_EXECUTION, Protocol.SETTLEMENT, Protocol.REFUND):
             self.add_behaviour(RiderListener(), make_template(proto))
 
     # ---- state machine ---------------------------------------------------------------------
@@ -222,6 +223,15 @@ class RiderAgent(BaseAgent):
     async def on_message(self, beh, msg) -> None:
         t = self.trip
         proto, perf, sender = msg.get_metadata("protocol"), msg.get_metadata("performative"), bare(msg.sender)
+        if proto == Protocol.REFUND:                                       # likewise: after the trip has ended
+            try:
+                back = parse_payload(msg, strict=True)
+            except (ValueError, TypeError):
+                return
+            owner = next((x for x in [t, *reversed(self.trips)] if x is not None and x.pool_id == msg.thread), None)
+            if owner and sender == self.payment_jid and isinstance(back, Refund):
+                owner.refund = back
+            return
         if proto == Protocol.SETTLEMENT:                                   # arrives after the trip has ended
             try:
                 settled = parse_payload(msg, strict=True)

@@ -34,6 +34,7 @@ logger = logging.getLogger(__name__)
 
 
 def handle_settlement(agent, msg: Message) -> List[Message]:
+    getattr(agent, "refresh_policy", lambda: None)()
     tc = expect(msg, TripCompleted)
     sender = bare(msg.sender)
     thread = tc.pool_id
@@ -62,9 +63,18 @@ def handle_settlement(agent, msg: Message) -> List[Message]:
             out.append(make_inform(driver, Protocol.SETTLEMENT, s, thread))
             out.append(make_inform(line.rider, Protocol.SETTLEMENT, s, thread))
     out.append(make_inform(sender, Protocol.SETTLEMENT, complete, thread))
+    if getattr(agent, "reputation_jid", None):                    # ID-07: tell Reputation it is settled
+        out.append(make_inform(agent.reputation_jid, Protocol.REPUTATION, complete, thread))
     return out
+
+
+async def _wait_for_backlog(agent) -> None:
+    """FE-08: while `agent.settlement_open` exists and is not set, settlements queue up."""
+    gate = getattr(agent, "settlement_open", None)
+    if gate is not None:
+        await gate.wait()
 
 
 class SettlementFSM(ServerFSM):
     def __init__(self):
-        super().__init__(handle_settlement)
+        super().__init__(handle_settlement, before=_wait_for_backlog)
