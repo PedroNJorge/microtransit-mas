@@ -42,8 +42,14 @@ def window_closes_at(queue: List[QueuedRequest], t_pool: float) -> float:
     return min(q.queued_at for q in queue) + t_pool if queue else float("inf")
 
 
-def batch_due(queue: List[QueuedRequest], t_pool: float, now: float, max_batch: int) -> bool:
-    return bool(queue) and (now >= window_closes_at(queue, t_pool) or len(queue) >= max_batch)
+def batch_due(queue: List[QueuedRequest], t_pool: float, now: float, max_batch: int,
+              slack: float = 0.0) -> bool:
+    """The window closes at T_pool after the first request, when max_batch are waiting, or (adaptive)
+    when a queued rider's own pickup window ends within `slack` seconds."""
+    if not queue:
+        return False
+    urgent = slack > 0 and any(q.req.time_window_end - now <= slack for q in queue)
+    return now >= window_closes_at(queue, t_pool) or len(queue) >= max_batch or urgent
 
 
 def take_batch(queue: List[QueuedRequest], max_batch: int) -> List[QueuedRequest]:
@@ -125,7 +131,7 @@ class BatchWindow(CyclicBehaviour):
 
     async def run(self):
         hub = self.agent
-        if batch_due(hub.queue, hub.t_pool, clock.now(), hub.max_batch):
+        if batch_due(hub.queue, hub.t_pool, clock.now(), hub.max_batch, hub.window_slack):
             try:
                 await run_batch(self, hub)
             except Exception:

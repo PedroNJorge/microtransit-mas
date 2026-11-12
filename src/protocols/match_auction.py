@@ -136,6 +136,9 @@ class _Start(_AuctionState):
             reserve = fare_ceiling({r.request_id: r.max_fare for r in reqs}, ctx.weights)
         else:
             reserve = min(r.max_fare for r in reqs) * len(reqs)     # an equal split never exceeds any max_fare
+        tariff = hub.tariff_reserve(reqs, ctx.stop_order, ctx.attempt)
+        if tariff is not None:                                   # bound what a lone bidder can win
+            reserve = min(reserve, tariff)
         cap = hub.current_fare_cap(now)                          # RI-01: a bid above the cap cannot win
         if cap is not None:
             reserve = min(reserve, cap)
@@ -159,7 +162,7 @@ class _CfpSent(_AuctionState):
 
     async def step(self):
         ctx, hub = self.ctx, self.agent
-        ctx.recipients = hub.eligible_drivers(clock.now())          # CC-08
+        ctx.recipients = hub.eligible_drivers(clock.now(), ctx.attempt)          # CC-08
         for jid in ctx.recipients:
             await self.send(make_cfp(jid, ctx.cfp))
         note(ctx, CFP_SENT, "cfp sent", drivers=len(ctx.recipients))
