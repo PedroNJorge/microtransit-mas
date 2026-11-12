@@ -55,7 +55,7 @@ TRANSITIONS = {
     IDLE: {REQUESTING},
     REQUESTING: {AWAITING_POOL, IDLE},
     AWAITING_POOL: {DECIDING, IDLE},
-    DECIDING: {AWAITING_MATCH, IDLE},
+    DECIDING: {AWAITING_MATCH, AWAITING_POOL, IDLE},      # AWAITING_POOL again = re-pooled (a co-rider declined)
     AWAITING_MATCH: {DRIVER_EN_ROUTE, IDLE},
     DRIVER_EN_ROUTE: {IN_TRIP, IDLE},
     IN_TRIP: {RATING, IDLE},
@@ -261,9 +261,10 @@ class RiderAgent(BaseAgent):
     async def on_trip_request(self, beh, t, sender, perf, payload, msg):
         if sender != t.hub_jid:
             return
-        if perf == Perf.AGREE and isinstance(payload, Pool) and self.state == REQUESTING:
-            t.pool_id = payload.pool_id
-            self.go(AWAITING_POOL, "agreed")
+        if perf == Perf.AGREE and self.state == REQUESTING:
+            if isinstance(payload, Pool):                      # immediate (solo) pool
+                t.pool_id = payload.pool_id
+            self.go(AWAITING_POOL, "agreed" if t.pool_id else "queued for pooling")   # else: pool id comes with the proposal
         elif perf == Perf.REFUSE and self.state == REQUESTING:
             self.end_trip(REFUSED, msg.body or "")
         # inform(request_queued ...) is informational
@@ -271,10 +272,10 @@ class RiderAgent(BaseAgent):
     async def on_pool(self, beh, t, sender, perf, payload):
         if sender != t.hub_jid:
             return
-        if perf == Perf.PROPOSE and isinstance(payload, PoolProposal) and payload.pool_id == t.pool_id \
-                and self.state == AWAITING_POOL:
+        if perf == Perf.PROPOSE and isinstance(payload, PoolProposal) and self.state == AWAITING_POOL \
+                and payload.request_id == t.request.request_id and t.pool_id in ("", payload.pool_id):
             self.go(DECIDING, "proposal received")
-            t.proposal = payload
+            t.pool_id, t.proposal = payload.pool_id, payload
             reason = self.evaluate_pool(t, payload)
             if reason:
                 await beh.send(make_message(t.hub_jid, Perf.REJECT, Protocol.POOL_FORMATION, reason, t.pool_id))
@@ -283,12 +284,17 @@ class RiderAgent(BaseAgent):
                 await beh.send(make_message(t.hub_jid, Perf.ACCEPT, Protocol.POOL_FORMATION, None, t.pool_id))
                 self._deadline = clock.now() + self.patience
         elif perf == Perf.INFORM and isinstance(payload, Pool) and payload.pool_id == t.pool_id \
-                and payload.status.value != "DISSOLVED" and self.state == DECIDING:   # pool_confirmed
+                and payload.status.value not in ("DISSOLVED", "FORMING") and self.state == DECIDING:   # pool_confirmed
             self.go(AWAITING_MATCH, "pool confirmed")
             if self.payment_jid and self.auto_escrow:
                 esc = EscrowRequest(t.request.request_id, self.me, t.pool_id, t.request.max_fare,
                                     t.request.subsidy_eligibility, t.hub_jid)
                 await beh.send(make_request(self.payment_jid, Protocol.ESCROW, esc, t.request.request_id))
+        elif perf == Perf.INFORM and isinstance(payload, Pool) and payload.status.value == "FORMING" \
+                and payload.pool_id == t.pool_id and self.state == DECIDING:       # a co-rider left: back to the queue
+            t.pool_id, t.proposal = "", None
+            self.go(AWAITING_POOL, "re-pooling")
+            self._deadline = clock.now() + self.patience
         elif perf == Perf.INFORM and msg_is_dissolved(payload) and self.state in (AWAITING_POOL, DECIDING):
             self.end_trip(DISSOLVED, "pool dissolved")
 

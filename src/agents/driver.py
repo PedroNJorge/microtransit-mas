@@ -322,6 +322,9 @@ class DriverAgent(BaseAgent):
         try:
             eta = net.travel_time(self.location, cfp.pickup_node, now)
             planned = net.best_stop_order(cfp.pickup_node, list(cfp.rider_destinations), now)
+            if cfp.stop_order and sorted(set(cfp.stop_order)) == sorted(set(cfp.rider_destinations) - {cfp.pickup_node}):
+                routed = net.route_through([cfp.pickup_node, *cfp.stop_order], now)     # the hub's exact plan
+                planned = ([cfp.pickup_node, *cfp.stop_order], routed[1]) if routed else None
         except KeyError:
             return None, UNREACHABLE
         if planned is None or math.isinf(eta):
