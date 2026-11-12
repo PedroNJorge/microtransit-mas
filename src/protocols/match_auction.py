@@ -43,6 +43,7 @@ from spade.behaviour import FSMBehaviour, State
 
 from common import clock
 from common.auction import AuctionResult, BidReject, evaluate_bids, split_fare
+from common.pooling import fare_ceiling, split_fare_weighted
 from common.messages import (
     make_accept_proposal, make_auction_failed, make_cfp, make_inform, make_message, make_reject_proposal,
     make_request,
@@ -68,6 +69,11 @@ class AuctionContext:
     rider_jids: Dict[str, str]                 # request_id -> rider JID
     escrow_ids: List[str] = field(default_factory=list)
     attempt: int = 0
+    # Pool formation (M9): fare weights (request_id -> direct ride seconds; empty = equal split),
+    # the planned drop-off order and the largest detour that plan imposes.
+    weights: Dict[str, float] = field(default_factory=dict)
+    stop_order: List[str] = field(default_factory=list)
+    plan_detour: Optional[float] = None
     # ---- filled while running ----
     cfp: Optional[CFP] = None
     recipients: List[str] = field(default_factory=list)
@@ -126,7 +132,10 @@ class _Start(_AuctionState):
         now = clock.now()
         ctx.started_at = now
         reqs = ctx.pool.requests
-        reserve = min(r.max_fare for r in reqs) * len(reqs)     # an equal split never exceeds any max_fare
+        if ctx.weights and len(reqs) > 1:           # proportional split: nobody's share may exceed their max_fare
+            reserve = fare_ceiling({r.request_id: r.max_fare for r in reqs}, ctx.weights)
+        else:
+            reserve = min(r.max_fare for r in reqs) * len(reqs)     # an equal split never exceeds any max_fare
         cap = hub.current_fare_cap(now)                          # RI-01: a bid above the cap cannot win
         if cap is not None:
             reserve = min(reserve, cap)
@@ -135,8 +144,10 @@ class _Start(_AuctionState):
             rider_destinations=[r.destination_home for r in reqs],
             rider_time_windows={r.request_id: [r.time_window_start, r.time_window_end] for r in reqs},
             passenger_count=len(reqs), auction_deadline=now + hub.t_auction, max_total_fare=reserve,
-            max_detour=min(r.detour_tolerance for r in reqs) + ctx.attempt * hub.widen_detour,
-            attempt=ctx.attempt, rider_jids=[ctx.rider_jids[r.request_id] for r in reqs])
+            max_detour=(min(r.detour_tolerance for r in reqs) if ctx.plan_detour is None
+                        else ctx.plan_detour + 1.0) + ctx.attempt * hub.widen_detour,
+            attempt=ctx.attempt, rider_jids=[ctx.rider_jids[r.request_id] for r in reqs],
+            stop_order=list(ctx.stop_order))
         note(ctx, START, "auction opens", riders=len(reqs), reserve=reserve,
              max_detour=ctx.cfp.max_detour, deadline=round(ctx.cfp.auction_deadline, 1),
              pricing=hub.rules.pricing)
@@ -244,7 +255,10 @@ class _Awarding(_AuctionState):
         ctx, hub = self.ctx, self.agent
         res = ctx.result
         winner = res.winner.bid
-        fares = split_fare(res.price, list(ctx.rider_jids.values()))
+        if ctx.weights:
+            fares = split_fare_weighted(res.price, {ctx.rider_jids[k]: w for k, w in ctx.weights.items()})
+        else:
+            fares = split_fare(res.price, list(ctx.rider_jids.values()))
         ctx.match = MatchResult(ctx.pool_id, winner.driver_id, res.price,
                                 clock.now() + winner.eta, fares)
         await self.send(make_accept_proposal(winner.driver_id, ctx.match))

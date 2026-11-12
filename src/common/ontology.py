@@ -266,6 +266,9 @@ class CFP:
     # JID of each rider, aligned with rider_destinations AND with the key order of
     # rider_time_windows (request ids). The winning driver needs them to run the trip.
     rider_jids: List[str] = field(default_factory=list)
+    # Drop-off order planned by the hub (pool formation, M9); the driver prices exactly this order.
+    # Empty -> the driver plans its own.
+    stop_order: List[str] = field(default_factory=list)
 
 
 @concept
@@ -338,6 +341,9 @@ class TripCompleted:
     # auction, so it holds an upper bound; Payment charges THIS and returns the rest.
     # Empty -> charge each rider's full held amount.
     rider_fares: Dict[str, float] = field(default_factory=dict)
+    # Posted SOLO reference fare per rider (hub -> Payment only); Payment reports the pooling
+    # discount = solo - charged in each Settlement. Empty -> no discount reported.
+    solo_fares: Dict[str, float] = field(default_factory=dict)
 
 
 # TripExecutionProtocol: per-rider granularity (pooled riders board/alight separately).
@@ -439,6 +445,7 @@ class Settlement:
     platform_fee: float = 0.0           # MVP: always 0. If non-zero it is recorded but not
                                         # disbursed (no Platform/Treasury agent yet).
     excess_returned: float = 0.0        # part of the hold not charged (held - fare), returned
+    pooling_discount: float = 0.0       # informational: reference solo fare - fare charged (>= 0)
 
 
 @concept

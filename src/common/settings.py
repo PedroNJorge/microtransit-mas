@@ -65,3 +65,10 @@ REPOSITION_COOLDOWN = 120.0         # after a refusal / failure leave that drive
 REPOSITION_MIN_SHIFT_LEFT = 900.0   # do not move a driver whose shift ends sooner than this
 REPOSITION_INCENTIVE_MARGIN = 1.1   # the hub pays this x the driver's assumed driving cost
 REPOSITION_MAX_MOVES = 3            # drivers moved per rebalancing round
+
+# ---- Pooling (Milestone 9) ----------------------------------------------------------------------
+T_POOL = 180.0              # batch window: requests wait this long (from the first queued) to be pooled
+MAX_POOL_SIZE = 4           # riders per vehicle (== DRIVER_CAPACITY)
+MAX_BATCH = 8               # requests solved together by the exact partition (3^n sub-problems)
+POOL_SOLVER = "exact"       # key of common.pooling.SOLVERS
+DETOUR_WEIGHT = 1.0         # seconds of rider detour counted per vehicle second in the pooling objective
