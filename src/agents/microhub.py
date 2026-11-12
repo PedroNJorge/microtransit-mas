@@ -12,6 +12,10 @@ What the hub does in this milestone
   3. MatchAuctionFSM       protocols/match_auction.py. A failed attempt is retried (wider detour)
                            up to `max_attempts`; the final failure refunds the escrows (FE-01).
   4. LateBidHandler        bids that arrive for a pool whose auction is closed are rejected (GC-09).
+  5. Repositioning         OPT-IN (pass `reposition=RepositionRules()`). Every `t_rebalance` the hub
+                           compares the predicted demand at the staging points (DemandForecast
+                           messages, or `demand_fn`) with where its idle drivers are, and asks the
+                           best ones to move: protocols/reposition.py (RepositionProtocol).
 
 Roles of the data it keeps: `pools` (live and finished), `matches` (pool_id -> MatchResult).
 Drivers: for M5 the hub is given the JIDs of the drivers to call (`driver_jids`); DriverStatus-
@@ -19,8 +23,10 @@ based selection of nearby free drivers arrives with the Driver milestone.
 Reputation: `reputations` is the hub's own record (jid -> 1..5); the Reputation agent will feed it.
 """
 import logging
+import math
+from collections import Counter
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 from spade.behaviour import CyclicBehaviour
 
@@ -33,16 +39,20 @@ from common.messages import (
     make_request, make_template,
 )
 from common.ontology import (
-    AuctionOutcome, AuditData, AuditReport, AuditRequest, AuditTrip, DriverState, DriverStatus, Escrow, EscrowStatus, FailureReason, MatchResult, Perf,
+    AuctionOutcome, AuditData, AuditReport, AuditRequest, AuditTrip, DemandForecast, DriverState, DriverStatus, Escrow, EscrowStatus, FailureReason, MatchResult, Perf,
     Penalty, Policy, Pool, Refund, PoolProposal, PoolStatus, Protocol, ReputationScore, SettlementComplete,
-    TripCompleted, TripFailed, TripRequest, parse_payload,
+    StagingPoint, TripCompleted, TripFailed, TripRequest, parse_payload,
 )
 from common.settings import (
     AUCTION_PRICING, MAX_AUCTION_ATTEMPTS, T_AUCTION, T_AWARD, T_ESCROW, VALUE_OF_DETOUR,
-    T_POOL_RESPONSE, T_STATUS, VALUE_OF_REPUTATION, VALUE_OF_TIME, WIDEN_DETOUR,
+    T_POOL_RESPONSE, T_REBALANCE, T_REPOSITION, T_STATUS, VALUE_OF_REPUTATION, VALUE_OF_TIME, WIDEN_DETOUR,
 )
 from protocols.match_auction import AuctionContext, MATCHED, MatchAuctionFSM, RETRY
 from protocols.payment_common import bare
+from protocols.reposition import (
+    ARRIVED, RepositionContext, RepositionFSM, RepositionPlan, RepositionPlanner, RepositionRules,
+    plan_repositions,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -310,6 +320,27 @@ class RefundReceiver(CyclicBehaviour):
             self.agent.refunds.append(back)
 
 
+class DemandForecastReceiver(CyclicBehaviour):
+    """DemandForecastProtocol: inform(DemandForecast) -> the numbers the rebalancing heuristic reads.
+    If the hub was given `forecast_jids`, only those senders count (otherwise anyone may skew it)."""
+
+    async def run(self):
+        msg = await self.receive(timeout=1)
+        if msg is None:
+            return
+        hub = self.agent
+        if hub.forecast_jids is not None and bare(msg.sender) not in hub.forecast_jids:
+            hub.log(f"ignored demand forecast from {bare(msg.sender)}")
+            return
+        try:
+            fc = parse_payload(msg, strict=True)
+        except (ValueError, TypeError):
+            return
+        if isinstance(fc, DemandForecast) and hub.record_forecast(fc):
+            hub.log(f"forecast for {fc.hub_id}: {fc.expected_requests:.1f} requests "
+                    f"until t={fc.horizon_end:.0f}")
+
+
 class PolicyReceiver(CyclicBehaviour):
     """PolicyProtocol (RI-04): acknowledge with agree, or refuse(reason). Only the Regulator's word counts."""
 
@@ -393,7 +424,11 @@ class MicrohubAgent(BaseAgent):
                  fare_cap: Optional[float] = None, t_status: float = T_STATUS,
                  reputation_jid: Optional[str] = None, propose_pools: bool = True,
                  t_pool_response: float = T_POOL_RESPONSE, regulator_jid: Optional[str] = None,
-                 audit_logs_available: bool = True, **kwargs):
+                 audit_logs_available: bool = True,
+                 reposition: Optional[RepositionRules] = None, t_rebalance: float = T_REBALANCE,
+                 t_reposition: float = T_REPOSITION,
+                 demand_fn: Optional[Callable[[StagingPoint, float], float]] = None,
+                 forecast_jids: Optional[List[str]] = None, **kwargs):
         super().__init__(jid, password, **kwargs)
         self.hub_id = hub_id                  # node id in the road network (== MicrohubNode.id)
         self.driver_jids: List[str] = [bare(j) for j in (driver_jids or [])]
@@ -421,6 +456,16 @@ class MicrohubAgent(BaseAgent):
         self.reputation_flags: Dict[str, bool] = {}
         self.finished: List[AuctionContext] = []
         self._seq = 0
+        # repositioning (None = this hub never moves drivers)
+        self.reposition_rules = reposition
+        self.t_rebalance, self.t_reposition = t_rebalance, t_reposition
+        self.demand_fn = demand_fn                      # (staging point, now) -> predicted requests
+        self.forecast_jids = [bare(j) for j in forecast_jids] if forecast_jids is not None else None
+        self.demand_forecasts: Dict[str, DemandForecast] = {}      # hub id -> newest forecast
+        self.repositions: Dict[str, RepositionContext] = {}        # thread -> requests in flight
+        self.reposition_log: List[RepositionContext] = []          # finished ones
+        self.reposition_cooldown: Dict[str, float] = {}            # driver JID -> not before (sim t)
+        self._reposition_seq = 0
 
     # ---- helpers used by behaviours -----------------------------------------------------
     def log(self, text: str) -> None:
@@ -548,6 +593,100 @@ class MicrohubAgent(BaseAgent):
         else:
             rec.state, rec.pool.status = "UNMATCHED", PoolStatus.DISSOLVED
 
+    # ---- repositioning (protocols/reposition.py) ------------------------------------------
+    def record_forecast(self, fc: DemandForecast) -> bool:
+        """Keep the newest forecast per hub. False if ignored (negative, or older than the one held)."""
+        old = self.demand_forecasts.get(fc.hub_id)
+        if fc.expected_requests < 0 or (old is not None and fc.horizon_start < old.horizon_start):
+            return False
+        self.demand_forecasts[fc.hub_id] = fc
+        return True
+
+    def predicted_demand(self, sp: StagingPoint, now: float) -> float:
+        """Expected requests at a staging point: `demand_fn` if the hub has one, otherwise the sum of the
+        unexpired forecasts of the hubs the point serves (sp.covered_hubs)."""
+        if self.demand_fn is not None:
+            return self.demand_fn(sp, now)
+        total = 0.0
+        for hub_id in sp.covered_hubs:
+            fc = self.demand_forecasts.get(hub_id)
+            if fc is not None and fc.horizon_end > now:
+                total += fc.expected_requests
+        return total
+
+    def _fresh_status(self, jid: str, now: float) -> Optional[DriverStatus]:
+        entry = self.registry.get(jid)
+        return entry[0] if entry and now - entry[1] <= 3 * self.t_status else None
+
+    def idle_drivers(self, now: float) -> Dict[str, str]:
+        """driver JID -> node, for the drivers this hub may move right now: its own, idle, empty, with a
+        fresh status, not already being moved, not on cooldown, and with enough shift left."""
+        rules = self.reposition_rules or RepositionRules()
+        moving = {c.plan.driver_jid for c in self.repositions.values()}
+        out: Dict[str, str] = {}
+        for jid in self.driver_jids:
+            st = self._fresh_status(jid, now)
+            if (st is None or st.state != DriverState.IDLE or st.current_passengers
+                    or jid in moving or self.reposition_cooldown.get(jid, -math.inf) > now
+                    or st.shift_end - now < rules.min_shift_left):
+                continue
+            out[jid] = st.location
+        return out
+
+    def reposition_supply(self, now: float) -> Dict[str, int]:
+        """staging point id -> idle drivers standing there (any hub's) + requests in flight towards it."""
+        here = Counter(st.location for st, at in self.registry.values()
+                       if now - at <= 3 * self.t_status and st.state == DriverState.IDLE)
+        supply = {sp.id: here[sp.location] for sp in self.network.staging_points.values()}
+        for ctx in self.repositions.values():
+            sp_id = ctx.plan.staging_point_id
+            supply[sp_id] = supply.get(sp_id, 0) + 1
+        return supply
+
+    def plan_repositions(self, now: float) -> List[RepositionPlan]:
+        """The heuristic, fed with this hub's view. Does not send anything."""
+        if self.network is None or self.reposition_rules is None:
+            return []
+        idle = self.idle_drivers(now)
+        if not idle:
+            return []
+
+        def seconds(a: str, b: str) -> float:
+            try:
+                return self.network.travel_time(a, b, now)
+            except KeyError:                       # a node the graph does not know
+                return math.inf
+
+        return plan_repositions(idle, list(self.network.staging_points.values()),
+                                lambda sp: self.predicted_demand(sp, now), seconds,
+                                self.reposition_supply(now), self.reposition_rules)
+
+    def start_reposition(self, plan: RepositionPlan) -> RepositionContext:
+        """Start one RepositionFSM (also usable directly, without the heuristic)."""
+        self._reposition_seq += 1
+        ctx = RepositionContext(plan, f"{self.hub_id}-repo-{self._reposition_seq:04d}",
+                                self.hub_id, self.t_reposition)
+        self.repositions[ctx.thread] = ctx
+        self.add_behaviour(RepositionFSM(ctx), make_template(Protocol.REPOSITION, thread=ctx.thread))
+        return ctx
+
+    def rebalance(self, now: float) -> List[RepositionContext]:
+        """One rebalancing round: plan, then start one FSM per move."""
+        started = [self.start_reposition(p) for p in self.plan_repositions(now)]
+        for ctx in started:
+            self.log(f"rebalance: {ctx.plan.driver_jid} {ctx.plan.from_node} -> {ctx.plan.staging_point_id} "
+                     f"({ctx.plan.travel_time:.0f}s, incentive {ctx.plan.incentive:.2f})")
+        return started
+
+    def on_reposition_finished(self, ctx: RepositionContext) -> None:
+        """Called by the FSM's END state. Anything but an arrival puts the driver on cooldown."""
+        self.repositions.pop(ctx.thread, None)
+        self.reposition_log.append(ctx)
+        if ctx.outcome != ARRIVED:
+            cooldown = (self.reposition_rules or RepositionRules()).cooldown
+            self.reposition_cooldown[ctx.plan.driver_jid] = clock.now() + cooldown
+        self.log(f"reposition {ctx.thread}: {ctx.outcome}" + (f" ({ctx.reason})" if ctx.reason else ""))
+
     async def setup(self):
         await super().setup()
         self.add_behaviour(TripRequestReceiver(),
@@ -564,3 +703,6 @@ class MicrohubAgent(BaseAgent):
             self.add_behaviour(SettlementReceiver(), make_template(Protocol.SETTLEMENT, Perf.INFORM))
             self.add_behaviour(RefundReceiver(), make_template(Protocol.REFUND, Perf.INFORM))
         self.add_behaviour(LateBidHandler(), make_template(Protocol.MATCH_AUCTION, Perf.PROPOSE))
+        if self.reposition_rules is not None:
+            self.add_behaviour(DemandForecastReceiver(), make_template(Protocol.DEMAND_FORECAST, Perf.INFORM))
+            self.add_behaviour(RepositionPlanner())
