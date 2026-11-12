@@ -103,6 +103,17 @@ class TripRecord:
         return (self.boarded_at - self.matched_at) - (self.match.pickup_eta - self.matched_at)
 
 
+def balanced_hub_policy(rng, spread: float = 1.6):
+    """Hub choice for riders who shop around: among the covering hubs within `spread` x the nearest
+    one's travel time, pick at random weighted by 1/time. A stand-in for choosing by the hubs' quotes
+    (wait, fare, queue), which would need a hub-quote protocol."""
+    def choose(candidates):                       # [(hub_id, seconds)], nearest first
+        best = candidates[0][1]
+        pool = [(h, t) for h, t in candidates if t <= spread * max(best, 1.0)]
+        return rng.choices([h for h, _ in pool], weights=[1.0 / max(t, 1.0) for _, t in pool])[0]
+    return choose
+
+
 def default_rating(trip: TripRecord, lateness_tolerance: float = 120.0) -> int:
     score = 5
     if trip.pickup_delay > lateness_tolerance:
@@ -134,7 +145,7 @@ class RiderAgent(BaseAgent):
                  rate_with: Optional[Callable[[TripRecord], int]] = None,
                  t_pool_response: float = T_POOL_RESPONSE, patience: float = T_RIDER_PATIENCE,
                  ready_delay: float = READY_DELAY, no_show: bool = False, auto_escrow: bool = True,
-                 **kwargs):
+                 hub_policy: Optional[Callable] = None, **kwargs):
         super().__init__(jid, password, **kwargs)
         self.hubs: Dict[str, str] = {h: bare(j) for h, j in (hub_jids or {}).items()}   # hub node id -> JID
         self.network = network
@@ -143,6 +154,7 @@ class RiderAgent(BaseAgent):
         self.rate_with = rate_with or default_rating
         self.t_pool_response, self.patience, self.ready_delay = t_pool_response, patience, ready_delay
         self.no_show, self.auto_escrow = no_show, auto_escrow
+        self.hub_policy = hub_policy                   # None = the nearest covering hub
         self.state = IDLE
         self.trip: Optional[TripRecord] = None
         self.trips: List[TripRecord] = []
@@ -189,10 +201,12 @@ class RiderAgent(BaseAgent):
         """Nearest hub (by coverage) that covers the destination, among the hubs this rider knows."""
         if self.network is None:
             return next(iter(self.hubs), None)
-        for hid in self.network.hubs_covering(destination, clock.now()):
-            if hid in self.hubs:
-                return hid
-        return None
+        covering = [h for h in self.network.hubs_covering(destination, clock.now()) if h in self.hubs]
+        if not covering:
+            return None
+        if self.hub_policy is None or len(covering) == 1:
+            return covering[0]
+        return self.hub_policy([(h, self.network.travel_time(h, destination, clock.now())) for h in covering])
 
     # ---- TripRequestProtocol (initiator) ----------------------------------------------------
     def request_trip(self, destination: str, max_fare: float, window: float = 3600.0,

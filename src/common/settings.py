@@ -59,3 +59,10 @@ MAX_POOL_SIZE = 4           # riders per vehicle (== DRIVER_CAPACITY)
 MAX_BATCH = 8               # requests solved together by the exact partition (3^n sub-problems)
 POOL_SOLVER = "exact"       # key of common.pooling.SOLVERS
 DETOUR_WEIGHT = 1.0         # seconds of rider detour counted per vehicle second in the pooling objective
+
+# ---- Market robustness (post-M9; all optional, off unless the hub is given a value) ---------------
+RESERVE_MARGIN = 1.5        # auction reserve = margin x posted tariff of the planned route (not the riders' max)
+PICKUP_ALLOWANCE = 300.0    # seconds of pickup leg the tariff reserve allows for (+ this per retry)
+MAX_PICKUP_ETA = 900.0      # CC-08: only call drivers whose own ETA to the hub is within this (+300 s per retry)
+RETRY_DELAY = 20.0          # wait this long before re-running a failed auction (provisional locks expire)
+WINDOW_SLACK = 120.0        # close the batch window early if a queued rider's window ends within this

@@ -22,11 +22,11 @@ import logging
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
-from spade.behaviour import CyclicBehaviour
+from spade.behaviour import CyclicBehaviour, OneShotBehaviour
 
 from agents.base_agent import BaseAgent
 from common import clock
-from common.auction import AuctionRules
+from common.auction import AuctionRules, ceil_cents
 from common.policy import PolicyBook
 from common.messages import (
     make_auction_failed, make_inform, make_message, make_pool_proposal, make_reject_proposal, make_reply,
@@ -43,7 +43,8 @@ from common.settings import (
 )
 from common.pooling import GroupPlan, fare_ceiling, reference_solo_fare, split_fare_weighted
 from common.settings import (
-    DETOUR_WEIGHT, DRIVER_BASE_COST, DRIVER_COST_PER_SECOND, MAX_BATCH, MAX_POOL_SIZE, POOL_SOLVER, T_POOL,
+    DETOUR_WEIGHT, DRIVER_BASE_COST, DRIVER_COST_PER_SECOND, MAX_BATCH, MAX_POOL_SIZE, PICKUP_ALLOWANCE,
+    POOL_SOLVER, T_POOL,
 )
 from protocols.match_auction import AuctionContext, MATCHED, MatchAuctionFSM, RETRY
 from protocols.pool_formation import BatchWindow, QueuedRequest, handle_decline, window_closes_at
@@ -402,6 +403,19 @@ class LateBidHandler(CyclicBehaviour):
             sender, AuctionOutcome(msg.thread, False, None, FailureReason.TIMEOUT)))
 
 
+class _Wake(OneShotBehaviour):
+    """Re-checks the auction queue once a delayed retry is due."""
+
+    def __init__(self, delay: float):
+        super().__init__()
+        self.delay = delay
+
+    async def run(self):
+        await clock.sim_sleep(self.delay + 0.1)
+        self.agent._waking = False
+        self.agent._next_auction()
+
+
 class MicrohubAgent(BaseAgent):
     role = "microhub"
     subscribes_to_traffic = True
@@ -415,7 +429,9 @@ class MicrohubAgent(BaseAgent):
                  t_pool_response: float = T_POOL_RESPONSE, regulator_jid: Optional[str] = None,
                  audit_logs_available: bool = True, t_pool: float = 0.0, max_pool_size: int = MAX_POOL_SIZE,
                  max_batch: int = MAX_BATCH, solver: str = POOL_SOLVER, detour_weight: float = DETOUR_WEIGHT,
-                 solo_fallback: bool = True, **kwargs):
+                 solo_fallback: bool = True, reserve_margin: Optional[float] = None,
+                 pickup_allowance: float = PICKUP_ALLOWANCE, max_pickup_eta: Optional[float] = None,
+                 retry_delay: float = 0.0, window_slack: float = 0.0, **kwargs):
         super().__init__(jid, password, **kwargs)
         self.hub_id = hub_id                  # node id in the road network (== MicrohubNode.id)
         self.driver_jids: List[str] = [bare(j) for j in (driver_jids or [])]
@@ -447,6 +463,9 @@ class MicrohubAgent(BaseAgent):
         self.t_pool, self.max_pool_size, self.max_batch = t_pool, max_pool_size, max_batch
         self.solver, self.detour_weight, self.solo_fallback = solver, detour_weight, solo_fallback
         self.queue: List[QueuedRequest] = []
+        self.reserve_margin, self.pickup_allowance = reserve_margin, pickup_allowance
+        self.max_pickup_eta, self.retry_delay, self.window_slack = max_pickup_eta, retry_delay, window_slack
+        self._waking = False
         self.auction_queue: List[tuple] = []
         self.auction_running = False
 
@@ -461,16 +480,53 @@ class MicrohubAgent(BaseAgent):
     def reputation_of(self, driver_jid: str) -> Optional[float]:
         return self.reputations.get(bare(driver_jid))
 
-    def eligible_drivers(self, now: float) -> List[str]:
-        """CC-08: do not call drivers known to hold a lock or be busy. A driver with no (fresh)
-        status is still called; it refuses `locked` itself if it must (CC-09)."""
+    def eligible_drivers(self, now: float, attempt: int = 0) -> List[str]:
+        """CC-08: do not call drivers known to hold a lock or be busy, nor (if `max_pickup_eta` is
+        set) drivers too far from the hub to be useful; each retry widens that radius. A driver with
+        no (fresh) status is still called; it refuses `locked` itself if it must (CC-09)."""
         out = []
         for jid in self.driver_jids:
             entry = self.registry.get(jid)
-            if entry and now - entry[1] <= 3 * self.t_status and entry[0].state != DriverState.IDLE:
-                continue
+            if entry and now - entry[1] <= 3 * self.t_status:
+                if entry[0].state != DriverState.IDLE:
+                    continue
+                if self.max_pickup_eta is not None:
+                    eta = self.hub_eta(jid, self.hub_id, now)
+                    if eta is not None and eta > self.max_pickup_eta + attempt * 300.0:
+                        continue
             out.append(jid)
         return out
+
+    def retry_wait(self, ctx: AuctionContext) -> float:
+        """How long to wait before re-running a failed auction. Normally `retry_delay`; but if the
+        drivers refused because they were locked by ANOTHER hub's open auction (or none was free to
+        call), the lock lasts up to t_auction + t_award, so waiting less is pointless."""
+        if not self.retry_delay:
+            return 0.0
+        locked = sum(1 for r in ctx.refusals.values() if r == "locked")
+        if not ctx.recipients or locked >= max(1, len(ctx.recipients) // 2):
+            return max(self.retry_delay, self.t_auction + self.t_award)
+        return self.retry_delay
+
+    def tariff_reserve(self, reqs, stop_order, attempt: int) -> Optional[float]:
+        """Reserve from the posted tariff of the planned route instead of the riders' max fare, so a
+        lone bidder cannot be paid the riders' whole budget: margin x (base + rate x (route + pickup
+        allowance)). None when disabled. Each retry allows a longer pickup leg."""
+        if self.reserve_margin is None or self.network is None:
+            return None
+        try:
+            if stop_order:
+                routed = self.network.route_through([self.hub_id, *stop_order], clock.now())
+                route = routed[1] if routed else None
+            else:
+                planned = self.network.best_stop_order(self.hub_id, [r.destination_home for r in reqs], clock.now())
+                route = planned[1] if planned else None
+        except KeyError:
+            return None
+        if route is None:
+            return None
+        cost = DRIVER_BASE_COST + DRIVER_COST_PER_SECOND * (route + self.pickup_allowance * (1 + attempt))
+        return ceil_cents(self.reserve_margin * cost) / 100
 
     def hub_eta(self, driver_jid: str, pickup: str, now: float) -> Optional[float]:
         """CC-10: the hub's own ETA from the driver's last reported position; None if unknown."""
@@ -601,12 +657,14 @@ class MicrohubAgent(BaseAgent):
         rec.escrow_deadline = clock.now() + self.t_escrow
         rec.pool.status = PoolStatus.LOCKED
 
-    def start_auction(self, rec: PoolRecord, attempt: int = 0) -> None:
+    def start_auction(self, rec: PoolRecord, attempt: int = 0, delay: Optional[float] = None) -> None:
         """Auctions run ONE AT A TIME per hub: two simultaneous auctions would call the same idle
         drivers, and a driver holding a provisional lock for the first must refuse the second (CC-09),
-        starving it of bids. A retry goes to the front of the line."""
+        starving it of bids. A retry goes to the front of the line, after `retry_delay` (so the locks
+        of the failed attempt have expired)."""
         rec.state = "AUCTION_QUEUED"
-        entry = (rec, attempt)
+        wait = (self.retry_delay if delay is None else delay) if attempt else 0.0
+        entry = (rec, attempt, clock.now() + wait)
         if attempt:
             self.auction_queue.insert(0, entry)
         else:
@@ -616,7 +674,15 @@ class MicrohubAgent(BaseAgent):
     def _next_auction(self) -> None:
         if self.auction_running or not self.auction_queue:
             return
-        rec, attempt = self.auction_queue.pop(0)
+        now = clock.now()
+        ready = next((e for e in self.auction_queue if e[2] <= now), None)
+        if ready is None:                                   # only delayed retries: wake up when the first is due
+            if not self._waking:
+                self._waking = True
+                self.add_behaviour(_Wake(min(e[2] for e in self.auction_queue) - now))
+            return
+        self.auction_queue.remove(ready)
+        rec, attempt, _ = ready
         self.auction_running = True
         rec.state = "AUCTIONING"
         rec.pool.status = PoolStatus.AUCTIONING
@@ -637,7 +703,7 @@ class MicrohubAgent(BaseAgent):
             rec.state, rec.pool.status = "ASSIGNED", PoolStatus.ASSIGNED
             self.matches[ctx.pool_id] = ctx.match
         elif ctx.outcome == RETRY:
-            self.start_auction(rec, ctx.attempt + 1)
+            self.start_auction(rec, ctx.attempt + 1, self.retry_wait(ctx))
         else:
             rec.state, rec.pool.status = "UNMATCHED", PoolStatus.DISSOLVED
         self._next_auction()
