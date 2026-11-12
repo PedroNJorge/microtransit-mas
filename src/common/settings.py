@@ -52,3 +52,16 @@ T_AUDIT_RESPONSE = 60.0     # a hub that does not answer an audit request in tim
 T_POLICY_ACK = 30.0         # the Regulator re-sends a policy to recipients that did not answer (RI-04)
 PENALTY_NON_COOPERATION = 50.0   # EUR
 PENALTY_FARE_VIOLATION = 10.0    # EUR per fare above the cap
+
+# ---- Repositioning (hub rebalancing heuristic, protocols/reposition.py) ----------------------
+# T_REPOSITION (above, Driver section) is how long the hub waits for agree / refuse.
+T_REBALANCE = 60.0                  # the hub looks for drivers worth moving this often
+REPOSITION_DEMAND_THRESHOLD = 3.0   # predicted requests (over the forecast horizon) above which a
+                                    # staging point counts as "hot"
+REPOSITION_REQUESTS_PER_DRIVER = 4.0    # predicted requests one waiting driver is expected to cover
+                                        # (keep it >= the threshold: a point just over it wants ONE driver)
+REPOSITION_MAX_TRAVEL = 600.0       # never move a driver further than this (seconds of driving)
+REPOSITION_COOLDOWN = 120.0         # after a refusal / failure leave that driver alone this long
+REPOSITION_MIN_SHIFT_LEFT = 900.0   # do not move a driver whose shift ends sooner than this
+REPOSITION_INCENTIVE_MARGIN = 1.1   # the hub pays this x the driver's assumed driving cost
+REPOSITION_MAX_MOVES = 3            # drivers moved per rebalancing round
