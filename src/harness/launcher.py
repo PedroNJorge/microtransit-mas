@@ -29,6 +29,7 @@ from agents.base_agent import BaseAgent
 from agents.registry import AGENT_CLASSES
 from common import clock
 from common.graph import TransitNetwork
+from common.ws_server import start_ws_server
 from harness.active import clear_active, write_active
 from harness.ping import PingResult, format_results, ping_agents
 from harness.scenario import DEFAULT_SCENARIO, AgentSpec, Scenario, ScenarioError
@@ -52,6 +53,7 @@ class Harness:
         self.network: Optional[TransitNetwork] = None
         self._server: Optional[asyncio.subprocess.Process] = None
         self._server_dir: Optional[str] = None
+        self._ws_server = None
 
     # ---- XMPP server -----------------------------------------------------------------
     async def ensure_server(self, wait: float = 20.0) -> None:
@@ -130,7 +132,8 @@ class Harness:
         sc = self.scenario
         await self.ensure_server()
         self.network = TransitNetwork.from_file(str(sc.graph_path))
-        clock.start(sc.speed)                           # t = 0
+        self._ws_server = await start_ws_server()       # <-- Liga o WebSocket na porta 8765
+        clock.start(sc.speed)
         try:
             for spec in sc.roster():
                 agent = self.build_agent(spec)
@@ -145,9 +148,13 @@ class Harness:
         for jid in reversed(list(self.agents)):
             try:
                 await self.agents[jid].stop()
-            except Exception:                           # keep stopping the others
+            except Exception:
                 logger.exception("error stopping %s", jid)
         self.agents.clear()
+        if self._ws_server is not None:
+            self._ws_server.close()
+            await self._ws_server.wait_closed()
+            self._ws_server = None
         await self._stop_server()
 
     async def ping_all(self, timeout: float = 5.0) -> List[PingResult]:

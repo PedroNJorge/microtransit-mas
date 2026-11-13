@@ -77,6 +77,8 @@ class Scenario:
     n_drivers: int = 2
     driver_start_hubs: List[str] = field(default_factory=list)
     n_riders: int = 2
+    rider_auto_request_interval: Optional[float] = None
+    rider_auto_request_max_fare: float = 100.0
     t_traffic: float = T_TRAFFIC
     full_every: int = FULL_SNAPSHOT_EVERY
     rider_balance: float = 100.0
@@ -109,7 +111,9 @@ class Scenario:
         width = max(2, len(str(max(self.n_riders, 1))))
         for i in range(self.n_riders):
             name = f"rider_{i + 1:0{width}d}"
-            specs.append(AgentSpec("rider", name, self.jid(name)))
+            specs.append(AgentSpec("rider", name, self.jid(name), {
+                "auto_request_interval": self.rider_auto_request_interval,
+                "auto_request_max_fare": self.rider_auto_request_max_fare}))
         specs.append(AgentSpec("environment", "environment", self.jid("environment")))
         return specs
 
@@ -179,8 +183,13 @@ class Scenario:
             raise ScenarioError(f"drivers.start_hubs must be a list of ACTIVE hubs {hub_ids}")
 
         r = dict(data.get("riders", {}))
-        _only_keys(r, {"count"}, "riders")
+        _only_keys(r, {"count", "auto_request_interval", "max_fare"}, "riders")
         n_riders = _int(r.get("count", 2), "riders.count", 0)
+        auto_request_interval = r.get("auto_request_interval")
+        if auto_request_interval is not None:
+            auto_request_interval = _num(auto_request_interval, "riders.auto_request_interval",
+                                         positive=True)
+        auto_request_max_fare = _num(r.get("max_fare", 100.0), "riders.max_fare", positive=True)
 
         e = dict(data.get("environment", {}))
         _only_keys(e, {"t_traffic", "full_every"}, "environment")
@@ -202,6 +211,8 @@ class Scenario:
         return cls(name=str(data.get("name", default_name)), graph_path=graph_path,
                    hub_ids=hub_ids, xmpp=xmpp, speed=speed, n_drivers=n_drivers,
                    driver_start_hubs=list(start_hubs), n_riders=n_riders,
+                   rider_auto_request_interval=auto_request_interval,
+                   rider_auto_request_max_fare=auto_request_max_fare,
                    t_traffic=_num(e.get("t_traffic", T_TRAFFIC), "environment.t_traffic",
                                   positive=True),
                    full_every=_int(e.get("full_every", FULL_SNAPSHOT_EVERY),

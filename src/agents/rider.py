@@ -44,6 +44,7 @@ from common.ontology import (
     parse_payload,
 )
 from common.settings import READY_DELAY, T_POOL_RESPONSE, T_RIDER_PATIENCE
+from common.ws_server import broadcast_event
 from protocols.payment_common import bare
 
 logger = logging.getLogger(__name__)
@@ -126,6 +127,14 @@ class RiderListener(CyclicBehaviour):
         await r.check_deadlines(self)
 
 
+class AutoTripGenerator(CyclicBehaviour):
+    async def run(self):
+        rider = self.agent
+        if rider.state == IDLE and rider.request_auto_trip() is None:
+            logger.info("%s: automatic trip skipped; no covered destination is available", rider.jid)
+        await clock.sim_sleep(rider.auto_request_interval)
+
+
 class RiderAgent(BaseAgent):
     role = "rider"
 
@@ -134,6 +143,7 @@ class RiderAgent(BaseAgent):
                  rate_with: Optional[Callable[[TripRecord], int]] = None,
                  t_pool_response: float = T_POOL_RESPONSE, patience: float = T_RIDER_PATIENCE,
                  ready_delay: float = READY_DELAY, no_show: bool = False, auto_escrow: bool = True,
+                 auto_request_interval: Optional[float] = None, auto_request_max_fare: float = 100.0,
                  **kwargs):
         super().__init__(jid, password, **kwargs)
         self.hubs: Dict[str, str] = {h: bare(j) for h, j in (hub_jids or {}).items()}   # hub node id -> JID
@@ -143,6 +153,15 @@ class RiderAgent(BaseAgent):
         self.rate_with = rate_with or default_rating
         self.t_pool_response, self.patience, self.ready_delay = t_pool_response, patience, ready_delay
         self.no_show, self.auto_escrow = no_show, auto_escrow
+        if auto_request_interval is not None and auto_request_interval <= 0:
+            raise ValueError("auto_request_interval must be > 0")
+        if auto_request_max_fare <= 0:
+            raise ValueError("auto_request_max_fare must be > 0")
+        self.auto_request_interval = auto_request_interval
+        self.auto_request_max_fare = auto_request_max_fare
+        self._auto_destinations: List[str] = []
+        self._auto_destination_index = 0
+        self._last_auto_destination: Optional[str] = None
         self.state = IDLE
         self.trip: Optional[TripRecord] = None
         self.trips: List[TripRecord] = []
@@ -156,6 +175,36 @@ class RiderAgent(BaseAgent):
         for proto in (Protocol.TRIP_REQUEST, Protocol.POOL_FORMATION, Protocol.ESCROW,
                       Protocol.MATCH_AUCTION, Protocol.TRIP_EXECUTION, Protocol.SETTLEMENT, Protocol.REFUND):
             self.add_behaviour(RiderListener(), make_template(proto))
+        if self.auto_request_interval is not None:
+            if self.network is None:
+                raise ValueError("automatic trip generation requires a transit network")
+            self._auto_destinations = [
+                node for node in self.network.nodes_of_type("residential")
+                if any(hub in self.hubs for hub in self.network.hubs_covering(node, clock.now()))
+            ]
+            if not self._auto_destinations:
+                raise ValueError("automatic trip generation requires a covered residential destination")
+            self._auto_destination_index = sum(map(ord, self.me)) % len(self._auto_destinations)
+            self.add_behaviour(AutoTripGenerator())
+
+  # ---- visualization ---------------------------------------------------------------------
+    def broadcast_viz(self, node_override: str = "", dest_override: str = "") -> None:
+        t = self.trip
+        # Extrai o ID do hub a partir de t.hub_jid (ex: "hub_trindade@localhost" -> "hub_trindade")
+        hub_node = t.hub_jid.split("@")[0] if (t and t.hub_jid) else ""
+        node = node_override or hub_node
+        destination = dest_override or (t.request.destination_home if t else "")
+        coro = broadcast_event("RIDER_UPDATE", {
+            "id": self.jid.user,
+            "state": self.state,
+            "node": node,
+            "destination": destination,
+        })
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(coro)
+        except RuntimeError:
+            pass
 
     # ---- state machine ---------------------------------------------------------------------
     @property
@@ -170,18 +219,22 @@ class RiderAgent(BaseAgent):
         if self.trip and note:
             self.trip.log.append(f"{self.state}->{new}: {note}")
         self.state = new
+        self.broadcast_viz()
         return True
 
     def end_trip(self, outcome: str, reason: str = "") -> None:
         t = self.trip
         if t is None:
             return
+        last_node = t.hub_jid.split("@")[0] if t.hub_jid else ""
+        last_dest = t.request.destination_home
         t.outcome, t.reason = outcome, reason
         self.trips.append(t)
         self.trip = None
         self._deadline = float("inf")
         if self.state != IDLE:
             self.go(IDLE, f"{outcome} {reason}".strip())
+        self.broadcast_viz(node_override=last_node, dest_override=last_dest)
         logger.info("[%s] trip %s ended: %s %s", self.jid.user, t.request.request_id, outcome, reason)
         self.ended.set()
 
@@ -218,6 +271,24 @@ class RiderAgent(BaseAgent):
         self.add_behaviour(_Sender(make_message(self.hubs[hub_id], Perf.REQUEST, Protocol.TRIP_REQUEST,
                                                 req, req.request_id)))
         return req
+
+    def request_auto_trip(self) -> Optional[TripRequest]:
+        if self.auto_request_interval is None or self.state != IDLE or not self._auto_destinations:
+            return None
+        now = clock.now()
+        for offset in range(len(self._auto_destinations)):
+            index = (self._auto_destination_index + offset) % len(self._auto_destinations)
+            destination = self._auto_destinations[index]
+            if destination == self._last_auto_destination:
+                continue
+            if not any(hub in self.hubs for hub in self.network.hubs_covering(destination, now)):
+                continue
+            request = self.request_trip(destination, self.auto_request_max_fare)
+            self._auto_destination_index = (index + 1) % len(self._auto_destinations)
+            if request is not None:
+                self._last_auto_destination = destination
+            return request
+        return None
 
     # ---- incoming ---------------------------------------------------------------------------
     async def on_message(self, beh, msg) -> None:
