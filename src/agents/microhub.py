@@ -469,7 +469,8 @@ class MicrohubAgent(BaseAgent):
         if self.network is not None:
             if not self.network.has_node(req.destination_home):
                 return "unknown_destination"
-            if self.hub_id and self.hub_id not in self.network.hubs_covering(req.destination_home, 0.0):
+            if self.hub_id and self.hub_id not in self.network.hubs_covering(
+                    req.destination_home, clock.now()):
                 return "outside_coverage"
         return ""
 

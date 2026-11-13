@@ -56,6 +56,7 @@ from common.settings import (
 from protocols.payment_common import bare
 
 logger = logging.getLogger(__name__)
+from common.ws_server import broadcast_event
 
 # refuse reasons (plain text bodies of a `refuse`)
 LOCKED = LockReason.LOCKED                  # CC-09
@@ -310,6 +311,37 @@ class DriverAgent(BaseAgent):
         self.status_log.append(st)
         for hub in self.hub_jids:
             await beh.send(make_message(hub, Perf.INFORM, Protocol.DRIVER_STATUS, st))
+        await self.broadcast_viz()
+
+    async def broadcast_viz(self) -> None:
+        if self.network is None or not self.location:
+            return
+        if not self.network.has_node(self.location):
+            return
+        
+        node_data = self.network.g.nodes[self.location]
+        lat = node_data.get("lat")
+        lon = node_data.get("lon")
+        if lat is None or lon is None:
+            return
+
+        onboard_riders = []
+        if self.assignment is not None:
+            onboard_riders = [
+                jid.split("@")[0]
+                for jid in self.assignment.boarded
+                if jid not in self.assignment.dropped
+            ]
+
+        await broadcast_event("DRIVER_UPDATE", {
+            "driver_id": self.jid.user,
+            "lat": lat,
+            "lon": lon,
+            "state": self.state.value,
+            "passengers": self.passengers,
+            "capacity": self.capacity,
+            "rider_ids": onboard_riders
+        })
 
     # ---- bidding ---------------------------------------------------------------------------
     def calculate_bid(self, cfp: CFP, now: float):
@@ -451,6 +483,7 @@ class DriverAgent(BaseAgent):
                     break                                   # road closed: re-plan from here
                 await clock.sim_sleep(dt)
                 self.location = nxt
+                await self.broadcast_viz()
             if a.cancelled:
                 raise _TripCancelled()
 
@@ -497,6 +530,7 @@ class DriverAgent(BaseAgent):
         self.passengers = len(boarding)
         self.activity = "on_trip"
         await self.announce(beh)
+        await self.broadcast_viz()
         # drive the planned order, dropping off as we go
         for stop in a.offer.route[1:]:
             await self.drive(stop, a)
@@ -507,12 +541,14 @@ class DriverAgent(BaseAgent):
                     self.passengers -= 1
                     await beh.send(make_message(jid, Perf.INFORM, Protocol.TRIP_EXECUTION,
                                                 RiderDroppedOff(req, pool, self.me, clock.now()), pool))
+            await self.broadcast_viz()
         for jid, req, dest in boarding:                            # drop-off at the pickup itself
             if jid not in a.dropped:
                 a.dropped.append(jid)
                 self.passengers -= 1
                 await beh.send(make_message(jid, Perf.INFORM, Protocol.TRIP_EXECUTION,
                                             RiderDroppedOff(req, pool, self.me, clock.now()), pool))
+        await self.broadcast_viz()
         done = TripCompleted(trip_id=f"trip-{pool}", pool_id=pool, driver_id=self.me,
                              rider_ids=list(a.dropped), completed_at=clock.now(),
                              rider_fares={j: a.match.rider_fares[j] for j in a.dropped

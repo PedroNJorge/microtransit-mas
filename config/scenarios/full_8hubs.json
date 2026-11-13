@@ -15,7 +15,9 @@
     "count": 4
   },
   "riders": {
-    "count": 4
+    "count": 4,
+    "auto_request_interval": 300,
+    "max_fare": 100
   },
   "environment": {
     "t_traffic": 60,
