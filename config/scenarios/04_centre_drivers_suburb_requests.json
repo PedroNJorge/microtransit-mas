@@ -1,0 +1,53 @@
+{
+  "name": "04-centre-drivers-suburb-requests",
+  "xmpp": {
+    "host": "localhost",
+    "port": 5222,
+    "server_port": 5269,
+    "password": "dev-password"
+  },
+  "clock": {
+    "speed": 60
+  },
+  "graph": "config/porto_graph.json",
+  "hubs": "all",
+  "duration": 3600,
+  "drivers": {
+    "placement": [
+      {
+        "hubs": {
+          "centre": 2
+        },
+        "count": 10
+      }
+    ]
+  },
+  "riders": {
+    "count": 16
+  },
+  "demand": [
+    {
+      "id": "suburb-demand",
+      "hubs": {
+        "periphery": 4
+      },
+      "start": 300,
+      "end": 2400,
+      "count": 28,
+      "pattern": "random",
+      "max_fare": 25,
+      "pooling": 0.5
+    }
+  ],
+  "environment": {
+    "t_traffic": 60,
+    "full_every": 10
+  },
+  "seed": 42,
+  "payment": {
+    "rider_balance": 100.0,
+    "subsidy_discount": 0.5,
+    "subsidy_budget": null,
+    "hold_max": 7200
+  }
+}

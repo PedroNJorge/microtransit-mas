@@ -1,0 +1,91 @@
+--- a/src/common/ontology.py
++++ b/src/common/ontology.py
+@@ -58,6 +58,7 @@
+     DISRUPTION = "DisruptionProtocol"
+     INTER_HUB = "InterHubCoordinationProtocol"
+     DEMAND_FORECAST = "DemandForecastProtocol"
++    ESCROW_REBIND = "EscrowRebindProtocol"          # rider -> Payment: my new hub after a takeover
+     HEARTBEAT = "HeartbeatProtocol"                 # ping/pong liveness check (every agent)
+ 
+ 
+@@ -110,6 +111,7 @@
+     ACCIDENT = "ACCIDENT"
+     ROAD_CLOSURE = "ROAD_CLOSURE"
+     WEATHER = "WEATHER"
++    CONGESTION = "CONGESTION"      # heavy traffic: edges slower by `severity`, still open
+ 
+ 
+ class FailureReason(str, Enum):
+@@ -120,6 +122,7 @@
+     TIMEOUT = "TIMEOUT"
+     OUTBID = "OUTBID"          # losing bidder in a successful auction
+     NO_BIDS = "NO_BIDS"        # auction closed with zero valid bids
++    OVERLOADED = "OVERLOADED"  # a hub at capacity hands a request to a neighbour (InterHub)
+     INVALID_BID = "INVALID_BID"  # bid rejected by the hub's validity checks (GC-09 still
+                                  # requires every bidder to be answered)
+ 
+@@ -602,13 +605,63 @@
+ 
+ @concept
+ @dataclass
+-class DemandForecast:                   # optional
++class DemandForecast:
++    """Hub -> every peer hub (DemandForecastProtocol): requests expected at `hub_id` in the horizon."""
+     hub_id: str
+     horizon_start: float
+     horizon_end: float
+     expected_requests: float
+ 
+ 
++@concept
++@dataclass
++class PoolSnapshot:
++    """One pending pool as a hub replicates it to its peers (enough for a neighbour to carry it on)."""
++    pool_id: str
++    request: TripRequest
++    rider_jid: str
++    state: str                          # PROPOSED | AWAITING_ESCROW | AUCTIONING
++    escrows: Dict[str, str] = field(default_factory=dict)     # request_id -> escrow_id (informational)
++    created_at: float = 0.0
++
++
++@concept
++@dataclass
++class HubSnapshot:
++    """Hub -> every peer (InterHubCoordinationProtocol, inform): the hub's pending pools. Sent on every
++    change and at least every T_hub_sync, so it is also the heartbeat: a hub whose snapshots stop is
++    presumed dead."""
++    hub_id: str
++    seq: int                            # grows by one per snapshot
++    sent_at: float
++    load: int                           # live pools (pending + assigned)
++    capacity: int
++    pools: List[PoolSnapshot] = field(default_factory=list)
++
++
++@concept
++@dataclass
++class HubTakeover:
++    """New hub -> rider (InterHubCoordinationProtocol, inform): "I serve your request from now on".
++    The rider only believes it if `old_hub` is its current hub and `new_hub` is a hub it knows."""
++    request_id: str
++    pool_id: str
++    old_hub: str                        # JID
++    new_hub: str                        # JID (also the sender)
++    reason: FailureReason               # HUB_FAILED (failover) or OVERLOADED (overflow)
++
++
++@concept
++@dataclass
++class EscrowRebind:
++    """Rider -> Payment (EscrowRebindProtocol, request): move my HELD escrow(s) of this pool from the hub
++    that failed to its successor. Only the rider who owns the money may ask."""
++    rider_id: str
++    pool_id: str
++    old_hub: str                        # JID
++    new_hub: str                        # JID
++
++
+ # ==========================================
+ # 3. Serialization
+ # ==========================================
