@@ -619,10 +619,13 @@
 
         riderStates[id] = state;
 
-        // Distribui até 16 passageiros em círculo largo à volta do hub sem nunca sobrepor
-        const slot = getRiderSlot(id) % 16;
-        const angle = (slot / 16) * (2 * Math.PI);
-        const hubRadius = 0.00085; // ~90m de raio à volta do centro do hub
+        // Distribui os passageiros em anéis concêntricos à volta do hub (16 por anel, até 4 anéis = 64):
+        // num pico de procura (30+ passageiros no mesmo hub) dois passageiros nunca ficam no mesmo sítio.
+        const n = getRiderSlot(id);
+        const slot = n % 16;
+        const ring = Math.floor(n / 16) % 4;
+        const angle = (slot / 16) * (2 * Math.PI) + ring * (Math.PI / 16);   // anéis desfasados
+        const hubRadius = 0.00085 * (1 + 0.6 * ring); // ~90m no 1.º anel, mais afastado nos seguintes
         const hubLatLng = [
             nodeCoords[resolvedNode][0] + Math.sin(angle) * hubRadius,
             nodeCoords[resolvedNode][1] + Math.cos(angle) * hubRadius
@@ -664,10 +667,196 @@
         );
     }
 
+    // 4b. Ruas cortadas (cenário 1): o servidor envia ROAD_BLOCKED / ROAD_CLEARED
+    const blockedRoads = {};   // id do corte -> camadas desenhadas
+
+    function clearBlockedRoads() {
+        Object.keys(blockedRoads).forEach(id => {
+            blockedRoads[id].forEach(l => targetMap.removeLayer(l));
+            delete blockedRoads[id];
+        });
+    }
+
+    function showBlockedRoad(d) {
+        (blockedRoads[d.id] || []).forEach(l => targetMap.removeLayer(l));   // um reenvio substitui, não empilha
+        blockedRoads[d.id] = d.segments.map(seg => {
+            const line = L.polyline(seg, { color: "#e00000", weight: 8, opacity: 0.95, lineCap: "round" })
+                .addTo(targetMap)
+                .bindTooltip(`⛔ Rua cortada (até t=${Math.round(d.end)} s)`, { sticky: true });
+            line.bringToBack();   // veículos e passageiros ficam por cima
+            return line;
+        });
+    }
+
+    // Carga de cada hub (cenário 3, pico de procura): crachá ao lado do hub: 🚕 motoristas no hub · 📥 pedidos recentes · ⏳ à espera · 🚗 em curso · ✖ sem viagem
+    const hubBadges = {};
+
+    function setHubLoad(d) {
+        const resolved = nodeCoords[d.hub_id] ? d.hub_id : (nodeCoords["hub_" + d.hub_id] ? "hub_" + d.hub_id : null);
+        if (!resolved) return;
+        const recent = d.recent || 0, failed = d.failed || 0, drivers = d.drivers || 0;
+        if (recent === 0 && d.waiting === 0 && d.active === 0 && drivers === 0) {
+            if (hubBadges[d.hub_id]) { targetMap.removeLayer(hubBadges[d.hub_id]); delete hubBadges[d.hub_id]; }
+            return;
+        }
+        const burst = recent >= 8 || d.waiting >= 8;                    // muitos pedidos de seguida = pico de procura
+        const parts = [];
+        if (drivers) parts.push(`🚕 ${drivers}`);                       // motoristas parados neste hub
+        if (recent) parts.push(`📥 ${recent}`);
+        if (d.waiting) parts.push(`⏳ ${d.waiting}`);
+        if (d.active) parts.push(`🚗 ${d.active}`);
+        if (failed) parts.push(`✖ ${failed}`);                          // pedidos recentes que ficaram sem viagem
+        const html = `<div style="background:${burst ? "#b91c1c" : "#1f2937"};color:#fff;border-radius:10px;` +
+                     `padding:2px 7px;font:600 12px/16px sans-serif;white-space:nowrap;box-shadow:0 1px 4px #0006;` +
+                     `${burst ? "outline:2px solid #fca5a5;" : ""}">${parts.join(" · ")}</div>`;
+        const icon = L.divIcon({ html, className: "hub-load-badge", iconSize: null, iconAnchor: [-12, 26] });
+        if (!hubBadges[d.hub_id]) {
+            hubBadges[d.hub_id] = L.marker(nodeCoords[resolved], { icon, interactive: false, zIndexOffset: 1000 }).addTo(targetMap);
+        } else {
+            hubBadges[d.hub_id].setIcon(icon);
+        }
+    }
+
+    function clearHubLoads() {
+        Object.keys(hubBadges).forEach(id => { targetMap.removeLayer(hubBadges[id]); delete hubBadges[id]; });
+    }
+
+    // Reposição de motoristas e previsões de procura (cenário 5)
+    (() => {
+        const st = document.createElement("style");
+        st.textContent = ".forecast-ring { animation: forecastPulse 1.6s ease-in-out infinite; }" +
+                         "@keyframes forecastPulse { 0%,100% { stroke-opacity: .95; fill-opacity: .18; } 50% { stroke-opacity: .25; fill-opacity: .04; } }";
+        document.head.appendChild(st);
+    })();
+
+    const forecastLayers = {};    // hub_id -> [círculo pulsante, etiqueta]
+    const repositionLines = {};   // id -> linha tracejada
+
+    function resolveNode(n) {
+        return nodeCoords[n] ? n : (nodeCoords["hub_" + n] ? "hub_" + n : null);
+    }
+
+    function hideForecast(hubId) {
+        (forecastLayers[hubId] || []).forEach(l => targetMap.removeLayer(l));
+        delete forecastLayers[hubId];
+    }
+
+    function showForecast(d) {
+        const node = resolveNode(d.hub_id);
+        if (!node) return;
+        hideForecast(d.hub_id);
+        const ring = L.circle(nodeCoords[node], { radius: 260, color: "#7c3aed", fillColor: "#7c3aed", fillOpacity: 0.12,
+                                                  weight: 3, dashArray: "6 6", className: "forecast-ring", interactive: false }).addTo(targetMap);
+        const label = L.marker(nodeCoords[node], { interactive: false, zIndexOffset: 900, icon: L.divIcon({
+            className: "forecast-label", iconSize: null, iconAnchor: [-14, -6],
+            html: `<div style="background:#7c3aed;color:#fff;border-radius:10px;padding:2px 7px;font:600 12px/16px sans-serif;` +
+                  `white-space:nowrap;box-shadow:0 1px 4px #0006;">📈 previsão: ${Math.round(d.expected)} pedidos até t=${Math.round(d.end)} s</div>` }) }).addTo(targetMap);
+        forecastLayers[d.hub_id] = [ring, label];
+    }
+
+    function hideReposition(id) {
+        if (repositionLines[id]) { targetMap.removeLayer(repositionLines[id]); delete repositionLines[id]; }
+    }
+
+    function showReposition(d) {
+        const from = resolveNode(d.from_node), to = resolveNode(d.to_node);
+        if (!from || !to) return;
+        hideReposition(d.id);
+        const moving = d.state === "moving";
+        repositionLines[d.id] = L.polyline([nodeCoords[from], nodeCoords[to]],
+            { color: moving ? "#2563eb" : "#9ca3af", weight: 5, opacity: 0.9, dashArray: "10 8", lineCap: "round" })
+            .addTo(targetMap)
+            .bindTooltip(`🔀 ${d.driver}: ${d.from_node} → ${d.to_node}<br>${moving ? "a caminho" : "a perguntar ao motorista"} · incentivo ${d.incentive} €`,
+                         { sticky: true });
+    }
+
+    function clearRepoLayers() {
+        Object.keys(forecastLayers).forEach(hideForecast);
+        Object.keys(repositionLines).forEach(hideReposition);
+    }
+
+    // Trânsito intenso (cenário 2): as ruas com trânsito ficam a LARANJA.
+    // Tal como nos hubs, a cor faz parte da função de estilo da camada das ruas, para sobreviver ao
+    // mouseover/mouseout do Folium (que chama resetStyle).
+    const STREET_LAYER = geo_json_118c7ae3f7d45048baccdfaae9e0464c;     // ruas (linhas cinzentas)
+    const trafficById = {};                                              // id -> {severity, scope, edges}
+    let trafficAll = 0;                                                  // severidade que afeta TODAS as ruas
+    let trafficLocal = new Map();                                        // "a|b" -> severidade (só algumas ruas)
+    const streetStyleOriginal = STREET_LAYER.options.style;
+
+    STREET_LAYER.options.style = (feature) => {
+        const p = (feature && feature.properties) || {};
+        const sev = Math.max(trafficAll, trafficLocal.get(p.from + "|" + p.to) || 0);
+        if (sev > 1 && p.from !== undefined) {
+            return { color: "#ff8c00", opacity: 0.95, weight: 2 + Math.min(sev, 4) };   // mais trânsito, mais grosso
+        }
+        return streetStyleOriginal(feature);
+    };
+
+    function recomputeTraffic() {
+        trafficAll = 0;
+        trafficLocal = new Map();
+        Object.values(trafficById).forEach(t => {
+            if (t.scope === "all") trafficAll = Math.max(trafficAll, t.severity);
+            else (t.edges || []).forEach(e => trafficLocal.set(e, Math.max(trafficLocal.get(e) || 0, t.severity)));
+        });
+        STREET_LAYER.setStyle(STREET_LAYER.options.style);
+    }
+
+    function clearTraffic() {
+        Object.keys(trafficById).forEach(id => delete trafficById[id]);
+        recomputeTraffic();
+    }
+
+    // Hubs parados (cenário com kill_hub): o círculo do hub fica preto
+    const HUB_LAYER = geo_json_323fd85ac9307bb7ead3bb8978893021;   // camada GeoJSON dos hubs (a vermelho)
+
+    // Folium repõe o estilo original do hub quando o rato passa por cima (mouseout -> resetStyle).
+    // Por isso o "preto" faz parte da função de estilo da camada, e não de um setStyle avulso:
+    // assim o hub parado continua preto durante toda a simulação, com ou sem rato.
+    const deadHubs = new Set();
+    const hubStyleOriginal = HUB_LAYER.options.style;
+
+    HUB_LAYER.options.style = (feature) => {
+        const id = feature && feature.properties && feature.properties.id;
+        if (deadHubs.has(id)) {
+            return { color: "#000000", fillColor: "#000000", fillOpacity: 0.95, weight: 3, radius: 10 };
+        }
+        return hubStyleOriginal(feature);
+    };
+
+    function setHubDown(hubId, down) {
+        if (down) deadHubs.add(hubId); else deadHubs.delete(hubId);
+        HUB_LAYER.eachLayer(l => {
+            if (!l.feature || l.feature.properties.id !== hubId) return;
+            HUB_LAYER.resetStyle(l);                         // aplica a função de estilo acima
+            if (down) {
+                l.bringToFront();
+                l.bindTooltip(`⚫ ${hubId} — fora de serviço`, { sticky: true });
+            } else {
+                l.unbindTooltip();
+            }
+        });
+    }
+
+    function resetHubs() {
+        HUB_LAYER.eachLayer(l => { if (l.feature) setHubDown(l.feature.properties.id, false); });
+    }
+
+    function hideBlockedRoad(id) {
+        (blockedRoads[id] || []).forEach(l => targetMap.removeLayer(l));
+        delete blockedRoads[id];
+    }
+
     // 5. Liga ao servidor WebSocket
     const ws = new WebSocket("ws://127.0.0.1:8765");
 
     ws.onopen = () => {
+        clearBlockedRoads();   // the server replays the closures that are still active
+        resetHubs();           // ...and the hubs that are still down
+        clearTraffic();        // ...and the slowdowns that are still active
+        clearHubLoads();
+        clearRepoLayers();
         const statusEl = document.getElementById("ws-status");
         if (statusEl) {
             statusEl.textContent = "Ligado";
@@ -748,6 +937,41 @@
 
         } else if (msg.type === "RIDER_UPDATE" || msg.type === "rider_update") {
             updateRiderMarker(msg.data);
+
+        } else if (msg.type === "ROAD_BLOCKED") {
+            showBlockedRoad(msg.data);
+
+        } else if (msg.type === "ROAD_CLEARED") {
+            hideBlockedRoad(msg.data.id);
+
+        } else if (msg.type === "TRAFFIC_LEVEL") {
+            trafficById[msg.data.id] = msg.data;
+            recomputeTraffic();
+
+        } else if (msg.type === "TRAFFIC_CLEARED") {
+            delete trafficById[msg.data.id];
+            recomputeTraffic();
+
+        } else if (msg.type === "FORECAST") {
+            showForecast(msg.data);
+
+        } else if (msg.type === "FORECAST_CLEARED") {
+            hideForecast(msg.data.hub_id);
+
+        } else if (msg.type === "REPOSITION") {
+            showReposition(msg.data);
+
+        } else if (msg.type === "REPOSITION_DONE") {
+            hideReposition(msg.data.id);
+
+        } else if (msg.type === "HUB_LOAD") {
+            setHubLoad(msg.data);
+
+        } else if (msg.type === "HUB_DOWN") {
+            setHubDown(msg.data.hub_id, true);
+
+        } else if (msg.type === "HUB_UP") {
+            setHubDown(msg.data.hub_id, false);
         }
     };
 </script>

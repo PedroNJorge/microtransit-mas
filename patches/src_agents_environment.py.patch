@@ -1,0 +1,32 @@
+--- a/src/agents/environment.py
++++ b/src/agents/environment.py
+@@ -94,6 +94,18 @@
+                                     thread=update.update_id))
+ 
+ 
++class SendForecast(OneShotBehaviour):
++    """Tell one hub that `fc.expected_requests` requests are coming to `fc.hub_id` (DemandForecastProtocol)."""
++
++    def __init__(self, jid: str, fc):
++        super().__init__()
++        self.jid_to, self.fc = jid, fc
++
++    async def run(self):
++        await self.send(make_inform(self.jid_to, Protocol.DEMAND_FORECAST, self.fc,
++                                    f"fc-{self.fc.hub_id}-{int(self.fc.horizon_start)}"))
++
++
+ class EnvironmentAgent(BaseAgent):
+     role = "environment"
+ 
+@@ -129,6 +141,10 @@
+         if self._seq > 0 and self.is_alive():
+             self.add_behaviour(SendFullSnapshot(jid))
+ 
++    def announce_forecast(self, jid: str, fc) -> None:
++        """A scheduled, publicly known event (a concert, a match): tell a hub what to expect."""
++        self.add_behaviour(SendForecast(jid, fc))
++
+     def remove_subscriber(self, jid: str) -> None:
+         if jid in self.subscribers:
+             self.subscribers.remove(jid)

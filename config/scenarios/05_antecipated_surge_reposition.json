@@ -1,0 +1,75 @@
+{
+  "name": "05-anticipated-surge-reposition",
+  "xmpp": {
+    "host": "localhost",
+    "port": 5222,
+    "server_port": 5269,
+    "password": "dev-password"
+  },
+  "clock": {
+    "speed": 60
+  },
+  "graph": "config/porto_graph.json",
+  "hubs": "all",
+  "duration": 3600,
+  "drivers": {
+    "placement": [
+      {
+        "hubs": {
+          "centre": 2
+        },
+        "count": 10
+      }
+    ]
+  },
+  "riders": {
+    "count": 20
+  },
+  "demand": [
+    {
+      "id": "surge",
+      "hubs": {
+        "periphery": 1
+      },
+      "start": 900,
+      "end": 1500,
+      "count": 16,
+      "pattern": "random",
+      "max_fare": 25,
+      "pooling": 0.5
+    }
+  ],
+  "forecasts": [
+    {
+      "at": 240,
+      "hub": {
+        "periphery": 1
+      },
+      "expected": 16,
+      "horizon": 1500,
+      "to": {
+        "periphery": 1
+      }
+    }
+  ],
+  "reposition": {
+    "demand_threshold": 3,
+    "requests_per_driver": 4,
+    "max_travel": 900,
+    "cooldown": 120,
+    "max_moves": 3,
+    "t_rebalance": 60,
+    "t_reposition": 30
+  },
+  "environment": {
+    "t_traffic": 60,
+    "full_every": 10
+  },
+  "seed": 42,
+  "payment": {
+    "rider_balance": 100.0,
+    "subsidy_discount": 0.5,
+    "subsidy_budget": null,
+    "hold_max": 7200
+  }
+}

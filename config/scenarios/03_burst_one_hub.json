@@ -1,0 +1,56 @@
+{
+  "name": "03-burst-one-hub",
+  "xmpp": {
+    "host": "localhost",
+    "port": 5222,
+    "server_port": 5269,
+    "password": "dev-password"
+  },
+  "clock": {
+    "speed": 60
+  },
+  "graph": "config/porto_graph.json",
+  "hubs": "all",
+  "duration": 3600,
+  "drivers": {
+    "count": 10
+  },
+  "riders": {
+    "count": 30
+  },
+  "demand": [
+    {
+      "id": "background",
+      "hubs": "all",
+      "start": 0,
+      "end": 3000,
+      "count": 8,
+      "pattern": "random",
+      "max_fare": 25,
+      "pooling": 0.5
+    },
+    {
+      "id": "burst",
+      "hubs": {
+        "periphery": 1
+      },
+      "start": 900,
+      "end": 960,
+      "count": 24,
+      "pattern": "random",
+      "max_fare": 25,
+      "pooling": 0.7
+    }
+  ],
+  "environment": {
+    "t_traffic": 60,
+    "full_every": 10
+  },
+  "seed": 42,
+  "payment": {
+    "rider_balance": 100.0,
+    "subsidy_discount": 0.5,
+    "subsidy_budget": null,
+    "hold_max": 7200
+  }
+}
