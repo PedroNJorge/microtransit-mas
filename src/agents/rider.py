@@ -206,17 +206,16 @@ class RiderAgent(BaseAgent):
         hub_node = t.hub_jid.split("@")[0] if (t and t.hub_jid) else ""
         node = node_override or hub_node
         destination = dest_override or (t.request.destination_home if t else "")
-        coro = broadcast_event("RIDER_UPDATE", {
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:                          # no event loop (a unit test): nothing to broadcast to
+            return
+        loop.create_task(broadcast_event("RIDER_UPDATE", {
             "id": self.jid.user,
             "state": self.state,
             "node": node,
             "destination": destination,
-        })
-        try:
-            loop = asyncio.get_running_loop()
-            loop.create_task(coro)
-        except RuntimeError:
-            pass
+        }))
 
     # ---- state machine ---------------------------------------------------------------------
     @property

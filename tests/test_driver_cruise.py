@@ -149,3 +149,28 @@ async def test_demand_signals_from_hubs_count_even_when_the_driver_was_not_calle
         await asyncio.sleep(0.3)
         assert len(r.drv.obs) == 1                       # the brain is not a hub: its signal is ignored
         assert r.drv.pressures(clock.now()) == {"n4_1": pytest.approx(1.0)}   # nobody was called: 1 request / max(1, 0)
+
+
+async def test_a_hubs_reposition_request_overrides_a_cruise(xmpp_server, sim_clock, net):
+    from common.ontology import RepositionRequest
+    async with BrainRig(net) as r:
+        await r.command("n1_3")
+        assert await until(lambda: r.drv.activity == "cruising")
+        req = RepositionRequest(str(r.h1.jid.bare), str(r.drv.jid.bare), "n4_1", 5.0)
+        await r.h1.tell(make_message(r.drv.jid, Perf.REQUEST, Protocol.REPOSITION, req, "repo-1"))
+        assert await until(lambda: r.h1.got(Protocol.REPOSITION, Perf.AGREE), 8)       # accepted, not refused as busy
+        assert not r.h1.got(Protocol.REPOSITION, Perf.REFUSE)
+        assert await until(lambda: r.drv.location == "n4_1" and r.drv.activity == "idle", 30)
+        assert await until(lambda: r.h1.got(Protocol.REPOSITION, Perf.INFORM), 8)     # arrived and told the hub (sent just after it turns idle)
+        assert r.drv.cruise is None
+
+
+async def test_a_repositioning_driver_refuses_the_brain(xmpp_server, sim_clock, net):
+    from common.ontology import RepositionRequest
+    async with BrainRig(net) as r:
+        req = RepositionRequest(str(r.h1.jid.bare), str(r.drv.jid.bare), "n4_1", 5.0)
+        await r.h1.tell(make_message(r.drv.jid, Perf.REQUEST, Protocol.REPOSITION, req, "repo-2"))
+        assert await until(lambda: r.drv.activity == "repositioning", 8)
+        await r.command("n1_3")
+        assert await until(lambda: r.brain.got(Protocol.DRIVER_BRAIN, Perf.REFUSE), 8)
+        assert r.drv.cruises == []

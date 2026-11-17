@@ -20,6 +20,10 @@ Schema (all sections but "graph" and "hubs" are optional):
   "graph": "config/porto_graph.json",           # relative paths resolve from the project root
   "hubs": ["hub_trindade", ...]  or  "all",     # ACTIVE hubs, a subset of the graph's hubs
   "drivers": {"count": 2, "start_hubs": ["hub_trindade"]},   # default: round-robin over hubs
+  # optional driver intelligence (all off by default):
+  #   "brains": true          every driver gets a BDI brain agent (brain_01, ...) that picks where it waits
+  #   "brain_bids": true      the brain also sets the driver's bid markup (needs "brains")
+  #   "return_policy": "nearest_hub" | "start_hub" | "none"   fixed rule, no BDI (ignored when "brains")
   "riders":  {"count": 2},
   "environment": {"t_traffic": 60, "full_every": 10},
   "payment": {"rider_balance": 100.0, "subsidy_discount": 0.5,
@@ -154,6 +158,9 @@ class Scenario:
     events: List[EventSpec] = field(default_factory=list)
     forecasts: List[ForecastSpec] = field(default_factory=list)
     reposition: Optional[Dict[str, float]] = None   # None = hubs never move drivers
+    brains: bool = False                       # one BDI brain per driver (agents/brain.py)
+    brain_bids: bool = False                   # the brain also owns the driver's bid markup
+    return_policy: str = "none"                # fixed baseline: none | start_hub | nearest_hub
     source: Optional[Path] = None              # file it was loaded from (None: from_dict)
 
     # ---- addresses -------------------------------------------------------------------
@@ -170,12 +177,25 @@ class Scenario:
         for role in ("regulator", "reputation"):
             specs.append(AgentSpec(role, role, self.jid(role)))
         for hid in self.hub_ids:
-            specs.append(AgentSpec("microhub", hid, self.jid(hid), {"hub_id": hid}))
+            hub_kw = {"hub_id": hid}
+            if self.brains:
+                hub_kw["broadcast_demand"] = True          # the brains read demand from the hubs' calls
+            specs.append(AgentSpec("microhub", hid, self.jid(hid), hub_kw))
         width = max(2, len(str(max(self.n_drivers, 1))))
+        if self.brains:                                    # brains first: their driver's percepts need a listener
+            for i in range(self.n_drivers):
+                specs.append(AgentSpec("driver_brain", f"brain_{i + 1:0{width}d}",
+                                       self.jid(f"brain_{i + 1:0{width}d}"),
+                                       {"driver_jid": self.jid(f"driver_{i + 1:0{width}d}"),
+                                        "bid_policy": self.brain_bids}))
         for i in range(self.n_drivers):
             name = f"driver_{i + 1:0{width}d}"
-            specs.append(AgentSpec("driver", name, self.jid(name),
-                                   {"start_hub": self.driver_start_hubs[i % len(self.driver_start_hubs)]}))
+            kw = {"start_hub": self.driver_start_hubs[i % len(self.driver_start_hubs)]}
+            if self.brains:
+                kw["brain_jid"] = self.jid(f"brain_{i + 1:0{width}d}")
+            elif self.return_policy != "none":
+                kw["return_policy"] = self.return_policy
+            specs.append(AgentSpec("driver", name, self.jid(name), kw))
         width = max(2, len(str(max(self.n_riders, 1))))
         for i in range(self.n_riders):
             name = f"rider_{i + 1:0{width}d}"
@@ -247,7 +267,7 @@ class Scenario:
 
         sel = _Selector(hub_ids, graph)
         d = dict(data.get("drivers", {}))
-        _only_keys(d, {"count", "start_hubs", "placement"}, "drivers")
+        _only_keys(d, {"count", "start_hubs", "placement", "brains", "brain_bids", "return_policy"}, "drivers")
         if "placement" in d:
             if "start_hubs" in d:
                 raise ScenarioError("drivers: use either start_hubs or placement, not both")
@@ -268,6 +288,15 @@ class Scenario:
             start_hubs = d.get("start_hubs") or hub_ids
             if not (isinstance(start_hubs, list) and all(h in hub_ids for h in start_hubs)):
                 raise ScenarioError(f"drivers.start_hubs must be a list of ACTIVE hubs {hub_ids}")
+
+        brains, brain_bids = d.get("brains", False), d.get("brain_bids", False)
+        return_policy = d.get("return_policy", "none")
+        if not isinstance(brains, bool) or not isinstance(brain_bids, bool):
+            raise ScenarioError("drivers.brains and drivers.brain_bids must be true or false")
+        if brain_bids and not brains:
+            raise ScenarioError("drivers.brain_bids needs drivers.brains")
+        if return_policy not in ("none", "start_hub", "nearest_hub"):
+            raise ScenarioError("drivers.return_policy must be none, start_hub or nearest_hub")
 
         r = dict(data.get("riders", {}))
         _only_keys(r, {"count", "auto_request_interval", "max_fare"}, "riders")
@@ -317,7 +346,8 @@ class Scenario:
                    escrow_hold_max=_num(p.get("hold_max", T_ESCROW_HOLD_MAX), "payment.hold_max",
                                         positive=True),
                    seed=_int(data.get("seed", 42), "seed", 0), duration=duration,
-                   demand=demand, events=events, forecasts=forecasts, reposition=reposition)
+                   demand=demand, events=events, forecasts=forecasts, reposition=reposition,
+                   brains=brains, brain_bids=brain_bids, return_policy=return_policy)
 
 
 # ---- helpers -------------------------------------------------------------------------------

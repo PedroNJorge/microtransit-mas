@@ -41,6 +41,7 @@ from spade.behaviour import CyclicBehaviour, OneShotBehaviour
 
 from agents.base_agent import BaseAgent
 from common import clock
+from common.ws_server import broadcast_event
 from common.auction import ceil_cents
 from common.policy import PolicyBook
 from common.lock import DriverLock, LockReason, LockState
@@ -58,7 +59,6 @@ from common.settings import (
 from protocols.payment_common import bare
 
 logger = logging.getLogger(__name__)
-from common.ws_server import broadcast_event
 
 # refuse reasons (plain text bodies of a `refuse`)
 LOCKED = LockReason.LOCKED                  # CC-09
@@ -386,41 +386,40 @@ class DriverAgent(BaseAgent):
             return
         self._announced = sig
         self.last_status_at = clock.now()
+        self.broadcast_viz()
         st = self.status()
         self.status_log.append(st)
         for hub in self.hub_jids:
             await beh.send(make_message(hub, Perf.INFORM, Protocol.DRIVER_STATUS, st))
-        await self.broadcast_viz()
 
-    async def broadcast_viz(self) -> None:
-        if self.network is None or not self.location:
-            return
-        if not self.network.has_node(self.location):
-            return
-        
-        node_data = self.network.g.nodes[self.location]
-        lat = node_data.get("lat")
-        lon = node_data.get("lon")
-        if lat is None or lon is None:
-            return
-
-        onboard_riders = []
+    # ---- map viewer (WebSocket) --------------------------------------------------------------
+    def viz_payload(self) -> Optional[dict]:
+        """What the map shows for this driver: DRIVER_UPDATE {driver_id, state, lat, lon, passengers, capacity,
+        rider_ids}. None if the position has no coordinates."""
+        node = self.network.g.nodes.get(self.location) if self.network is not None else None
+        if not node or node.get("lat") is None or node.get("lon") is None:
+            return None
+        state = self.state.value if hasattr(self.state, "value") else str(self.state)
+        if self.activity == "repositioning":
+            state = "REPOSITIONING"                       # hub-requested move (Milestone 10)
+        elif self.activity == "cruising":
+            state = "CRUISING"                            # self-directed move by the BDI brain / return policy
+        on_board = []
         if self.assignment is not None:
-            onboard_riders = [
-                jid.split("@")[0]
-                for jid in self.assignment.boarded
-                if jid not in self.assignment.dropped
-            ]
+            on_board = [j.split("@")[0] for j in self.assignment.boarded if j not in self.assignment.dropped]
+        return {"driver_id": self.jid.user, "state": state, "lat": float(node["lat"]), "lon": float(node["lon"]),
+                "passengers": self.passengers, "capacity": self.capacity, "rider_ids": on_board}
 
-        await broadcast_event("DRIVER_UPDATE", {
-            "driver_id": self.jid.user,
-            "lat": lat,
-            "lon": lon,
-            "state": self.state.value,
-            "passengers": self.passengers,
-            "capacity": self.capacity,
-            "rider_ids": onboard_riders
-        })
+    def broadcast_viz(self) -> None:
+        """Fire-and-forget; never blocks or breaks the simulation (no loop = a unit test = nothing to send)."""
+        payload = self.viz_payload()
+        if payload is None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        loop.create_task(broadcast_event("DRIVER_UPDATE", payload))
 
     # ---- bidding ---------------------------------------------------------------------------
     def calculate_bid(self, cfp: CFP, now: float):
@@ -660,7 +659,7 @@ class DriverAgent(BaseAgent):
                     break                                   # road closed: re-plan from here
                 await clock.sim_sleep(dt)
                 self.location = nxt
-                await self.broadcast_viz()
+                self.broadcast_viz()
             if a.cancelled:
                 raise _TripCancelled()
 
@@ -709,7 +708,6 @@ class DriverAgent(BaseAgent):
         self.passengers = len(boarding)
         self.activity = "on_trip"
         await self.announce(beh)
-        await self.broadcast_viz()
         # drive the planned order, dropping off as we go
         for stop in a.offer.route[1:]:
             await self.drive(stop, a)
@@ -720,14 +718,12 @@ class DriverAgent(BaseAgent):
                     self.passengers -= 1
                     await beh.send(make_message(jid, Perf.INFORM, Protocol.TRIP_EXECUTION,
                                                 RiderDroppedOff(req, pool, self.me, clock.now()), pool))
-            await self.broadcast_viz()
         for jid, req, dest in boarding:                            # drop-off at the pickup itself
             if jid not in a.dropped:
                 a.dropped.append(jid)
                 self.passengers -= 1
                 await beh.send(make_message(jid, Perf.INFORM, Protocol.TRIP_EXECUTION,
                                             RiderDroppedOff(req, pool, self.me, clock.now()), pool))
-        await self.broadcast_viz()
         done = TripCompleted(trip_id=f"trip-{pool}", pool_id=pool, driver_id=self.me,
                              rider_ids=list(a.dropped), completed_at=clock.now(),
                              rider_fares={j: a.match.rider_fares[j] for j in a.dropped
@@ -785,9 +781,9 @@ class DriverAgent(BaseAgent):
             reason = UNKNOWN_HUB
         elif self.lock.state != LockState.FREE or self.activity in ("to_pickup", "on_trip"):
             reason = LOCKED                                           # GC-13
-        elif self.activity != "idle":
+        elif self.activity not in ("idle", "cruising"):
             reason = "busy"
-        else:
+        else:                                                         # a self-directed cruise (BDI) yields to the hub's request
             sp = self.network.staging_points.get(req.staging_point_id) if self.network else None
             target = sp.location if sp else (req.staging_point_id if self.network and
                                              self.network.has_node(req.staging_point_id) else "")
@@ -799,6 +795,8 @@ class DriverAgent(BaseAgent):
         if reason:
             await beh.send(make_message(hub, Perf.REFUSE, Protocol.REPOSITION, reason, thread))
             return
+        if self.cruise is not None:
+            self.cruise.cancelled = True                              # stops at its next junction; _Reposition waits for it
         self.activity = "repositioning"
         await beh.send(make_message(hub, Perf.AGREE, Protocol.REPOSITION, req, thread))
         await self.announce(beh)
@@ -813,6 +811,8 @@ class _Reposition(OneShotBehaviour):
     async def run(self):
         d = self.agent
         probe = Assignment(self.hub, None, None)                     # only the `cancelled` flag is used
+        while d._cruise_busy:                                        # a cancelled cruise ends at its next junction
+            await asyncio.sleep(0.02)
         try:
             await d.drive(self.target, probe)
         except _Unreachable:

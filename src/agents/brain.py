@@ -22,6 +22,7 @@ import agentspeak as asp
 from spade.behaviour import CyclicBehaviour
 from spade_bdi.bdi import BDIAgent
 
+from agents.base_agent import PingBehaviour
 from common.messages import make_message, make_template
 from common.ontology import BidPolicy, BrainPercept, CruiseCommand, Perf, Protocol, parse_payload
 from protocols.payment_common import bare
@@ -74,6 +75,7 @@ class DriverBrain(BDIAgent):
         self.refusals: list = []
         self.agreed = 0
         self.percepts_received = 0
+        self.pings_answered = 0                       # liveness: the brain answers pings like every agent
         self._beliefs: Dict[Tuple[str, str], tuple] = {}      # (functor, key) -> args currently in the belief base
         super().__init__(jid, password, asl, **kwargs)
 
@@ -116,6 +118,7 @@ class DriverBrain(BDIAgent):
 
     async def setup(self):
         self.add_behaviour(PerceptReceiver(), make_template(Protocol.DRIVER_BRAIN))
+        self.add_behaviour(PingBehaviour(), make_template(protocol=Protocol.HEARTBEAT, performative=Perf.REQUEST))
         orig = self.bdi.run
 
         async def paced():                            # spade_bdi's loop never sleeps; keep 20 brains cheap

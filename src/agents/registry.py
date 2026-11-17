@@ -10,3 +10,9 @@ from agents.rider import RiderAgent
 AGENT_CLASSES = {cls.role: cls for cls in (
     RiderAgent, DriverAgent, MicrohubAgent, PaymentAgent,
     RegulatorAgent, ReputationAgent, EnvironmentAgent)}
+
+try:                                                    # the BDI driver brain needs the optional `spade_bdi` package
+    from agents.brain import DriverBrain
+    AGENT_CLASSES[DriverBrain.role] = DriverBrain
+except ImportError:                                     # scenarios with "brains": true then fail with a clear error
+    pass

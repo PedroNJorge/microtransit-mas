@@ -32,6 +32,8 @@ from common.graph import TransitNetwork
 from common.ws_server import start_ws_server
 from harness.active import clear_active, write_active
 from harness.ping import PingResult, format_results, ping_agents
+from harness.runner import ScenarioRunner, report
+from protocols.reposition import RepositionRules
 from harness.scenario import DEFAULT_SCENARIO, AgentSpec, Scenario, ScenarioError
 
 logger = logging.getLogger(__name__)
@@ -54,6 +56,7 @@ class Harness:
         self._server: Optional[asyncio.subprocess.Process] = None
         self._server_dir: Optional[str] = None
         self._ws_server = None
+        self.runner: Optional[ScenarioRunner] = None    # plays the scenario's demand / events / forecasts
 
     # ---- XMPP server -----------------------------------------------------------------
     async def ensure_server(self, wait: float = 20.0) -> None:
@@ -122,10 +125,18 @@ class Harness:
             kwargs.update(network=self.network, payment_jid=sc.jid("payment"),
                           regulator_jid=sc.jid("regulator"), reputation_jid=sc.jid("reputation"),
                           hub_jids=[s.jid for s in sc.roster() if s.role == "microhub"])
+        if spec.role == "microhub" and sc.reposition is not None:     # "reposition": {...} switches the heuristic on
+            opts = dict(sc.reposition)
+            hub_opts = {k: opts.pop(k) for k in ("t_rebalance", "t_reposition") if k in opts}
+            if "max_moves" in opts:
+                opts["max_moves"] = int(opts["max_moves"])
+            kwargs.update(reposition=RepositionRules(**opts), **hub_opts)
         if spec.role == "microhub":
             kwargs.update(
                 network=self.network, payment_jid=sc.jid("payment"), reputation_jid=sc.jid("reputation"),
                 regulator_jid=sc.jid("regulator"), driver_jids=[s.jid for s in sc.roster() if s.role == "driver"])
+        if spec.role not in AGENT_CLASSES:
+            raise RuntimeError(f"agent role {spec.role!r} is not available (the BDI brain needs `uv add spade_bdi`)")
         return AGENT_CLASSES[spec.role](spec.jid, sc.xmpp.password, port=sc.xmpp.port, **kwargs)
 
     async def start(self) -> None:
@@ -142,9 +153,14 @@ class Harness:
         except BaseException:
             await self.stop()
             raise
+        if sc.demand or sc.events or sc.forecasts:
+            self.runner = ScenarioRunner(self)
+            self.runner.start()
         logger.info("Scenario %r up: %d agents", sc.name, len(self.agents))
 
     async def stop(self) -> None:
+        if self.runner is not None:
+            await self.runner.stop()
         for jid in reversed(list(self.agents)):
             try:
                 await self.agents[jid].stop()
@@ -197,11 +213,15 @@ async def run(scenario: Scenario, check: bool, run_for: Optional[float], start_s
             except NotImplementedError:                 # Windows: fall back to KeyboardInterrupt
                 pass
         print("\nRunning. Ping with:  python -m harness.ping --all     Stop with Ctrl-C.")
+        if run_for is None and scenario.duration:         # the scenario says how long it lasts (sim seconds)
+            run_for = clock.to_real(scenario.duration)
         try:
             await asyncio.wait_for(stop.wait(), run_for)
         except asyncio.TimeoutError:
             pass
         print("Stopping...")
+        if h.runner is not None:
+            print(report(h))
         clear_active()
     return 0
 

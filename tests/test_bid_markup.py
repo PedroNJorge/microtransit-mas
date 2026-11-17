@@ -47,3 +47,26 @@ def test_markup_above_the_reserve_means_no_bid(net):
 def test_bidpolicy_validates_range():
     with pytest.raises(ValueError):
         BidPolicy("d@localhost", 1.5)
+
+
+# ---- map viewer payload ---------------------------------------------------------------------------
+
+def test_viz_payload_has_what_the_map_needs():
+    from common.graph import TransitNetwork
+    net = TransitNetwork.from_file("config/porto_graph.json")
+    hub = sorted(net.hubs)[0]
+    d = DriverAgent("driver_07@localhost", "pw", start_hub=hub, network=net, hub_jids=[])
+    p = d.viz_payload()
+    assert set(p) == {"driver_id", "state", "lat", "lon", "passengers", "capacity", "rider_ids"}
+    assert p["driver_id"] == "driver_07" and p["state"] == "IDLE" and p["rider_ids"] == []
+    assert 40 < p["lat"] < 42 and -9 < p["lon"] < -8                      # Porto
+    d.activity = "cruising"
+    assert d.viz_payload()["state"] == "CRUISING"
+    d.activity = "repositioning"
+    assert d.viz_payload()["state"] == "REPOSITIONING"
+    d.broadcast_viz()                                                     # no event loop: must simply do nothing
+
+
+def test_viz_payload_is_none_without_coordinates(net):
+    d = driver(net)                                                       # the test grid has no lat/lon
+    assert d.viz_payload() is None

@@ -25,7 +25,15 @@ from harness.runner import covered_nodes, event_disruptions, plan_demand   # noq
 from harness.scenario import Scenario, ScenarioError               # noqa: E402
 
 GRAPH = "config/porto_graph.json"
-CENTRE = ["hub_ribeira", "hub_aliados"]
+CENTRE = ["hub_aliados", "hub_trindade"]           # the two hubs nearest the centroid of the Porto graph
+
+
+
+_NET = TransitNetwork.from_file(str(ROOT / GRAPH))
+NODE_T = next(n for n in sorted(_NET.g.successors("hub_trindade")) if _NET.g.has_edge(n, "hub_trindade"))   # a two-way neighbour
+NODE_C = next(n for n in sorted(_NET.g.successors("hub_campanha")) if _NET.g.has_edge(n, "hub_campanha"))
+EDGE_T, EDGE_T_REV, EDGE_C = f"hub_trindade|{NODE_T}", f"{NODE_T}|hub_trindade", f"hub_campanha|{NODE_C}"
+T_EDGE = _NET.effective_time("hub_trindade", NODE_T, 0)             # its normal travel time (s)
 
 
 def base(**extra):
@@ -58,8 +66,8 @@ def test_shipped_scenarios_load_and_have_expected_shape():
 
 
 @pytest.mark.parametrize("sel,expected", [
-    ("all", 8), ("hub_foz", 1), (["hub_foz", "hub_maia"], 2), ({"centre": 2}, 2), ({"periphery": 3}, 3),
-    ({"role": "suburb"}, 6), ({"index": [0, 7]}, 2)])
+    ("all", 8), ("hub_trindade", 1), (["hub_trindade", "hub_campanha"], 2), ({"centre": 2}, 2), ({"periphery": 3}, 3),
+    ({"role": "rail interface (east)"}, 1), ({"index": [0, 7]}, 2)])
 def test_hub_selectors(sel, expected):
     sc = Scenario.from_dict(base(demand=[{"hubs": sel, "start": 0, "end": 10, "count": 1}]))
     assert len(sc.demand[0].hubs) == expected
@@ -96,11 +104,11 @@ def test_placement_expands_and_sets_driver_count():
                   "profile": [[0, 2], [20, 3]]}]}, "below 'duration'"),
     ({"events": [{"at": 1, "type": "block_road", "duration": 10, "where": {"edges": ["nobar"]}}]}, "edge ids"),
     ({"events": [{"at": 1, "type": "block_road", "duration": 10, "where": "all"}]}, "where"),
-    ({"events": [{"at": 1, "type": "kill_hub", "hub": "hub_foz", "duration": 3}]}, "unknown keys"),
+    ({"events": [{"at": 1, "type": "kill_hub", "hub": "hub_trindade", "duration": 3}]}, "unknown keys"),
     ({"forecasts": [{"at": 0, "hub": "all", "expected": 3, "horizon": 10}]}, "exactly one hub"),
     ({"reposition": {"speed": 3}}, "unknown keys"),
     ({"drivers": {"count": 3, "placement": [{"hubs": "all", "count": 2}]}}, "!= sum"),
-    ({"drivers": {"start_hubs": ["hub_foz"], "placement": [{"hubs": "all", "count": 2}]}}, "not both"),
+    ({"drivers": {"start_hubs": ["hub_trindade"], "placement": [{"hubs": "all", "count": 2}]}}, "not both"),
 ])
 def test_invalid_sections_are_rejected(patch, msg):
     with pytest.raises(ScenarioError, match=msg):
@@ -108,14 +116,14 @@ def test_invalid_sections_are_rejected(patch, msg):
 
 
 def test_duplicate_event_ids_rejected():
-    ev = {"id": "a", "at": 1, "type": "kill_hub", "hub": "hub_foz"}
+    ev = {"id": "a", "at": 1, "type": "kill_hub", "hub": "hub_trindade"}
     with pytest.raises(ScenarioError, match="duplicate"):
         Scenario.from_dict(base(events=[ev, dict(ev, at=2)]))
 
 
 # ---- demand plan -------------------------------------------------------------------------------------
 def demand_sc(**kw):
-    spec = {"id": "d", "hubs": ["hub_foz", "hub_maia"], "start": 100, "end": 200, "count": 10}
+    spec = {"id": "d", "hubs": ["hub_trindade", "hub_campanha"], "start": 100, "end": 200, "count": 10}
     spec.update(kw)
     return Scenario.from_dict(base(demand=[spec]))
 
@@ -123,10 +131,10 @@ def demand_sc(**kw):
 def test_plan_is_deterministic_and_seeded(net):
     a = plan_demand(demand_sc(pattern="random"), net)
     assert a == plan_demand(demand_sc(pattern="random"), net)
-    other = Scenario.from_dict(dict(base(demand=[{"id": "d", "hubs": ["hub_foz"], "start": 0, "end": 9,
+    other = Scenario.from_dict(dict(base(demand=[{"id": "d", "hubs": ["hub_trindade"], "start": 0, "end": 9,
                                                   "count": 5, "pattern": "random"}]), seed=8))
     assert plan_demand(other, net) != plan_demand(Scenario.from_dict(dict(base(demand=[
-        {"id": "d", "hubs": ["hub_foz"], "start": 0, "end": 9, "count": 5, "pattern": "random"}]), seed=9)), net)
+        {"id": "d", "hubs": ["hub_trindade"], "start": 0, "end": 9, "count": 5, "pattern": "random"}]), seed=9)), net)
 
 
 @pytest.mark.parametrize("pattern", ["even", "random"])
@@ -135,13 +143,13 @@ def test_plan_times_hubs_and_destinations(net, pattern):
     assert len(plan) == 10 and [r.at for r in plan] == sorted(r.at for r in plan)
     assert all(100 <= r.at < 200 for r in plan)
     for r in plan:
-        assert r.hub in ("hub_foz", "hub_maia")
+        assert r.hub in ("hub_trindade", "hub_campanha")
         assert r.destination in covered_nodes(net, r.hub)            # a trip the hub can actually take
 
 
 def test_even_pattern_alternates_hubs_and_spaces_evenly(net):
     plan = plan_demand(demand_sc(pattern="even"), net)
-    assert [r.hub for r in plan[:4]] == ["hub_foz", "hub_maia", "hub_foz", "hub_maia"]
+    assert [r.hub for r in plan[:4]] == ["hub_trindade", "hub_campanha", "hub_trindade", "hub_campanha"]
     gaps = {round(b.at - a.at, 6) for a, b in zip(plan, plan[1:])}
     assert gaps == {10.0}
 
@@ -158,23 +166,23 @@ def ev(sc_events):
 
 def test_block_explicit_edges_both_directions(net):
     e = ev([{"id": "b", "at": 50, "type": "block_road", "duration": 100,
-             "where": {"edges": ["hub_foz|n_2_1"]}}])
+             "where": {"edges": [EDGE_T]}}])
     (d,) = event_disruptions(e, net, 7)
-    assert d.closed and sorted(d.affected_edges) == ["hub_foz|n_2_1", "n_2_1|hub_foz"]
+    assert d.closed and sorted(d.affected_edges) == [EDGE_T, EDGE_T_REV]
     assert (d.start_time, d.end_time) == (50, 150)
 
 
 def test_block_one_way_only(net):
     e = ev([{"id": "b", "at": 0, "type": "block_road", "duration": 10, "both_directions": False,
-             "where": {"edges": ["hub_foz|n_2_1"]}}])
-    assert event_disruptions(e, net, 7)[0].affected_edges == ["hub_foz|n_2_1"]
+             "where": {"edges": [EDGE_T]}}])
+    assert event_disruptions(e, net, 7)[0].affected_edges == [EDGE_T]
 
 
 def test_random_block_lies_on_a_hub_to_hub_route(net):
     e = ev([{"id": "r", "at": 0, "type": "block_road", "duration": 10,
-             "where": {"random_on_routes": 2, "among": ["hub_foz", "hub_maia"]}, "both_directions": False}])
+             "where": {"random_on_routes": 2, "among": ["hub_trindade", "hub_campanha"]}, "both_directions": False}])
     (d,) = event_disruptions(e, net, 7)
-    path = net.shortest_path("hub_foz", "hub_maia")[0] + net.shortest_path("hub_maia", "hub_foz")[0]
+    path = net.shortest_path("hub_trindade", "hub_campanha")[0] + net.shortest_path("hub_campanha", "hub_trindade")[0]
     on_route = {f"{a}|{b}" for a, b in zip(path, path[1:])}
     assert len(d.affected_edges) == 2 and set(d.affected_edges) <= on_route
     assert event_disruptions(e, net, 7)[0].affected_edges == d.affected_edges       # same seed, same roads
@@ -182,11 +190,11 @@ def test_random_block_lies_on_a_hub_to_hub_route(net):
 
 def test_applied_block_makes_the_edge_unusable_then_it_reopens(net):
     local = TransitNetwork.from_file(str(ROOT / GRAPH))
-    e = ev([{"id": "b", "at": 100, "type": "block_road", "duration": 100, "where": {"edges": ["hub_foz|n_2_1"]}}])
+    e = ev([{"id": "b", "at": 100, "type": "block_road", "duration": 100, "where": {"edges": [EDGE_T]}}])
     for d in event_disruptions(e, local, 1):
         local.add_disruption(d)
-    assert local.effective_time("hub_foz", "n_2_1", 150) is None
-    assert local.effective_time("hub_foz", "n_2_1", 50) == 90.0 == local.effective_time("hub_foz", "n_2_1", 200)
+    assert local.effective_time("hub_trindade", NODE_T, 150) is None
+    assert local.effective_time("hub_trindade", NODE_T, 50) == T_EDGE == local.effective_time("hub_trindade", NODE_T, 200)
 
 
 def test_traffic_profile_becomes_consecutive_disruptions(net):
@@ -199,16 +207,16 @@ def test_traffic_profile_becomes_consecutive_disruptions(net):
     local = TransitNetwork.from_file(str(ROOT / GRAPH))
     for d in ds:
         local.add_disruption(d)
-    assert local.effective_time("hub_foz", "n_2_1", 1300) == pytest.approx(270.0)
-    assert local.effective_time("hub_foz", "n_2_1", 1700) == pytest.approx(90.0)
+    assert local.effective_time("hub_trindade", NODE_T, 1300) == pytest.approx(3.0 * T_EDGE)
+    assert local.effective_time("hub_trindade", NODE_T, 1700) == pytest.approx(T_EDGE)
 
 
 def test_traffic_near_a_hub_is_local(net):
     e = ev([{"id": "t", "at": 0, "type": "traffic", "duration": 10, "severity": 2,
-             "where": {"near": "hub_foz", "radius": 200}}])
+             "where": {"near": "hub_trindade", "radius": 200}}])
     (d,) = event_disruptions(e, net, 1)
     assert 0 < len(d.affected_edges) < net.g.number_of_edges() // 4
-    assert "hub_foz|n_2_1" in d.affected_edges and "hub_maia|n_2_6" not in d.affected_edges
+    assert EDGE_T in d.affected_edges and EDGE_C not in d.affected_edges
 
 
 # ---- end to end (real agents) ----------------------------------------------------------------------
@@ -220,23 +228,23 @@ def free_port():
 
 def test_xmpp_events_requests_forecast_and_hub_kill():
     """One short run: a request stream, a road closure, a forecast, a hub kill; checks they all happened."""
-    d = base(clock={"speed": 100}, duration=1500, drivers={"count": 3, "start_hubs": ["hub_foz"]},
+    d = base(clock={"speed": 100}, duration=1500, drivers={"count": 3, "start_hubs": ["hub_trindade"]},
              riders={"count": 3}, xmpp={"port": free_port(), "server_port": free_port()},
-             demand=[{"id": "s", "hubs": ["hub_foz"], "start": 100, "end": 400, "count": 3}],
+             demand=[{"id": "s", "hubs": ["hub_trindade"], "start": 100, "end": 400, "count": 3}],
              events=[{"id": "blk", "at": 200, "type": "block_road", "duration": 300,
-                      "where": {"edges": ["hub_foz|n_2_1"]}},
-                     {"id": "die", "at": 900, "type": "kill_hub", "hub": "hub_maia"}],
-             forecasts=[{"at": 50, "hub": "hub_foz", "expected": 5, "horizon": 800, "to": "hub_foz"}],
+                      "where": {"edges": [EDGE_T]}},
+                     {"id": "die", "at": 900, "type": "kill_hub", "hub": "hub_campanha"}],
+             forecasts=[{"at": 50, "hub": "hub_trindade", "expected": 5, "horizon": 800, "to": "hub_trindade"}],
              reposition={"t_rebalance": 120})
-    d["hubs"] = ["hub_foz", "hub_maia"]
+    d["hubs"] = ["hub_trindade", "hub_campanha"]
 
     async def go():
         async with Harness(Scenario.from_dict(d)) as h:
             await asyncio.sleep(clock.to_real(1200))
-            foz, maia = h.agents["hub_foz@localhost"], h.agents["hub_maia@localhost"]
+            foz, maia = h.agents["hub_trindade@localhost"], h.agents["hub_campanha@localhost"]
             riders = [a for a in h.agents.values() if a.role == "rider"]
             return (h.runner.summary.issued, h.runner.errors(), [t for _, t in h.runner.summary.events],
-                    maia.is_alive(), foz.is_alive(), foz.demand_forecasts.get("hub_foz"),
+                    maia.is_alive(), foz.is_alive(), foz.demand_forecasts.get("hub_trindade"),
                     sum(len(r.trips) for r in riders) + sum(1 for r in riders if r.trip))
 
     try:
@@ -244,6 +252,6 @@ def test_xmpp_events_requests_forecast_and_hub_kill():
     except RuntimeError as e:                       # no XMPP server available here
         pytest.skip(str(e))
     assert errors == [] and issued == 3 and started == 3
-    assert any("blk" in n for n in notes) and any("hub_maia killed" in n for n in notes)
+    assert any("blk" in n for n in notes) and any("hub_campanha killed" in n for n in notes)
     assert not maia_alive and foz_alive
     assert fc is not None and fc.expected_requests == 5
