@@ -33,6 +33,7 @@ import asyncio
 import logging
 import math
 import uuid
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Sequence
 
@@ -45,6 +46,7 @@ from common.policy import PolicyBook
 from common.lock import DriverLock, LockReason, LockState
 from common.messages import make_inform, make_message, make_propose, make_refuse, make_template
 from common.ontology import (
+    BrainPercept, BidPolicy, CruiseCommand, DemandSignal,
     AuctionOutcome, Bid, CFP, Policy, Rating, DriverArriving, DriverState, DriverStatus, FailureReason, MatchResult,
     Perf, Protocol, RepositionRequest, RiderBoarded, RiderDroppedOff, RiderReady, Settlement,
     TripCompleted, TripFailed, parse_payload,
@@ -122,6 +124,63 @@ class Housekeeping(CyclicBehaviour):
             d.log(f"provisional lock on {expired.pool_id} expired")
             d.offers.pop(expired.pool_id, None)
         await d.announce(self, force=now - d.last_status_at >= d.t_status)
+        if d.brain_jid:
+            await d.send_percept(self)
+
+
+class BrainLink(CyclicBehaviour):
+    """Commands from this driver's own BDI brain (only that JID is obeyed)."""
+
+    async def run(self):
+        msg = await self.receive(timeout=1)
+        if msg is not None:
+            try:
+                await self.agent.on_brain_command(self, msg)
+            except Exception:
+                logger.exception("%s: error handling a brain command", self.agent.jid)
+
+
+class DemandListener(CyclicBehaviour):
+    """A hub tells us about a request we were not called for (we were busy or too far)."""
+
+    async def run(self):
+        msg = await self.receive(timeout=1)
+        if msg is None:
+            return
+        d = self.agent
+        try:
+            sig = parse_payload(msg, strict=True)
+        except (ValueError, TypeError):
+            return
+        if isinstance(sig, DemandSignal) and bare(msg.sender) in d.hub_jids:
+            d.observe_signal(sig, clock.now())
+
+
+class _Cruise(OneShotBehaviour):
+    def __init__(self, probe: Assignment, target: str):
+        super().__init__()
+        self.probe, self.target = probe, target
+
+    async def run(self):
+        d = self.agent
+        while d._cruise_busy:                                       # the previous move ends at its next junction
+            await asyncio.sleep(0.02)
+        if self.probe.cancelled:
+            return
+        d._cruise_busy = True
+        try:
+            d.activity = "cruising"
+            await d.announce(self)
+            await d.drive(self.target, self.probe)
+        except (_TripCancelled, _Unreachable):
+            pass
+        finally:
+            d._cruise_busy = False
+            if d.cruise is self.probe:                              # not replaced, not overtaken by a job
+                d.cruise, d.cruise_target = None, ""
+                if d.activity == "cruising":
+                    d.activity = "idle"
+            await d.announce(self)
 
 
 class RepositionHandler(CyclicBehaviour):
@@ -235,9 +294,14 @@ class DriverAgent(BaseAgent):
                  dwell_pickup: float = DWELL_PICKUP, dwell_dropoff: float = DWELL_DROPOFF,
                  payment_jid: Optional[str] = None, regulator_jid: Optional[str] = None,
                  reputation_jid: Optional[str] = None,
-                 rate_riders_with: Optional[Callable[['Assignment'], int]] = None, **kwargs):
+                 rate_riders_with: Optional[Callable[['Assignment'], int]] = None,
+                 brain_jid: Optional[str] = None, t_percept: float = 30.0, t_obs_window: float = 600.0,
+                 return_policy: str = "none", **kwargs):
         super().__init__(jid, password, **kwargs)
         self.start_hub = start_hub                    # hub id where this driver starts its shift
+        # fixed baseline (no BDI): after a trip drive back to `start_hub` / the `nearest_hub`; `none` = wait where dropped off
+        self.return_policy = return_policy
+        self.returns: List[str] = []                  # hubs this policy sent the driver to (history)
         self.network = network
         self.hub_jids: List[str] = [bare(j) for j in hub_jids]
         self.capacity, self.shift_end = capacity, shift_end
@@ -262,6 +326,18 @@ class DriverAgent(BaseAgent):
         self.status_log: List[DriverStatus] = []
         self.last_status_at = -math.inf
         self._announced = None
+        # BDI layer (optional): the brain gets percepts and may command `cruise` moves while idle
+        self.brain_jid = bare(brain_jid) if brain_jid else None
+        self.t_percept, self.t_obs_window = t_percept, t_obs_window
+        self.obs: deque = deque()                      # (time, hub_id, callees, pool_id) of every CFP seen
+        self._obs_pools: set = set()
+        self.cruise: Optional[Assignment] = None       # the current self-directed move (only the `cancelled` flag is used)
+        self.cruise_target: str = ""
+        self._cruise_busy = False
+        self._last_percept = (None, -math.inf)
+        self.bid_markup = 0.0                          # opportunity-cost markup set by the brain (0 = bid at cost)
+        self.markups: List[float] = []                 # history of markups the brain set
+        self.cruises: List[str] = []                   # hubs the brain sent this driver to (history)
         self._trip_inbox: Dict[str, List] = {}
 
     async def setup(self):
@@ -272,6 +348,9 @@ class DriverAgent(BaseAgent):
         self.add_behaviour(SettlementReceiver(), make_template(Protocol.SETTLEMENT, Perf.INFORM))
         self.add_behaviour(PolicyReceiver(), make_template(Protocol.POLICY, Perf.REQUEST))
         self.add_behaviour(CompletionReceiver(), make_template(Protocol.TRIP_EXECUTION, Perf.INFORM))
+        if self.brain_jid:
+            self.add_behaviour(BrainLink(), make_template(Protocol.DRIVER_BRAIN, Perf.REQUEST))
+            self.add_behaviour(DemandListener(), make_template(Protocol.DRIVER_BRAIN, Perf.INFORM))
 
     # ---- small helpers -------------------------------------------------------------------
     def log(self, text: str) -> None:
@@ -302,7 +381,7 @@ class DriverAgent(BaseAgent):
         """DriverStatusProtocol (CC-07): send the status to every hub when the state changed
         (or on the heartbeat)."""
         sig = (self.state, self.lock.holder.pool_id if self.lock.holder else None,
-               self.location if self.state != DriverState.IDLE else None)
+               self.location if (self.state != DriverState.IDLE or self.activity == "cruising") else None)
         if not force and sig == self._announced:
             return
         self._announced = sig
@@ -376,7 +455,8 @@ class DriverAgent(BaseAgent):
             detour = max(detour, extra)
         if detour > cfp.max_detour + 1e-9:                                     # GC-06
             return None, DETOUR_TOO_LARGE
-        price = ceil_cents(self.base_cost + self.cost_per_second * (eta + route_time)) / 100.0
+        cost = self.base_cost + self.cost_per_second * (eta + route_time)
+        price = ceil_cents(cost * (1.0 + self.bid_markup)) / 100.0               # cost + opportunity cost
         if price > cfp.max_total_fare + 1e-9:                                  # IR: not below cost
             return None, OVER_RESERVE
         bid = Bid(str(uuid.uuid4()), self.me, cfp.pool_id, price, eta, detour,
@@ -415,6 +495,7 @@ class DriverAgent(BaseAgent):
 
     async def handle_cfp(self, beh, hub: str, cfp: CFP, now: float) -> None:
         pool = cfp.pool_id
+        self.observe(cfp, now)
         if self.activity == "offline":
             await beh.send(make_refuse(hub, pool, OFFLINE)); return
         if self.lock.blocks(pool, hub, cfp.attempt, now):                      # CC-09
@@ -447,6 +528,9 @@ class DriverAgent(BaseAgent):
             await beh.send(make_refuse(hub, pool, decision.reason or LockReason.NO_LOCK)); return
         if decision.replay:
             await beh.send(make_message(hub, Perf.CONFIRM, Protocol.MATCH_AUCTION, match, pool)); return
+        if self.cruise is not None:                                            # a job beats a cruise: stop at the next junction
+            self.cruise.cancelled = True
+            self.cruise, self.cruise_target = None, ""
         self.assignment = Assignment(hub, match, offer)
         self.activity = "to_pickup"
         self.log(f"committed to {pool}, fare {match.final_fare:.2f}")
@@ -463,6 +547,96 @@ class DriverAgent(BaseAgent):
         if self.lock.abort(pool, hub, now, "cancelled"):
             self.offers.pop(pool, None)
             self.log(f"{pool} cancelled by {hub}: lock released")
+
+    # ---- BDI layer: perception and commands ----------------------------------------------------
+    def observe(self, cfp: CFP, now: float) -> None:
+        """Every call for proposals is a sighting of demand at its hub (and of how many drivers it called)."""
+        if cfp.pool_id not in self._obs_pools:
+            self._obs_pools.add(cfp.pool_id)
+            self.obs.append((now, cfp.hub_id, max(1.0, cfp.constraints.get("callees", 1.0)), cfp.pool_id))
+
+    def observe_signal(self, sig: DemandSignal, now: float) -> None:
+        if sig.pool_id not in self._obs_pools:
+            self._obs_pools.add(sig.pool_id)
+            self.obs.append((now, sig.hub_id, max(1.0, sig.callees), sig.pool_id))
+
+    def pressures(self, now: float) -> Dict[str, float]:
+        """hub -> requests per available driver seen in the last t_obs_window seconds."""
+        while self.obs and now - self.obs[0][0] > self.t_obs_window:
+            _, _, _, pool = self.obs.popleft()
+            self._obs_pools.discard(pool)
+        out: Dict[str, float] = {}
+        for _, hub, callees, _ in self.obs:
+            out[hub] = out.get(hub, 0.0) + 1.0 / callees
+        return out
+
+    def percept(self, now: float) -> BrainPercept:
+        pressures = self.pressures(now)
+        known = set(self.network.hubs) if self.network is not None else set()   # the brain sees every hub
+        hubs = sorted(set(pressures) | known | ({self.start_hub} if self.start_hub else set()))
+        etas = []
+        for h in hubs:
+            try:
+                t = self.network.travel_time(self.location, h, now) if self.network else math.inf
+            except KeyError:
+                t = math.inf
+            etas.append(-1.0 if math.isinf(t) else round(t, 1))
+        if self.activity == "cruising":
+            state = "cruising"
+        elif self.lock.state == LockState.FIRM or self.activity not in ("idle", "cruising"):
+            state = "busy"
+        else:
+            state = "idle"                                       # a provisional lock is a bid in flight, not a job
+        at_hub = self.location if self.location in hubs else ""
+        return BrainPercept(self.me, state, self.location, at_hub, self.start_hub, hubs, etas,
+                            [round(pressures.get(h, 0.0), 3) for h in hubs], now)
+
+    async def send_percept(self, beh, force: bool = False) -> None:
+        now = clock.now()
+        p = self.percept(now)
+        sig = (p.state, p.at_hub)
+        if not force and sig == self._last_percept[0] and now - self._last_percept[1] < self.t_percept:
+            return
+        self._last_percept = (sig, now)
+        await beh.send(make_message(self.brain_jid, Perf.INFORM, Protocol.DRIVER_BRAIN, p))
+
+    async def on_brain_command(self, beh, msg) -> None:
+        if bare(msg.sender) != self.brain_jid:
+            return
+        try:
+            cmd = parse_payload(msg, strict=True)
+            if not isinstance(cmd, (CruiseCommand, BidPolicy)):
+                raise ValueError("not a brain command")
+        except (ValueError, TypeError):
+            await beh.send(make_message(msg.sender, Perf.REFUSE, Protocol.DRIVER_BRAIN, MALFORMED, msg.thread))
+            return
+        if isinstance(cmd, BidPolicy):                                          # pricing needs no lock: it only shapes future bids
+            self.bid_markup = cmd.markup
+            self.markups.append(cmd.markup)
+            await beh.send(make_message(msg.sender, Perf.AGREE, Protocol.DRIVER_BRAIN, cmd, msg.thread))
+            return
+        now = clock.now()
+        if self.lock.state != LockState.FREE or self.activity not in ("idle", "cruising"):
+            reason = LOCKED                                                     # busy: the brain is told and re-plans
+        elif not self.network or not self.network.has_node(cmd.hub_id):
+            reason = UNREACHABLE
+        elif cmd.hub_id == self.cruise_target:
+            reason = "already_going"
+        elif math.isinf(self.network.travel_time(self.location, cmd.hub_id, now)):
+            reason = UNREACHABLE
+        else:
+            reason = ""
+        if reason:
+            await beh.send(make_message(msg.sender, Perf.REFUSE, Protocol.DRIVER_BRAIN, reason, msg.thread))
+            return
+        if self.cruise is not None:
+            self.cruise.cancelled = True                                        # redirected: the old move stops at its next junction
+        self.cruise = Assignment("", None, None)
+        self.cruise_target = cmd.hub_id
+        self.cruises.append(cmd.hub_id)
+        self.log(f"brain: cruising to {cmd.hub_id}")
+        await beh.send(make_message(msg.sender, Perf.AGREE, Protocol.DRIVER_BRAIN, cmd, msg.thread))
+        self.add_behaviour(_Cruise(self.cruise, cmd.hub_id))
 
     # ---- trip execution ----------------------------------------------------------------------
     async def drive(self, to: str, a: Assignment) -> None:
@@ -492,6 +666,8 @@ class DriverAgent(BaseAgent):
 
     async def run_trip(self, beh, a: Assignment) -> None:
         pool, cfp = a.match.pool_id, a.offer.cfp
+        while self._cruise_busy:                                               # let the cruise stop first
+            await asyncio.sleep(0.02)
         riders = list(zip(cfp.rider_jids, cfp.rider_time_windows.keys(), cfp.rider_destinations))
         await self.announce(beh)
         await self.drive(cfp.pickup_node, a)
@@ -562,6 +738,36 @@ class DriverAgent(BaseAgent):
         self.completed.append(pool)
         self.finished_trips[pool] = a
         self.log(f"{pool} completed, idle at {self.location}")
+        self.return_after_trip()
+
+    def return_target(self) -> str:
+        """Hub the fixed return policy sends an idle driver to ('' = stay)."""
+        if self.return_policy == "start_hub":
+            return self.start_hub
+        if self.return_policy == "nearest_hub" and self.network is not None:
+            now = clock.now()
+            best, best_t = "", math.inf
+            for h in sorted(self.network.hubs):
+                try:
+                    t = self.network.travel_time(self.location, h, now)
+                except KeyError:
+                    continue
+                if t < best_t:
+                    best, best_t = h, t
+            return best
+        return ""
+
+    def return_after_trip(self) -> None:
+        target = self.return_target()
+        if not target or target == self.location or self.brain_jid:
+            return
+        if self.cruise is not None:
+            self.cruise.cancelled = True
+        self.cruise = Assignment("", None, None)
+        self.cruise_target = target
+        self.returns.append(target)
+        self.log(f"returning to {target}")
+        self.add_behaviour(_Cruise(self.cruise, target))
 
     # ---- repositioning ------------------------------------------------------------------------
     async def on_reposition(self, beh, msg) -> None:

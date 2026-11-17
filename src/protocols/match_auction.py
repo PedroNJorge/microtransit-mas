@@ -49,7 +49,7 @@ from common.messages import (
     make_request,
 )
 from common.ontology import (
-    AuctionOutcome, Bid, CFP, FailureReason, MatchResult, Perf, Pool, Protocol, TripFailed,
+    AuctionOutcome, Bid, CFP, DemandSignal, FailureReason, MatchResult, Perf, Pool, Protocol, TripFailed,
 )
 from protocols.payment_common import bare, expect
 
@@ -163,8 +163,15 @@ class _CfpSent(_AuctionState):
     async def step(self):
         ctx, hub = self.ctx, self.agent
         ctx.recipients = hub.eligible_drivers(clock.now(), ctx.attempt)          # CC-08
+        ctx.cfp.constraints["callees"] = float(len(ctx.recipients))   # supply signal for the drivers' BDI brains
         for jid in ctx.recipients:
             await self.send(make_cfp(jid, ctx.cfp))
+        if hub.broadcast_demand and ctx.attempt == 0:                # tell the drivers that were not called
+            for jid in hub.driver_jids:
+                if jid not in ctx.recipients:
+                    await self.send(make_inform(jid, Protocol.DRIVER_BRAIN,
+                                                DemandSignal(hub.hub_id, ctx.pool_id, float(len(ctx.recipients)),
+                                                             clock.now()), ctx.pool_id))
         note(ctx, CFP_SENT, "cfp sent", drivers=len(ctx.recipients))
         self.set_next_state(COLLECTING_BIDS)
 

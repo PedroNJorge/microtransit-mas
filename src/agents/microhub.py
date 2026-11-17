@@ -76,6 +76,7 @@ class PoolRecord:
     proposal_deadline: float = 0.0
     plan: Optional[GroupPlan] = None                         # the group's exact plan (pooling, M9)
     accepted: set = field(default_factory=set)               # request ids that accepted the proposal
+    times: Dict[str, float] = field(default_factory=dict)    # sim-time milestones: confirmed, queued, auction_start, matched
 
 
 class TripRequestReceiver(CyclicBehaviour):
@@ -466,7 +467,8 @@ class MicrohubAgent(BaseAgent):
                  max_batch: int = MAX_BATCH, solver: str = POOL_SOLVER, detour_weight: float = DETOUR_WEIGHT,
                  solo_fallback: bool = True, reserve_margin: Optional[float] = None,
                  pickup_allowance: float = PICKUP_ALLOWANCE, max_pickup_eta: Optional[float] = None,
-                 retry_delay: float = 0.0, window_slack: float = 0.0, **kwargs):
+                 retry_delay: float = 0.0, window_slack: float = 0.0, broadcast_demand: bool = False,
+                 **kwargs):
         super().__init__(jid, password, **kwargs)
         self.hub_id = hub_id                  # node id in the road network (== MicrohubNode.id)
         self.driver_jids: List[str] = [bare(j) for j in (driver_jids or [])]
@@ -511,6 +513,7 @@ class MicrohubAgent(BaseAgent):
         self.reserve_margin, self.pickup_allowance = reserve_margin, pickup_allowance
         self.max_pickup_eta, self.retry_delay, self.window_slack = max_pickup_eta, retry_delay, window_slack
         self._waking = False
+        self.broadcast_demand = broadcast_demand      # tell drivers that were not called about the request (BDI input)
         self.auction_queue: List[tuple] = []
         self.auction_running = False
 
@@ -700,6 +703,7 @@ class MicrohubAgent(BaseAgent):
 
     def confirm_pool(self, rec: PoolRecord) -> None:
         rec.state = "AWAITING_ESCROW"
+        rec.times.setdefault("confirmed", clock.now())
         rec.escrow_deadline = clock.now() + self.t_escrow
         rec.pool.status = PoolStatus.LOCKED
 
@@ -709,6 +713,7 @@ class MicrohubAgent(BaseAgent):
         starving it of bids. A retry goes to the front of the line, after `retry_delay` (so the locks
         of the failed attempt have expired)."""
         rec.state = "AUCTION_QUEUED"
+        rec.times.setdefault("queued", clock.now())          # first time only: retries are part of the auction phase
         wait = (self.retry_delay if delay is None else delay) if attempt else 0.0
         entry = (rec, attempt, clock.now() + wait)
         if attempt:
@@ -729,6 +734,7 @@ class MicrohubAgent(BaseAgent):
             return
         self.auction_queue.remove(ready)
         rec, attempt, _ = ready
+        rec.times.setdefault("auction_start", now)
         self.auction_running = True
         rec.state = "AUCTIONING"
         rec.pool.status = PoolStatus.AUCTIONING
@@ -747,6 +753,7 @@ class MicrohubAgent(BaseAgent):
         self.auction_running = False
         if ctx.outcome == MATCHED:
             rec.state, rec.pool.status = "ASSIGNED", PoolStatus.ASSIGNED
+            rec.times["matched"] = clock.now()
             self.matches[ctx.pool_id] = ctx.match
         elif ctx.outcome == RETRY:
             self.start_auction(rec, ctx.attempt + 1, self.retry_wait(ctx))
