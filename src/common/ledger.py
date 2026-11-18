@@ -39,6 +39,7 @@ from common.ontology import EscrowStatus
 
 EXTERNAL = "external"
 FUND = "subsidy_fund"
+POOL_FUND = "pooling_fund"
 
 
 class Reason:
@@ -120,6 +121,7 @@ class SettlementLine:
     subsidy_c: int
     excess_c: int
     shortfall_c: int = 0                # subsidy wanted but not paid (fund exhausted)
+    incentive_c: int = 0                # pooling incentive credited from the pooling fund
 
 
 @dataclass
@@ -141,6 +143,10 @@ class SettleOutcome:
     def total_returned(self) -> float:
         return money(sum(l.excess_c for l in self.lines))
 
+    @property
+    def total_incentive(self) -> float:
+        return money(sum(l.incentive_c for l in self.lines))
+
 
 @dataclass(frozen=True)
 class RefundItem:
@@ -159,16 +165,20 @@ class RefundItem:
 class Ledger:
     def __init__(self, default_rider_balance: Optional[float] = None,
                  subsidy_budget: Optional[float] = None, subsidy_discount: float = 0.0,
-                 now: Callable[[], float] = lambda: 0.0):
+                 now: Callable[[], float] = lambda: 0.0, pooling_budget: Optional[float] = None):
         """default_rider_balance: wallet opened on a rider's first escrow request (simulation
         endowment, booked as an external inflow). None: unknown riders are refused.
         subsidy_budget: size of the subsidy fund; None = unlimited (funded on demand).
-        subsidy_discount: share of the fare rebated to eligible riders, in [0, 1]."""
+        subsidy_discount: share of the fare rebated to eligible riders, in [0, 1].
+        pooling_budget: size of the pooling-incentive fund; None = unlimited (funded on demand)."""
         self._now = now
         self.default_rider_balance = default_rider_balance
         self.unlimited_subsidy = subsidy_budget is None
         self.set_subsidy_discount(subsidy_discount)
-        self._balances: Dict[str, int] = {EXTERNAL: 0, FUND: 0}
+        self._balances: Dict[str, int] = {EXTERNAL: 0, FUND: 0, POOL_FUND: 0}
+        self.unlimited_pooling = pooling_budget is None
+        self.pooling_spent_c = 0
+        self.pooling_shortfall_c = 0
         self.entries: List[Entry] = []
         self._escrows: Dict[str, EscrowRecord] = {}
         self._status: Dict[str, EscrowStatus] = {}
@@ -182,6 +192,11 @@ class Ledger:
                 raise ValueError("subsidy_budget must be >= 0")
             if cents(subsidy_budget):                   # 0 is a valid budget: "no subsidies"
                 self.fund_subsidy(subsidy_budget)
+        if pooling_budget is not None:
+            if cents(pooling_budget) < 0:
+                raise ValueError("pooling_budget must be >= 0")
+            if cents(pooling_budget):
+                self._transfer("pooling_funding", EXTERNAL, POOL_FUND, cents(pooling_budget))
 
     # ---- low level --------------------------------------------------------------------
     def _transfer(self, kind: str, src: str, dst: str, amount_c: int, ref: str = "") -> None:
@@ -233,6 +248,14 @@ class Ledger:
         return money(self.subsidy_spent_c)
 
     @property
+    def pooling_spent(self) -> float:
+        return money(self.pooling_spent_c)
+
+    @property
+    def pooling_shortfall(self) -> float:
+        return money(self.pooling_shortfall_c)
+
+    @property
     def subsidy_shortfall(self) -> float:
         return money(self.subsidy_shortfall_c)
 
@@ -263,9 +286,15 @@ class Ledger:
         known = self._by_request.get(request_id)
         if known is not None:
             rec = self._escrows[known]
-            if (rec.rider, rec.pool_id, rec.amount_c, rec.hub) != (rider, pool_id, amount_c, hub):
+            if (rec.rider, rec.pool_id, rec.amount_c, rec.hub) == (rider, pool_id, amount_c, hub):
+                return rec, False
+            if rec.rider != rider or self._status[known] == EscrowStatus.SETTLED \
+                    or (rec.pool_id, rec.hub) == (pool_id, hub):          # same pool and hub: the terms conflict
                 raise LedgerError(Reason.DUPLICATE_REQUEST, request_id)
-            return rec, False
+            # The same rider starts the same request over with another pool or hub (the request was handed over to a
+            # neighbour hub, M11): its old hold goes back to its wallet and the new one replaces it.
+            if self._status[known] == EscrowStatus.HELD:
+                self._refund_one(rec.pool_id, known, "", force=True)
         if not self.has_wallet(rider):
             if self.default_rider_balance is None:
                 raise LedgerError(Reason.UNKNOWN_ACCOUNT, rider)
@@ -285,7 +314,7 @@ class Ledger:
     # ---- SettlementProtocol --------------------------------------------------------------
     def settle(self, pool_id: str, driver: str, rider_ids: Iterable[str],
                rider_fares: Optional[Dict[str, float]] = None,
-               requester: str = "") -> SettleOutcome:
+               requester: str = "", incentives: Optional[Dict[str, float]] = None) -> SettleOutcome:
         rider_ids = list(dict.fromkeys(rider_ids))
         if not self._by_pool.get(pool_id):
             raise LedgerError(Reason.UNKNOWN_POOL, pool_id)
@@ -350,9 +379,19 @@ class Ledger:
                     self._transfer("subsidy", FUND, wallet(rec.rider), subsidy_c, rec.escrow_id)
                 self.subsidy_spent_c += subsidy_c
                 self.subsidy_shortfall_c += shortfall_c
+            incentive_c = 0
+            want_c = cents((incentives or {}).get(rec.rider, 0.0))
+            if want_c > 0 and fare_c:
+                if self.unlimited_pooling and self._balances[POOL_FUND] < want_c:
+                    self._transfer("pooling_funding", EXTERNAL, POOL_FUND, want_c - self._balances[POOL_FUND])
+                incentive_c = min(want_c, self._balances[POOL_FUND])
+                if incentive_c:
+                    self._transfer("pooling_incentive", POOL_FUND, wallet(rec.rider), incentive_c, rec.escrow_id)
+                self.pooling_spent_c += incentive_c
+                self.pooling_shortfall_c += want_c - incentive_c
             self._status[rec.escrow_id] = EscrowStatus.SETTLED
             line = SettlementLine(rec.escrow_id, rec.rider, driver, fare_c, subsidy_c,
-                                  excess_c, shortfall_c)
+                                  excess_c, shortfall_c, incentive_c)
             self._settled[rec.escrow_id] = line
             lines.append(line)
         return SettleOutcome(pool_id, driver, lines)

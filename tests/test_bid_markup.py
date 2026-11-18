@@ -64,6 +64,19 @@ def test_viz_payload_has_what_the_map_needs():
     assert d.viz_payload()["state"] == "CRUISING"
     d.activity = "repositioning"
     assert d.viz_payload()["state"] == "REPOSITIONING"
+
+
+def test_an_auction_in_progress_shows_over_cruising():
+    """A cruising driver that has bid on a pool is BIDDING on the map, not teal."""
+    from common.graph import TransitNetwork
+    net = TransitNetwork.from_file("config/porto_graph.json")
+    d = DriverAgent("driver_07@localhost", "pw", start_hub=sorted(net.hubs)[0], network=net, hub_jids=[])
+    d.activity = "cruising"
+    assert d.viz_payload()["state"] == "CRUISING"
+    assert d.lock.acquire("pool-1", "hub@localhost", "bid-1", 0, 0.0).ok          # a provisional lock = a bid in flight
+    assert d.viz_payload()["state"] == "BIDDING"
+    assert d.lock.commit("pool-1", "hub@localhost", 1.0).ok
+    assert d.viz_payload()["state"] == "COMMITTED"                                # won, still cruising until it turns
     d.broadcast_viz()                                                     # no event loop: must simply do nothing
 
 

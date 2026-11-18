@@ -45,6 +45,7 @@ class GroupPlan:
     direct: Dict[str, float] = field(compare=False, default_factory=dict)     # request_id -> direct seconds
     detour: Dict[str, float] = field(compare=False, default_factory=dict)     # request_id -> experienced detour
     marginal: Dict[str, float] = field(compare=False, default_factory=dict)   # request_id -> 2.1 marginal detour
+    wait: Dict[str, float] = field(compare=False, default_factory=dict)       # request_id -> seconds already waited for the batch
     departure: float = 0.0                       # earliest common pickup instant inside every window
 
     @property
@@ -92,7 +93,7 @@ def _simulate(network, hub: str, order: Sequence[str], t: float
 
 
 def evaluate_group(network, hub: str, reqs: Sequence, now: float,
-                   respect_windows: bool = True) -> Optional[GroupPlan]:
+                   respect_windows: bool = True, count_wait: bool = True) -> Optional[GroupPlan]:
     """Best feasible drop-off order for exactly these requests, or None.
 
     Feasible = windows share an instant (unless respect_windows=False) AND every rider's
@@ -106,6 +107,7 @@ def evaluate_group(network, hub: str, reqs: Sequence, now: float,
     if dep is None:
         return None
     dests = sorted({r.destination_home for r in reqs})
+    waited = {r.request_id: (max(0.0, now - r.created_at) if count_wait and len(reqs) > 1 and r.created_at > 0 else 0.0) for r in reqs}
     direct = {}
     for r in reqs:
         d = network.travel_time(hub, r.destination_home, dep)
@@ -120,7 +122,10 @@ def evaluate_group(network, hub: str, reqs: Sequence, now: float,
         arrivals, total = sim
         ride = {r.request_id: arrivals[r.destination_home] for r in reqs}
         detour = {k: max(0.0, ride[k] - direct[k]) for k in ride}
-        if any(detour[r.request_id] > r.detour_tolerance + 1e-9 for r in reqs):
+        # What sharing costs a rider: the extra ride AND the time spent waiting for the batch (a rider alone is not
+        # batched). The wait is already spent when the plan is made, so it limits who may share but is not in the
+        # objective below (that would count a sunk cost).
+        if any(detour[r.request_id] + waited[r.request_id] > r.detour_tolerance + 1e-9 for r in reqs):
             continue
         key = (total + sum(detour.values()), perm)
         if best_key is None or key < best_key:
@@ -138,7 +143,7 @@ def evaluate_group(network, hub: str, reqs: Sequence, now: float,
         sim = _simulate(network, hub, sub, dep)
         marginal[r.request_id] = total - sim[1] if sim else 0.0
     return GroupPlan(tuple(sorted(r.request_id for r in reqs)), (hub, *perm), total, ride, direct,
-                     detour, marginal, dep)
+                     detour, marginal, waited, dep)
 
 
 # ---- insertion operator (the spec's "insertion heuristic", made exact for one insertion) ------------
@@ -166,6 +171,23 @@ def insert_rider(network, hub: str, route: Sequence[str], new_dest: str, now: fl
         if best is None or key < best:
             best = key
     return (best[1], best[0]) if best else None
+
+
+# ---- footprint (vehicle distance, CO2) ---------------------------------------------------------------------------
+
+def footprint(network, hub: str, stops: Sequence[str], dests: Sequence[str], now: float) -> Optional[Tuple[float, float]]:
+    """(metres driven on the shared route hub -> stops, metres if each destination had its own vehicle from the hub).
+    The loaded leg only: both are measured from the hub, so the difference is what sharing saved. None if unreachable."""
+    shared = network.route_length([hub, *stops], now) if stops else 0.0
+    if shared is None:
+        return None
+    alone = 0.0
+    for d in dests:
+        leg = network.route_length([hub, d], now) if d != hub else 0.0
+        if leg is None:
+            return None
+        alone += leg
+    return shared, alone
 
 
 # ---- partitioning -------------------------------------------------------------------------------
@@ -283,3 +305,43 @@ def reference_solo_fare(direct_seconds: float, base: float, per_second: float, m
     """Posted solo tariff used to show the pooling discount: base + rate x direct ride time,
     never above the rider's own maximum."""
     return min(max_fare, round_cents(base + per_second * direct_seconds) / 100)
+
+
+# ---- late join: a rider joins a pool whose driver has not reached the hub yet (item 4) ------------------------------
+@dataclass
+class LateJoinTerms:
+    plan: GroupPlan                         # the new shared trip (existing riders + the joiner)
+    extra_seconds: float                    # extra driving the joiner causes
+    extra_pay: float                        # paid to the driver on top of the old total, EUR
+    fares: Dict[str, float]                 # request_id -> fare after the join (existing riders: never above before)
+    total: float                            # new total fare = old total + extra_pay
+
+
+def late_join_terms(network, hub: str, existing: Sequence, new_req, old_fares: Dict[str, float], now: float,
+                    cost_per_second: float, markup: float, max_size: int) -> Optional[LateJoinTerms]:
+    """Can `new_req` join the pool of `existing` requests, and on what terms? None if not.
+
+    Feasible = the group (existing + joiner) is feasible as a whole: windows overlap at `now` (the driver's expected arrival)
+    and every rider's detour stays within ITS OWN tolerance (the existing riders agreed to a detour only up to that, they
+    are not asked again). The driver is paid for the extra driving at its variable cost plus `markup`. The new total is
+    split like any pool (by direct time); an existing rider pays the smaller of its old fare and its new share, so
+    nobody's fare rises, and the joiner pays what is left, which is never below the driver's extra pay. If the joiner's
+    fare is above its max_fare the join is not offered."""
+    existing = list(existing)
+    if not existing or len(existing) + 1 > max_size:
+        return None
+    # No batch wait here: nobody waits for a batch, the driver is already coming; only the detour counts against tolerance.
+    before = evaluate_group(network, hub, existing, now, respect_windows=False, count_wait=False)
+    plan = evaluate_group(network, hub, existing + [new_req], now, count_wait=False)
+    if before is None or plan is None:
+        return None
+    extra_seconds = max(0.0, plan.route_time - before.route_time)
+    extra_pay = round(extra_seconds * cost_per_second * (1.0 + markup), 2)
+    old_total = round(sum(old_fares.values()), 2)
+    total = round(old_total + extra_pay, 2)
+    shares = split_fare_weighted(total, {rid: max(1.0, d) for rid, d in plan.direct.items()})
+    fares = {rid: min(old_fares[rid], shares[rid]) for rid in old_fares}
+    fares[new_req.request_id] = round(total - sum(fares.values()), 2)
+    if fares[new_req.request_id] > new_req.max_fare + 1e-9 or fares[new_req.request_id] <= 0:
+        return None
+    return LateJoinTerms(plan, extra_seconds, extra_pay, fares, total)

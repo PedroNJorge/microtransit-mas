@@ -219,3 +219,91 @@ def test_fare_ceiling_never_exceeds_anyones_max():
 def test_reference_solo_fare_is_capped():
     assert reference_solo_fare(100, 2.0, 0.004, 20.0) == pytest.approx(2.40)
     assert reference_solo_fare(100000, 2.0, 0.004, 20.0) == 20.0
+
+
+# ---- the batch wait counts against a rider's tolerance (sharing only; a rider alone is not batched) -------------
+
+def queued(i, dest, created_at, tol):
+    return TripRequest(f"r{i}", f"rider{i}", HUB, dest, 0.0, 3600.0, tol, 20.0, True, False, created_at)
+
+
+def test_waiting_for_the_batch_uses_up_the_tolerance_of_a_shared_ride(net):
+    a, b = queued(1, "n1_2", 100.0, 200.0), queued(2, "n1_3", 100.0, 200.0)      # zero detour on the same road
+    assert evaluate_group(net, HUB, [a, b], now=200.0) is not None                 # waited 100 s <= 200 s
+    plan = evaluate_group(net, HUB, [a, b], now=200.0)
+    assert plan.wait == {"r1": 100.0, "r2": 100.0}
+    assert evaluate_group(net, HUB, [a, b], now=400.0) is None                     # waited 300 s > 200 s: may not share
+
+
+def test_a_rider_alone_is_never_refused_for_having_waited(net):
+    a = queued(1, "n1_2", 100.0, 10.0)
+    plan = evaluate_group(net, HUB, [a], now=900.0)
+    assert plan is not None and plan.wait == {"r1": 0.0}
+
+
+def test_the_wait_does_not_change_which_partition_is_cheapest(net):
+    """Sunk cost: it limits who may share, it is not part of the objective."""
+    a, b = queued(1, "n1_2", 100.0, 900.0), queued(2, "n1_3", 100.0, 900.0)
+    p1, p2 = best_partition(net, HUB, [a, b], now=150.0), best_partition(net, HUB, [a, b], now=600.0)
+    assert [g.request_ids for g in p1.groups] == [g.request_ids for g in p2.groups]
+
+
+# ---- footprint -------------------------------------------------------------------------------------------------
+
+def test_a_shared_route_drives_fewer_metres_than_separate_ones(net):
+    from common.pooling import footprint
+    shared, alone = footprint(net, HUB, ["n1_2", "n1_3"], ["n1_2", "n1_3"], 0.0)
+    assert shared == pytest.approx(2.0) and alone == pytest.approx(3.0)             # grid lengths: 1 per road
+    assert shared < alone
+
+
+def test_footprint_of_a_solo_ride_saves_nothing(net):
+    from common.pooling import footprint
+    shared, alone = footprint(net, HUB, ["n1_3"], ["n1_3"], 0.0)
+    assert shared == alone
+
+
+def test_route_length_sums_edge_lengths(net):
+    assert net.route_length([HUB, "n1_3"], 0.0) == pytest.approx(2.0)
+    assert net.route_length([HUB, "n1_3", "n1_2"], 0.0) == pytest.approx(3.0)
+
+
+# ---- CO2 pooling incentive (hub side) ----------------------------------------------------------
+def test_pool_incentive_split_by_delay_and_zero_when_nothing_saved():
+    from types import SimpleNamespace as NS
+    from agents.microhub import MicrohubAgent, PoolMetric
+    hub = NS(pool_incentive_per_kg=2.0, emission_g_per_km=150.0,
+             pool_metrics=[PoolMetric("p1", 2, 3000.0, 9000.0)])            # 6 km saved = 0.9 kg -> 1.80 EUR
+    rec = NS(pool=NS(pool_id="p1", requests=[1, 2]), rider_jids={"q1": "a@x", "q2": "b@x"},
+             plan=NS(detour={"q1": 0.0, "q2": 299.0}))
+    got = MicrohubAgent.pool_incentives(hub, rec, ["a@x", "b@x"])
+    assert got == {"a@x": 0.01, "b@x": 1.79} and abs(sum(got.values()) - 1.80) < 0.011
+    hub.pool_metrics = [PoolMetric("p1", 2, 9000.0, 9000.0)]
+    assert MicrohubAgent.pool_incentives(hub, rec, ["a@x", "b@x"]) == {}
+    hub.pool_metrics, hub.pool_incentive_per_kg = [PoolMetric("p1", 2, 3000.0, 9000.0)], 0.0
+    assert MicrohubAgent.pool_incentives(hub, rec, ["a@x", "b@x"]) == {}
+
+
+# ---- late join terms ---------------------------------------------------------------------------
+def test_late_join_never_raises_an_existing_fare_and_pays_the_driver_the_extra():
+    from common.pooling import late_join_terms
+    net = build_grid_network()
+    a = req(1, "n1_3")
+    b = req(2, "n1_4")                         # same direction, a bit further: a cheap addition
+    t = late_join_terms(net, HUB, [a], b, {"r1": 6.0}, 100.0, 0.004, 0.3, 4)
+    assert t is not None and t.extra_seconds >= 0
+    assert t.fares["r1"] <= 6.0 and abs(sum(t.fares.values()) - t.total) < 0.011
+    assert t.total == round(6.0 + t.extra_pay, 2)
+    assert t.fares["r2"] >= t.extra_pay - 1e-9
+
+
+def test_late_join_refused_when_full_when_tolerance_breaks_or_fare_too_high():
+    from common.pooling import late_join_terms
+    net = build_grid_network()
+    a = req(1, "n1_3", tol=0.0)                # nobody may be delayed: any extra driving breaks a's tolerance
+    far = req(2, "n3_1", tol=0.0)              # opposite direction, and nobody may be delayed either
+    assert late_join_terms(net, HUB, [a], far, {"r1": 6.0}, 100.0, 0.004, 0.3, 4) is None
+    ok = req(3, "n1_4")
+    assert late_join_terms(net, HUB, [req(1, "n1_3")], ok, {"r1": 6.0}, 100.0, 0.004, 0.3, 1) is None   # capacity
+    poor = req(4, "n1_4", max_fare=0.01)
+    assert late_join_terms(net, HUB, [req(1, "n1_3")], poor, {"r1": 6.0}, 100.0, 0.004, 0.3, 4) is None

@@ -43,7 +43,8 @@ def handle_settlement(agent, msg: Message) -> List[Message]:
     fares = {agent.account(r): f for r, f in tc.rider_fares.items()} or None
     solo = {agent.account(r): f for r, f in tc.solo_fares.items()}
     try:
-        outcome = agent.ledger.settle(tc.pool_id, driver, riders, fares, sender)
+        incentives = {agent.account(r): v for r, v in tc.pool_incentives.items()}
+        outcome = agent.ledger.settle(tc.pool_id, driver, riders, fares, sender, incentives)
     except LedgerError as e:
         agent.stats["settlement_refused"] += 1
         return [make_message(sender, Perf.REFUSE, Protocol.SETTLEMENT,
@@ -52,7 +53,7 @@ def handle_settlement(agent, msg: Message) -> List[Message]:
     complete = SettlementComplete(
         pool_id=tc.pool_id, driver_id=driver, escrow_ids=[l.escrow_id for l in outcome.lines],
         total_paid=outcome.total_paid, total_subsidy=outcome.total_subsidy,
-        total_returned=outcome.total_returned)
+        total_returned=outcome.total_returned, total_incentive=outcome.total_incentive)
     out: List[Message] = []
     if outcome.replayed:
         agent.stats["settlement_replayed"] += 1
@@ -61,7 +62,7 @@ def handle_settlement(agent, msg: Message) -> List[Message]:
         for line in outcome.lines:
             discount_c = max(0, cents(solo[line.rider]) - line.payout_c) if line.rider in solo else 0
             s = Settlement(line.escrow_id, driver, money(line.payout_c), money(line.subsidy_c),
-                           0.0, money(line.excess_c), money(discount_c))
+                           0.0, money(line.excess_c), money(discount_c), money(line.incentive_c))
             out.append(make_inform(driver, Protocol.SETTLEMENT, s, thread))
             out.append(make_inform(line.rider, Protocol.SETTLEMENT, s, thread))
     out.append(make_inform(sender, Protocol.SETTLEMENT, complete, thread))

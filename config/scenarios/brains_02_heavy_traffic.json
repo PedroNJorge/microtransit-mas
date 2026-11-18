@@ -13,11 +13,11 @@
   "hubs": "all",
   "duration": 14400,
   "drivers": {
-    "count": 8,
+    "count": 20,
     "brains": true
   },
   "riders": {
-    "count": 20
+    "count": 60
   },
   "demand": [
     {
@@ -25,7 +25,7 @@
       "hubs": "all",
       "start": 0,
       "end": 3300,
-      "count": 20,
+      "count": 60,
       "pattern": "random",
       "max_fare": 25,
       "pooling": 1.0

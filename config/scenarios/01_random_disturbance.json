@@ -13,10 +13,10 @@
   "hubs": "all",
   "duration": 14400,
   "drivers": {
-    "count": 8
+    "count": 16
   },
   "riders": {
-    "count": 16
+    "count": 48
   },
   "demand": [
     {
@@ -24,7 +24,7 @@
       "hubs": "all",
       "start": 0,
       "end": 2400,
-      "count": 16,
+      "count": 48,
       "pattern": "random",
       "max_fare": 25,
       "pooling": 1.0

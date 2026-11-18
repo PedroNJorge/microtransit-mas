@@ -49,12 +49,12 @@ from common.messages import make_inform, make_message, make_propose, make_refuse
 from common.ontology import (
     BrainPercept, BidPolicy, CruiseCommand, DemandSignal,
     AuctionOutcome, Bid, CFP, Policy, Rating, DriverArriving, DriverState, DriverStatus, FailureReason, MatchResult,
-    Perf, Protocol, RepositionRequest, ReputationScore, RiderBoarded, RiderDroppedOff, RiderReady, Settlement,
+    LateJoinDecision, LateJoinRequest, Perf, Protocol, RepositionRequest, ReputationScore, RiderBoarded, RiderDroppedOff, RiderReady, Settlement,
     TripCompleted, TripFailed, parse_payload,
 )
 from common.settings import (
     DRIVER_BASE_COST, DRIVER_CAPACITY, DRIVER_COST_PER_SECOND, DWELL_DROPOFF, DWELL_PICKUP,
-    T_NO_SHOW, T_PROVISIONAL, T_STATUS,
+    T_JOIN_HOLD, T_NO_SHOW, T_PROVISIONAL, T_STATUS,
 )
 from protocols.payment_common import bare
 
@@ -93,8 +93,56 @@ class Assignment:
     offer: Offer
     cancelled: bool = False
     boarded: List[str] = field(default_factory=list)       # rider JIDs
+    riders: List[tuple] = field(default_factory=list)      # (rider JID, request id, destination, that rider's pool id)
+    route: List[str] = field(default_factory=list)         # stop order in force, pickup first ([] = offer.route)
+    frozen: bool = False                                   # arrived at the pickup: nobody can join any more
+    pending: Dict[str, "PendingJoin"] = field(default_factory=dict)   # provisional late joiners by their pool id
     no_shows: List[str] = field(default_factory=list)
     dropped: List[str] = field(default_factory=list)
+
+
+@dataclass
+class PendingJoin:
+    """A late joiner the driver accepted but the hub has not confirmed yet: what to undo if it never is."""
+    rider: tuple
+    previous_route: List[str]
+    deadline: float
+
+
+# ---------------------------------------------------------------------------------------------
+class LateJoinHandler(CyclicBehaviour):
+    """LateJoinProtocol, driver side: request(LateJoinRequest) -> agree (applied provisionally) | refuse(reason);
+    inform(LateJoinDecision) -> keep it or undo it. The driver is free to refuse: it must still be on the way to the
+    pickup, have a seat, and be paid at least its own variable cost of the extra driving plus its markup."""
+
+    async def run(self):
+        msg = await self.receive(timeout=1)
+        if msg is None:
+            return
+        d, sender = self.agent, bare(msg.sender)
+        try:
+            p = parse_payload(msg, strict=True)
+        except (ValueError, TypeError):
+            return
+        a = d.assignment
+        if isinstance(p, LateJoinRequest) and msg.get_metadata("performative") == Perf.REQUEST:
+            reason = d.late_join_problem(a, sender, p)
+            if reason:
+                d.log(f"late join {p.join_pool_id} into {p.pool_id} refused: {reason}")
+                await self.send(make_message(sender, Perf.REFUSE, Protocol.LATE_JOIN, reason, p.join_pool_id))
+                return
+            rider = (p.rider_jid, p.request_id, p.destination, p.join_pool_id)
+            a.pending[p.join_pool_id] = PendingJoin(rider, list(a.route or a.offer.route),
+                                                    clock.now() + d.t_join_hold)
+            a.riders.append(rider)
+            a.route = list(p.route)
+            d.log(f"late join {p.join_pool_id} into {p.pool_id} agreed: +{p.extra_seconds:.0f}s for +{p.extra_pay:.2f}")
+            await self.send(make_message(sender, Perf.AGREE, Protocol.LATE_JOIN, "agreed", p.join_pool_id))
+        elif isinstance(p, LateJoinDecision) and a is not None and sender == a.hub and a.match.pool_id == p.pool_id:
+            if p.confirmed:
+                a.pending.pop(p.join_pool_id, None)
+            else:
+                d.undo_late_join(a, p.join_pool_id)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -351,6 +399,8 @@ class DriverAgent(BaseAgent):
         self.cruise_target: str = ""
         self._cruise_busy = False
         self._last_percept = (None, -math.inf)
+        self.late_join = True                          # may accept riders into a pool it is already driving to
+        self.t_join_hold = T_JOIN_HOLD                 # sim s it waits at the hub for a provisional joiner to be confirmed
         self.bid_markup = 0.0                          # opportunity-cost markup set by the brain (0 = bid at cost)
         self.markups: List[float] = []                 # history of markups the brain set
         self.cruises: List[str] = []                   # hubs the brain sent this driver to (history)
@@ -360,6 +410,7 @@ class DriverAgent(BaseAgent):
         await super().setup()
         self.add_behaviour(AuctionContractor(), make_template(Protocol.MATCH_AUCTION))
         self.add_behaviour(Housekeeping())
+        self.add_behaviour(LateJoinHandler(), make_template(Protocol.LATE_JOIN))
         self.add_behaviour(RepositionHandler(), make_template(Protocol.REPOSITION, Perf.REQUEST))
         self.add_behaviour(SettlementReceiver(), make_template(Protocol.SETTLEMENT, Perf.INFORM))
         self.add_behaviour(ReputationReceiver(), make_template(Protocol.REPUTATION, Perf.INFORM))
@@ -417,9 +468,9 @@ class DriverAgent(BaseAgent):
         if not node or node.get("lat") is None or node.get("lon") is None:
             return None
         state = self.state.value if hasattr(self.state, "value") else str(self.state)
-        if self.activity == "repositioning":
-            state = "REPOSITIONING"                       # hub-requested move (Milestone 10)
-        elif self.activity == "cruising":
+        # Colour priority: a driver in an auction or on a job shows that (BIDDING, COMMITTED, EN_ROUTE_PICKUP, ON_TRIP),
+        # even while it is also cruising; REPOSITIONING and CRUISING only show for a driver that is otherwise free.
+        if self.state == DriverState.IDLE and self.activity == "cruising":
             state = "CRUISING"                            # self-directed move by the BDI brain / return policy
         on_board = []
         if self.assignment is not None:
@@ -551,8 +602,8 @@ class DriverAgent(BaseAgent):
         self.activity = "to_pickup"
         self.log(f"committed to {pool}, fare {match.final_fare:.2f}")
         await beh.send(make_message(hub, Perf.CONFIRM, Protocol.MATCH_AUCTION, match, pool))
-        self.add_behaviour(TripRunner(self.assignment),
-                           make_template(Protocol.TRIP_EXECUTION, Perf.INFORM, thread=pool))
+        # no thread filter: a rider that joined late talks on its own pool id (run_trip checks the sender)
+        self.add_behaviour(TripRunner(self.assignment), make_template(Protocol.TRIP_EXECUTION, Perf.INFORM))
 
     async def handle_cancel(self, hub: str, pool: str, now: float) -> None:
         a = self.assignment
@@ -684,14 +735,27 @@ class DriverAgent(BaseAgent):
         pool, cfp = a.match.pool_id, a.offer.cfp
         while self._cruise_busy:                                               # let the cruise stop first
             await asyncio.sleep(0.02)
-        riders = list(zip(cfp.rider_jids, cfp.rider_time_windows.keys(), cfp.rider_destinations))
+        a.riders = [(j, r, dest, pool) for j, r, dest in
+                    zip(cfp.rider_jids, cfp.rider_time_windows.keys(), cfp.rider_destinations)]
         await self.announce(beh)
         await self.drive(cfp.pickup_node, a)
-        # arrived: tell the riders and wait for them (T_no_show, FE-05)
+        # arrived. Joiners the hub has not confirmed yet get a little time (T_join_hold), then they are undone; after this
+        # nobody can join any more (no await between the last check and the freeze).
+        while a.pending and not a.cancelled:
+            for jp, pend in list(a.pending.items()):
+                if clock.now() >= pend.deadline:
+                    self.undo_late_join(a, jp)
+                    await beh.send(make_message(a.hub, Perf.INFORM, Protocol.LATE_JOIN,
+                                                LateJoinDecision(pool, jp, False, "not_confirmed"), jp))
+            if a.pending:
+                await clock.sim_sleep(2.0)
+        a.frozen = True
+        riders = list(a.riders)
+        # tell the riders and wait for them (T_no_show, FE-05)
         eta = 0.0
-        for jid, req, _ in riders:
+        for jid, req, _, rpool in riders:
             await beh.send(make_message(jid, Perf.INFORM, Protocol.TRIP_EXECUTION,
-                                        DriverArriving(req, pool, self.me, eta), pool))
+                                        DriverArriving(req, rpool, self.me, eta), rpool))
         ready: set = set()
         deadline = clock.now() + self.t_no_show
         while len(ready) < len(riders) and clock.now() < deadline:
@@ -708,39 +772,40 @@ class DriverAgent(BaseAgent):
                 ready.add(bare(m.sender))
         if a.cancelled:
             raise _TripCancelled()
-        a.no_shows = [jid for jid, _, _ in riders if jid not in ready]
-        for jid in a.no_shows:                                     # FE-05: report, do not wait longer
-            await beh.send(make_message(a.hub, Perf.INFORM, Protocol.TRIP_EXECUTION,
-                                        TripFailed(pool, FailureReason.RIDER_CANCELLED, jid), pool))
+        a.no_shows = [jid for jid, _, _, _ in riders if jid not in ready]
+        for jid, _, _, rpool in riders:
+            if jid in a.no_shows:                                  # FE-05: report, do not wait longer
+                await beh.send(make_message(a.hub, Perf.INFORM, Protocol.TRIP_EXECUTION,
+                                            TripFailed(rpool, FailureReason.RIDER_CANCELLED, jid), rpool))
         boarding = [r for r in riders if r[0] in ready]
         if not boarding:
             self.lock.abort(pool, a.hub, clock.now(), "no_show")
             self.log(f"{pool}: nobody showed up, back to idle")
             return
         await clock.sim_sleep(self.dwell_pickup)
-        for jid, req, _ in boarding:
+        for jid, req, _, rpool in boarding:
             a.boarded.append(jid)
             await beh.send(make_message(jid, Perf.INFORM, Protocol.TRIP_EXECUTION,
-                                        RiderBoarded(req, pool, self.me, clock.now()), pool))
+                                        RiderBoarded(req, rpool, self.me, clock.now()), rpool))
         self.passengers = len(boarding)
         self.activity = "on_trip"
         await self.announce(beh)
         # drive the planned order, dropping off as we go
-        for stop in a.offer.route[1:]:
+        for stop in (a.route or a.offer.route)[1:]:
             await self.drive(stop, a)
             await clock.sim_sleep(self.dwell_dropoff)
-            for jid, req, dest in boarding:
+            for jid, req, dest, rpool in boarding:
                 if dest == stop and jid not in a.dropped:
                     a.dropped.append(jid)
                     self.passengers -= 1
                     await beh.send(make_message(jid, Perf.INFORM, Protocol.TRIP_EXECUTION,
-                                                RiderDroppedOff(req, pool, self.me, clock.now()), pool))
-        for jid, req, dest in boarding:                            # drop-off at the pickup itself
+                                                RiderDroppedOff(req, rpool, self.me, clock.now()), rpool))
+        for jid, req, dest, rpool in boarding:                     # drop-off at the pickup itself
             if jid not in a.dropped:
                 a.dropped.append(jid)
                 self.passengers -= 1
                 await beh.send(make_message(jid, Perf.INFORM, Protocol.TRIP_EXECUTION,
-                                            RiderDroppedOff(req, pool, self.me, clock.now()), pool))
+                                            RiderDroppedOff(req, rpool, self.me, clock.now()), rpool))
         done = TripCompleted(trip_id=f"trip-{pool}", pool_id=pool, driver_id=self.me,
                              rider_ids=list(a.dropped), completed_at=clock.now(),
                              rider_fares={j: a.match.rider_fares[j] for j in a.dropped
@@ -752,6 +817,29 @@ class DriverAgent(BaseAgent):
         self.finished_trips[pool] = a
         self.log(f"{pool} completed, idle at {self.location}")
         self.return_after_trip()
+
+    def late_join_problem(self, a, sender: str, p) -> str:
+        """Why this driver does not take a late joiner ('' = it does)."""
+        if not self.late_join or a is None or a.match is None or sender != a.hub or a.match.pool_id != p.pool_id:
+            return "not_assigned"
+        if a.frozen or self.activity != "to_pickup":
+            return "too_late"
+        if len(a.riders) + 1 > self.capacity:
+            return "full"
+        if p.extra_pay + 1e-9 < p.extra_seconds * self.cost_per_second * (1.0 + self.bid_markup):
+            return "underpaid"
+        return ""
+
+    def undo_late_join(self, a, join_pool_id: str) -> bool:
+        """Take a provisional joiner back out (cancelled, or never confirmed). Only possible before the pickup."""
+        pend = a.pending.pop(join_pool_id, None)
+        if pend is None:
+            return False
+        if pend.rider in a.riders:
+            a.riders.remove(pend.rider)
+        a.route = list(pend.previous_route)
+        self.log(f"late join {join_pool_id} undone")
+        return True
 
     def return_target(self) -> str:
         """Hub the fixed return policy sends an idle driver to ('' = stay)."""

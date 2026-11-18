@@ -149,10 +149,12 @@ def test_absolute_graph_path_and_name_default(tmp_path):
 def test_payment_section_defaults_and_roster_kwargs():
     pay = next(r for r in make().roster() if r.role == "payment")
     assert pay.kwargs == {"default_rider_balance": 100.0, "subsidy_discount": 0.5,
-                          "subsidy_budget": None, "hold_max": 7200.0}
+                          "subsidy_budget": None, "hold_max": 7200.0, "pooling_budget": None}
     s = make(payment={"rider_balance": 30, "subsidy_discount": 0.25, "subsidy_budget": 500,
                       "hold_max": 600})
     pay = next(r for r in s.roster() if r.role == "payment")
     assert pay.kwargs == {"default_rider_balance": 30.0, "subsidy_discount": 0.25,
-                          "subsidy_budget": 500.0, "hold_max": 600.0}
+                          "subsidy_budget": 500.0, "hold_max": 600.0, "pooling_budget": None}
     assert [r.role for r in s.roster()][:3] == ["payment", "regulator", "reputation"]
+    inc = make(payment={"pool_incentive_per_kg": 2.0, "pooling_budget": 50})
+    assert inc.pool_incentive_per_kg == 2.0 and inc.pooling_budget == 50.0

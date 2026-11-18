@@ -83,6 +83,10 @@ async def propose_groups(beh, hub, part: Partition, by_id: Dict[str, QueuedReque
             await beh.send(make_pool_proposal(q.sender, hub.proposal_for(rec, q.req, plan)))
     for rid in part.unserved:
         q = by_id[rid]
+        if clock.now() < q.req.time_window_end - hub.t_pool:       # roads may reopen: try again in the next batch
+            hub.log(f"request {rid}: no feasible pool right now; back in the queue")
+            hub.queue.append(QueuedRequest(q.req, q.sender, clock.now()))
+            continue
         hub.log(f"request {rid}: no feasible pool (window closed or unreachable)")
         gone = Pool(f"{hub.hub_id}-none-{rid}", hub.hub_id, [q.req], PoolStatus.DISSOLVED, clock.now())
         await beh.send(make_inform(q.sender, Protocol.POOL_FORMATION, gone, gone.pool_id))

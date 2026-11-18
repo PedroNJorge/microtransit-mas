@@ -361,6 +361,15 @@ class TransitNetwork:
             total += dt
         return full, total
 
+    def route_length(self, stops: Iterable[str], t: float = 0.0) -> Optional[float]:
+        """Length in METRES of the route through the ordered stops (time-shortest paths, summing each edge's
+        `length`). None if a stop is unreachable."""
+        routed = self.route_through(stops, t)
+        if routed is None:
+            return None
+        path = routed[0]
+        return float(sum(self.g[a][b].get("length", 0.0) for a, b in zip(path, path[1:])))
+
     def detour_seconds(self, origin: str, dest: str, stops: List[str],
                        t: float = 0.0) -> Optional[float]:
         """Extra ride time in SECONDS for a rider on the shared route `stops` versus going

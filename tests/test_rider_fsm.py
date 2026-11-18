@@ -78,3 +78,49 @@ def test_default_rating_penalises_a_late_pickup_and_a_window_miss():
 def test_a_match_does_not_start_the_trip_only_boarding_does():
     assert IN_TRIP not in TRANSITIONS[AWAITING_MATCH]            # you cannot be "in trip" straight from the match
     assert TRANSITIONS[DRIVER_EN_ROUTE] == {IN_TRIP, IDLE}
+
+
+def _refuse_outside_coverage(r):
+    """What a REFUSE(outside_coverage) from the rider's hub leads to (no XMPP)."""
+    t = r.trip
+    t.tried_hubs = ["n1_1"]
+    r.retry_after_coverage_refusal(t)
+    return t
+
+
+def test_an_outside_coverage_refusal_ends_the_trip_by_default():
+    r = rider()
+    r.request_trip("n2_2", 10.0)
+    assert r.retry_coverage == 0                       # the plain rider keeps its old behaviour (REFUSED)
+
+
+def test_after_an_outside_coverage_refusal_a_patient_rider_waits_and_asks_again():
+    r = rider(retry_coverage=3600.0)
+    r.request_trip("n2_2", 10.0)
+    t = _refuse_outside_coverage(r)                    # the only hub it knows already refused: nobody else to ask
+    assert r.state == REQUESTING and t.retry_at > clock.now() and t.tried_hubs == []
+    assert r._deadline >= 3600.0
+
+
+def test_after_an_outside_coverage_refusal_a_rider_tries_another_covering_hub():
+    r = RiderAgent("r@localhost", "pw", hub_jids={"n1_1": "a@localhost", "n1_4": "b@localhost"},
+                   network=build_grid_network(), retry_coverage=3600.0)
+    r.request_trip("n1_2", 10.0, hub_id="n1_1")        # n1_2 is covered by both hubs
+    t = _refuse_outside_coverage(r)
+    assert t.hub_jid == "b@localhost" and t.retry_at == 0.0 and "n1_4" in t.tried_hubs
+
+
+def test_relative_tolerance_caps_the_request_at_a_share_of_the_solo_ride():
+    r = rider(detour_ratio=0.5)
+    req = r.request_trip("n2_2", 10.0, detour_tolerance=600.0)
+    direct = build_grid_network().travel_time("n1_1", "n2_2")
+    assert req.detour_tolerance == pytest.approx(0.5 * direct) and req.detour_tolerance < 600.0
+
+
+def test_the_cap_still_applies_when_the_ratio_would_allow_more():
+    r = rider(detour_ratio=100.0)
+    assert r.request_trip("n2_2", 10.0, detour_tolerance=90.0).detour_tolerance == 90.0
+
+
+def test_without_a_ratio_the_tolerance_is_what_the_request_says():
+    assert rider().request_trip("n2_2", 10.0, detour_tolerance=600.0).detour_tolerance == 600.0

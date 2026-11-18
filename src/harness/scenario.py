@@ -32,16 +32,27 @@ Schema (all sections but "graph" and "hubs" are optional):
 }
 payment: rider_balance = wallet each rider gets on their first escrow request (simulation
 endowment); subsidy_discount = share of the fare rebated to subsidy-eligible riders;
-subsidy_budget = size of the subsidy fund (null = unlimited); hold_max = sim seconds after
+subsidy_budget = size of the subsidy fund (null = unlimited); pool_incentive_per_kg = euro the pooling fund pays
+the riders of a shared trip per kg of CO2 it saves (0 = off), pooling_budget = size of that fund (null = unlimited); hold_max = sim seconds after
 which an unsettled escrow is returned to the rider.
 Unknown keys are rejected (a typo must not silently fall back to a default).
 
+Hubs coordinate by default ("inter_hub": false switches it off, or give {"t_heartbeat", "t_failover",
+"overflow_after", "k_neighbours", "t_overflow_reply"}): they exchange heartbeats with their nearest neighbours, a
+neighbour takes over the pending requests of a hub that dies and a hub passes a pool it cannot serve to a
+neighbour (protocols/inter_hub.py).
+"detour_ratio" (default 0.5): a rider accepts at most that fraction of its solo ride time as extra time when sharing
+(never more than the demand's "detour_tolerance", which is the cap); the time waited for the batch counts too.
+null = only the cap.
 Pooling is the standard: hubs batch requests for "t_pool" seconds (default 180; 0 turns it off), riders and
 demand streams are pooling-willing by default.
 
 "patient" (default true): nobody gives up. A hub whose auction gets no bids tries again (with a wider pickup radius)
 until a driver is free and a rider waits for as long as that takes. With false, a hub gives up after 4 attempts
 and the rider ends 'unmatched'.
+"late_join" (default true): a pooling-willing rider may join a pool already assigned to a driver who has not reached
+the hub yet (driver may refuse; see docs/late_join.md). payment.pool_incentive_per_kg / pooling_budget pay riders of shared
+trips from a pooling fund per kg of CO2 saved (default off).
 With a demand section the run ends by itself once every request has been issued and every rider is home;
 "duration" is then only the safety cap (sim seconds).
 
@@ -81,7 +92,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
-from common.settings import FULL_SNAPSHOT_EVERY, SUBSIDY_DISCOUNT, T_ESCROW_HOLD_MAX, T_POOL, T_TRAFFIC
+from common.settings import DETOUR_RATIO, FULL_SNAPSHOT_EVERY, POOL_INCENTIVE_PER_KG, SUBSIDY_DISCOUNT, T_ESCROW_HOLD_MAX, T_POOL, T_TRAFFIC
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]       # <root>/src/harness/scenario.py
 DEFAULT_SCENARIO = PROJECT_ROOT / "config" / "scenario.json"
@@ -160,6 +171,8 @@ class Scenario:
     rider_balance: float = 100.0
     subsidy_discount: float = SUBSIDY_DISCOUNT
     subsidy_budget: Optional[float] = None
+    pool_incentive_per_kg: float = POOL_INCENTIVE_PER_KG   # euro per kg CO2 a shared trip saves (0 = off)
+    pooling_budget: Optional[float] = None                 # pooling fund size (None = unlimited)
     escrow_hold_max: float = T_ESCROW_HOLD_MAX
     seed: int = 42
     duration: Optional[float] = None           # sim seconds; None = run until stopped
@@ -168,7 +181,10 @@ class Scenario:
     forecasts: List[ForecastSpec] = field(default_factory=list)
     reposition: Optional[Dict[str, float]] = None   # None = hubs never move drivers
     t_pool: float = T_POOL                     # batch window at the hubs (s); 0 switches pooling off
+    inter_hub: Optional[Dict[str, float]] = field(default_factory=dict)   # None = hubs never coordinate; {} = defaults
+    detour_ratio: Optional[float] = DETOUR_RATIO   # riders' tolerance = min(cap, ratio x solo ride time); None = cap only
     patient: bool = True                       # hubs keep retrying and riders keep waiting until a driver is free
+    late_join: bool = True                     # a rider may join a pool whose driver is still on the way to the hub
     legacy_market: bool = False                # True: hubs without the market fixes (reserve margin, pickup radius, retries)
     brains: bool = False                       # one BDI brain per driver (agents/brain.py)
     brain_bids: bool = False                   # the brain also owns the driver's bid markup
@@ -185,7 +201,8 @@ class Scenario:
         specs: List[AgentSpec] = []
         specs.append(AgentSpec("payment", "payment", self.jid("payment"), {
             "default_rider_balance": self.rider_balance, "subsidy_discount": self.subsidy_discount,
-            "subsidy_budget": self.subsidy_budget, "hold_max": self.escrow_hold_max}))
+            "subsidy_budget": self.subsidy_budget, "hold_max": self.escrow_hold_max,
+            "pooling_budget": self.pooling_budget}))
         for role in ("regulator", "reputation"):
             specs.append(AgentSpec(role, role, self.jid(role)))
         for hid in self.hub_ids:
@@ -241,7 +258,7 @@ class Scenario:
     def from_dict(cls, data: dict, default_name: str = "scenario") -> "Scenario":
         _only_keys(data, {"name", "xmpp", "clock", "graph", "hubs", "drivers", "riders",
                           "environment", "payment", "seed", "duration", "demand", "events",
-                          "forecasts", "reposition", "t_pool", "legacy_market", "patient"}, "scenario")
+                          "forecasts", "reposition", "t_pool", "legacy_market", "late_join", "patient", "inter_hub", "detour_ratio"}, "scenario")
         for required in ("graph", "hubs"):
             if required not in data:
                 raise ScenarioError(f"scenario: missing required key {required!r}")
@@ -323,7 +340,8 @@ class Scenario:
         _only_keys(e, {"t_traffic", "full_every"}, "environment")
 
         p = dict(data.get("payment", {}))
-        _only_keys(p, {"rider_balance", "subsidy_discount", "subsidy_budget", "hold_max"}, "payment")
+        _only_keys(p, {"rider_balance", "subsidy_discount", "subsidy_budget", "hold_max", "pool_incentive_per_kg",
+                       "pooling_budget"}, "payment")
         discount = _num(p.get("subsidy_discount", SUBSIDY_DISCOUNT), "payment.subsidy_discount")
         if not 0.0 <= discount <= 1.0:
             raise ScenarioError(f"payment.subsidy_discount must be in [0, 1] (got {discount})")
@@ -332,6 +350,14 @@ class Scenario:
             budget = _num(budget, "payment.subsidy_budget")
             if budget < 0:
                 raise ScenarioError("payment.subsidy_budget must be >= 0 or null")
+        incentive = _num(p.get("pool_incentive_per_kg", POOL_INCENTIVE_PER_KG), "payment.pool_incentive_per_kg")
+        if incentive < 0:
+            raise ScenarioError("payment.pool_incentive_per_kg must be >= 0")
+        pooling_budget = p.get("pooling_budget")
+        if pooling_budget is not None:
+            pooling_budget = _num(pooling_budget, "payment.pooling_budget")
+            if pooling_budget < 0:
+                raise ScenarioError("payment.pooling_budget must be >= 0 or null")
         rider_balance = _num(p.get("rider_balance", 100.0), "payment.rider_balance")
         if rider_balance < 0:
             raise ScenarioError("payment.rider_balance must be >= 0")
@@ -354,14 +380,17 @@ class Scenario:
                    full_every=_int(e.get("full_every", FULL_SNAPSHOT_EVERY),
                                    "environment.full_every", 1),
                    rider_balance=rider_balance, subsidy_discount=discount,
-                   subsidy_budget=budget,
+                   subsidy_budget=budget, pool_incentive_per_kg=incentive, pooling_budget=pooling_budget,
                    escrow_hold_max=_num(p.get("hold_max", T_ESCROW_HOLD_MAX), "payment.hold_max",
                                         positive=True),
                    seed=_int(data.get("seed", 42), "seed", 0), duration=duration,
                    demand=demand, events=events, forecasts=forecasts, reposition=reposition,
                    t_pool=_num(data.get("t_pool", T_POOL), "t_pool"),
+                   inter_hub=_parse_inter_hub(data.get("inter_hub", True)),
+                   detour_ratio=None if data.get("detour_ratio", DETOUR_RATIO) is None
+                   else _num(data.get("detour_ratio", DETOUR_RATIO), "detour_ratio", positive=True),
                    patient=bool(data.get("patient", True)),
-                   legacy_market=bool(data.get("legacy_market", False)),
+                   legacy_market=bool(data.get("legacy_market", False)), late_join=bool(data.get("late_join", True)),
                    brains=brains, brain_bids=brain_bids, return_policy=return_policy)
 
 
@@ -596,6 +625,21 @@ def _parse_forecasts(items, sel: _Selector) -> List[ForecastSpec]:
 
 _REPO_KEYS = {"demand_threshold", "requests_per_driver", "max_travel", "incentive_per_second",
               "incentive_margin", "cooldown", "min_shift_left", "max_moves", "t_rebalance", "t_reposition"}
+
+
+_INTER_HUB_KEYS = {"t_heartbeat", "t_failover", "overflow_after", "k_neighbours", "t_overflow_reply"}
+
+
+def _parse_inter_hub(v) -> Optional[Dict[str, float]]:
+    """true (default) = hubs coordinate with their neighbours, false = they never do, or an object with options."""
+    if v is True:
+        return {}
+    if v is False:
+        return None
+    if not isinstance(v, dict):
+        raise ScenarioError("inter_hub must be true, false or an object")
+    _only_keys(v, _INTER_HUB_KEYS, "inter_hub")
+    return {k: _num(x, f"inter_hub.{k}", positive=(k != "overflow_after")) for k, x in v.items()}
 
 
 def _parse_reposition(r) -> Dict[str, float]:
