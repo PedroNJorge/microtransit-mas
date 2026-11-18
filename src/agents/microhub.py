@@ -47,10 +47,11 @@ from common.settings import (
     AUCTION_PRICING, MAX_AUCTION_ATTEMPTS, T_AUCTION, T_AWARD, T_ESCROW, VALUE_OF_DETOUR,
     T_POOL_RESPONSE, T_REBALANCE, T_REPOSITION, T_STATUS, VALUE_OF_REPUTATION, VALUE_OF_TIME, WIDEN_DETOUR,
 )
+from common.costs import driver_cost, dwell_seconds, rate_per_second
 from common.pooling import late_join_terms, GroupPlan, fare_ceiling, footprint, reference_solo_fare, split_fare_weighted
 from common.settings import (
-    DETOUR_WEIGHT, DRIVER_BASE_COST, DRIVER_COST_PER_SECOND, MAX_BATCH, MAX_POOL_SIZE, PICKUP_ALLOWANCE,
-    EMISSION_G_PER_KM, HUB_NEIGHBOURS, LATE_JOIN_MARKUP, T_LATE_REPLY, OVERFLOW_AFTER, POOL_SOLVER, T_FAILOVER, T_HEARTBEAT, T_OVERFLOW_REPLY, T_POOL,
+    DETOUR_WEIGHT, DRIVER_BASE_COST, DRIVER_COST_PER_KM, DRIVER_COST_PER_SECOND, MAX_BATCH, MAX_POOL_SIZE, PICKUP_ALLOWANCE,
+    EMISSION_G_PER_KM, NOMINAL_SPEED_KMH, HUB_NEIGHBOURS, LATE_JOIN_MARKUP, T_LATE_REPLY, OVERFLOW_AFTER, POOL_SOLVER, T_FAILOVER, T_HEARTBEAT, T_OVERFLOW_REPLY, T_POOL,
 )
 from protocols.match_auction import AuctionContext, MATCHED, MatchAuctionFSM, RETRY
 from protocols.pool_formation import BatchWindow, QueuedRequest, handle_decline, window_closes_at
@@ -751,11 +752,20 @@ class MicrohubAgent(BaseAgent):
             else:
                 planned = self.network.best_stop_order(self.hub_id, [r.destination_home for r in reqs], clock.now())
                 route = planned[1] if planned else None
+                planned_stops = planned[0][1:] if planned else []
         except KeyError:
             return None
         if route is None:
             return None
-        cost = DRIVER_BASE_COST + DRIVER_COST_PER_SECOND * (route + self.pickup_allowance * (1 + attempt))
+        allowance = self.pickup_allowance * (1 + attempt)
+        try:
+            stops = stop_order or planned_stops
+            metres = self.network.route_length([self.hub_id, *stops], clock.now()) or 0.0
+        except KeyError:
+            metres = 0.0
+        speed = metres / route if route > 0 and metres > 0 else NOMINAL_SPEED_KMH / 3.6          # m/s
+        dwell = dwell_seconds(len(set(stops)))
+        cost = driver_cost((metres + speed * allowance) / 1000.0, route + allowance, dwell)
         return ceil_cents(self.reserve_margin * cost) / 100
 
     def hub_eta(self, driver_jid: str, pickup: str, now: float) -> Optional[float]:
@@ -939,7 +949,7 @@ class MicrohubAgent(BaseAgent):
             return {}
         by_req = {r.request_id: r for r in rec.pool.requests}
         return {rec.rider_jids[rid]: reference_solo_fare(rec.plan.direct[rid], DRIVER_BASE_COST,
-                                                         DRIVER_COST_PER_SECOND, by_req[rid].max_fare)
+                                                         rate_per_second(), by_req[rid].max_fare)
                 for rid in rec.rider_jids if rec.rider_jids[rid] in rider_jids}
 
     def pool_incentives(self, rec: PoolRecord, rider_jids: List[str]) -> Dict[str, float]:
@@ -978,10 +988,12 @@ class MicrohubAgent(BaseAgent):
             if eta is None or eta < 15.0:                        # too close: no time to ask, propose, escrow
                 continue
             existing = list(base.pool.requests) + [lr.rec.pool.requests[0] for lr in base.late]
+            if not all(r.pooling_willingness for r in existing):     # someone who refused pooling is not given a stranger
+                continue
             old = {r.request_id: (match.rider_fares[base.rider_jids[r.request_id]] if r.request_id in base.rider_jids
                                   else next(lr.fare for lr in base.late if lr.request_id == r.request_id))
                    for r in existing}
-            terms = late_join_terms(self.network, self.hub_id, existing, req, old, now + eta, DRIVER_COST_PER_SECOND,
+            terms = late_join_terms(self.network, self.hub_id, existing, req, old, now + eta, rate_per_second(),
                                     self.late_join_markup, self.max_pool_size)
             if terms is not None and (best is None or terms.extra_seconds < best[0].extra_seconds):
                 best = (terms, base, match)

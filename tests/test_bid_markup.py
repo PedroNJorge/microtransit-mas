@@ -3,6 +3,7 @@ import pytest
 
 from agents.driver import DriverAgent
 from common import clock
+from common.costs import driver_cost, dwell_seconds
 from common.graph import build_grid_network
 from common.ontology import BidPolicy, CFP
 
@@ -25,8 +26,10 @@ def test_default_markup_bids_at_cost(net):
     d = driver(net)
     offer, why = d.calculate_bid(cfp(), 0.0)
     assert why is None and d.bid_markup == 0.0
-    cost = d.base_cost + d.cost_per_second * (0.0 + offer.route_time)
+    metres = net.route_length(["n1_1", "n1_3"], 0.0)
+    cost = driver_cost(metres / 1000.0, offer.route_time, dwell_seconds(1))      # km + hourly wage + boarding/alighting
     assert offer.bid.price == pytest.approx(cost, abs=0.011)
+    assert cost > d.cost_per_second * offer.route_time                            # the km and dwell parts are really in it
 
 
 def test_markup_raises_the_price_proportionally(net):

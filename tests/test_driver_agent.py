@@ -127,8 +127,8 @@ async def test_idle_driver_bids_its_true_cost_and_takes_the_lock(xmpp_server, si
         reply = await r.cfp_and_wait(r.h1)
         assert reply.get_metadata("performative") == Perf.PROPOSE
         bid = parse_payload(reply)
-        # eta 0 (at the hub), route n1_1 -> n2_2 = 120 s: cost = 2.00 + 0.004 * 120
-        assert bid.price == pytest.approx(2.48) and bid.eta == 0 and bid.max_detour == 0
+        # eta 0 (at the hub), route n1_1 -> n2_2 = 120 s, 2 m: cost = 0.18/km + 5.60/h x (120 s + boarding 15 s + 1 alighting 10 s)
+        assert bid.price == pytest.approx(0.18 * 0.002 + 5.60 / 3600 * 145, abs=0.011) and bid.eta == 0 and bid.max_detour == 0
         assert bid.driver_id == str(r.drv.jid.bare) and bid.attempt == 0
         assert r.drv.lock.state == LockState.PROVISIONAL and r.drv.state == DriverState.BIDDING
 
@@ -210,7 +210,7 @@ async def test_unknown_hub_is_refused(xmpp_server, sim_clock, net):
 @pytest.mark.parametrize("kw,cfp_kw,reason", [
     ({"capacity": 1}, {"riders": ("a@localhost", "b@localhost")}, "no_capacity"),
     ({"shift_end": 100.0}, {}, "shift_ending"),
-    ({}, {"fare": 1.0}, "over_reserve"),
+    ({}, {"fare": 0.1}, "over_reserve"),
     ({"start_hub": "n5_5"}, {"window_end": 100.0}, "too_late"),
     ({}, {"dest": "nowhere"}, "unreachable"),
 ])

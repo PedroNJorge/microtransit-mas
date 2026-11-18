@@ -5,6 +5,7 @@ from types import SimpleNamespace as NS
 import pytest
 
 from agents.microhub import PoolMetric
+from common.costs import driver_cost
 from common.ontology import Settlement
 from harness.live_metrics import MetricsCollector, gini, percentile
 
@@ -65,7 +66,7 @@ def test_rider_and_driver_metrics():
     assert c["pooling_discount"] == 2.0
     assert c["completion_rate"] == pytest.approx(3 / 4) and s["failures"] == {"NO_MATCH": 1}
     assert c["revenue_per_trip"] == pytest.approx(7.5)                      # 15 EUR / 2 trips
-    cost = (2.0 + 0.004 * 400 + 2.0 + 0.004 * 250) / 2
+    cost = (driver_cost(4.0, 400, 35) + driver_cost(2.5, 250, 25)) / 2        # km + hourly wage + boarding/alighting
     assert c["profit_per_trip"] == pytest.approx(7.5 - cost)
     assert c["deadhead_share"] == pytest.approx(2000 / 7000)                # (pickup 1500 + other 500) / all 7000
     assert c["gini"] == pytest.approx(0.0, abs=0.35)

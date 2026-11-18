@@ -49,7 +49,8 @@ import math
 from typing import Dict, List, Optional
 
 from common import clock
-from common.settings import DRIVER_BASE_COST, DRIVER_COST_PER_SECOND, EMISSION_G_PER_KM
+from common.costs import driver_cost, dwell_seconds
+from common.settings import EMISSION_G_PER_KM
 
 logger = logging.getLogger(__name__)
 
@@ -142,15 +143,19 @@ class MetricsCollector:
                 recs.append(dict(
                     t=log["done"], riders=len(a.dropped), late=late,
                     shared_m=m.shared_m if m else log["loaded_m"], alone_m=m.alone_m if m else log["loaded_m"],
-                    pickup_m=log["pickup_m"], seconds=log["pickup_s"] + log["loaded_s"]))
+                    pickup_m=log["pickup_m"], loaded_m=log["loaded_m"], seconds=log["pickup_s"] + log["loaded_s"]))
         return recs
+
+    def empty_records(self) -> List[tuple]:
+        """(time, metres, seconds) of every empty hop (cruising, repositioning, returning)."""
+        return [x for d in self._by_role("driver") for x in getattr(d, "other_log", [])]
 
     def payout_records(self) -> List[tuple]:
         return [(t, str(d.jid.bare), s.driver_payout) for d in self._by_role("driver")
                 for s, t in zip(d.payouts, d.payout_times)]
 
     # ---- the numbers ---------------------------------------------------------------------------------------------
-    def compute(self, now: float, lo: float, riders, pools, payouts) -> Dict[str, Optional[float]]:
+    def compute(self, now: float, lo: float, riders, pools, payouts, empty=()) -> Dict[str, Optional[float]]:
         """Every event-based metric over events with lo < time <= now."""
         R = [r for r in riders if lo < r["t"] <= now]
         P = [p for p in pools if lo < p["t"] <= now and p["riders"] > 0]
@@ -185,7 +190,9 @@ class MetricsCollector:
         out["time_to_match"] = mean(r["match"] for r in R if r["match"] is not None)
 
         revenue = sum(y[2] for y in Y)
-        cost = sum(DRIVER_BASE_COST + DRIVER_COST_PER_SECOND * p["seconds"] for p in P)
+        cost = sum(driver_cost((p["pickup_m"] + p["loaded_m"]) / 1000.0, p["seconds"], dwell_seconds(p["riders"]))
+                   for p in P)
+        cost += sum(driver_cost(m / 1000.0, s) for t, m, s in empty if lo < t <= now)        # empty driving is a cost too
         out["revenue_per_trip"] = revenue / len(P) if P else None
         out["profit_per_trip"] = (revenue - cost) / len(P) if P else None
         n_drivers = max(1, len(self._by_role("driver")))
@@ -219,9 +226,10 @@ class MetricsCollector:
         self._last_t = now
 
         riders, pools, payouts = self.rider_records(), self.pool_records(), self.payout_records()
+        empty = self.empty_records()
         lo = now - self.window
-        cum = self.compute(now, -math.inf, riders, pools, payouts)
-        roll = self.compute(now, lo, riders, pools, payouts)
+        cum = self.compute(now, -math.inf, riders, pools, payouts, empty)
+        roll = self.compute(now, lo, riders, pools, payouts, empty)
         for metrics, since in ((cum, -math.inf), (roll, lo)):
             u = self._window_sum(self._util, now, since)
             tot = sum(u.values())

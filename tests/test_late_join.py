@@ -90,8 +90,8 @@ class World:
                                                                   self.driver.assignment.riders,
                                                                   list(self.driver.assignment.pending)))))
 
-    async def first_rider_assigned(self):
-        r1 = self.riders[0].request_trip("n1_2", 20.0, hub_id=HUB, pooling_willingness=False)
+    async def first_rider_assigned(self, willing=True):
+        r1 = self.riders[0].request_trip("n1_2", 20.0, hub_id=HUB, pooling_willingness=willing)
         assert r1 is not None
         assert await until(lambda: any(r.state == "ASSIGNED" for r in self.hub.pools.values()), timeout=40)
         return r1
@@ -145,3 +145,13 @@ async def test_a_driver_who_wants_more_than_the_hub_offers_refuses(xmpp_server, 
         assert r2 is not None
         await w.finish(w.riders[0], w.riders[1])
         await normal_way(w)
+
+
+async def test_a_rider_who_refused_pooling_is_not_given_a_joiner(xmpp_server, sim_clock, net):
+    async with World(net) as w:
+        await w.first_rider_assigned(willing=False)
+        r2 = w.riders[1].request_trip("n1_3", 20.0, hub_id=HUB, pooling_willingness=True)
+        assert r2 is not None
+        await w.finish(w.riders[0])
+        assert w.hub.late_joined == []
+        assert w.riders[0].trips[-1].outcome == COMPLETED and not w.riders[0].trips[-1].amended
