@@ -79,3 +79,19 @@ PICKUP_ALLOWANCE = 300.0    # seconds of pickup leg the tariff reserve allows fo
 MAX_PICKUP_ETA = 900.0      # CC-08: only call drivers whose own ETA to the hub is within this (+300 s per retry)
 RETRY_DELAY = 20.0          # wait this long before re-running a failed auction (provisional locks expire)
 WINDOW_SLACK = 120.0        # close the batch window early if a queued rider's window ends within this
+
+# --- inter-hub coordination (Milestone 11) -----------------------------------------------------------
+T_HEARTBEAT = 60.0          # a hub tells its neighbours it is alive, how loaded it is and what it still owes (sim s)
+T_FAILOVER = 180.0          # a neighbour silent this long is declared failed; its pending requests are taken over
+HUB_NEIGHBOURS = 3          # each hub watches (and is watched by) its k nearest hubs
+OVERFLOW_AFTER = 2          # a pool that failed this many auction attempts is offered to a neighbour hub
+T_OVERFLOW_REPLY = 60.0     # the neighbour must answer an overflow request within this, else the hub carries on alone
+T_RIDER_REPLY = 300.0       # a rider whose hub has not answered its request within this tries another covering hub
+
+# --- pooling: relative tolerance and footprint (Milestone 9 follow-up) ----------------------------------------------
+DETOUR_RATIO = 1.0          # a rider's tolerance = min(its cap, this x its direct (solo) ride time); None = cap only
+POOL_INCENTIVE_PER_KG = 0.0   # euro paid by the pooling fund per kg of CO2 a shared trip saves (0 = no incentive)
+LATE_JOIN_MARKUP = 0.3      # what the hub offers a driver for extra driving, over its variable cost (a driver bidding higher refuses)
+T_LATE_REPLY = 40.0         # sim seconds the hub waits for the driver's answer to a late-join request
+T_JOIN_HOLD = 240.0         # sim seconds a driver waits at the hub for a provisional joiner to be confirmed
+EMISSION_G_PER_KM = 150.0   # CO2 of a vehicle-kilometre (small petrol car, grams); used for the footprint metric

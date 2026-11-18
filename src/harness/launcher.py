@@ -120,8 +120,10 @@ class Harness:
         if spec.role == "rider":
             kwargs.update(network=self.network, payment_jid=sc.jid("payment"),
                           reputation_jid=sc.jid("reputation"), hub_jids={x.name: x.jid for x in hubs})
+            kwargs["detour_ratio"] = sc.detour_ratio
             if sc.patient:
-                kwargs["patience"] = 1e9                 # waits for a driver as long as it takes
+                kwargs["retry_coverage"] = 6 * 3600.0     # a blocked road is no reason to give up
+                kwargs["match_patience"] = 1e9           # waits for a driver as long as it takes (a dead hub still times out)
         if spec.role == "reputation":
             kwargs.update(hub_jids=[x.jid for x in hubs], payment_jid=sc.jid("payment"))
         if spec.role == "driver":
@@ -134,9 +136,12 @@ class Harness:
             if "max_moves" in opts:
                 opts["max_moves"] = int(opts["max_moves"])
             kwargs.update(reposition=RepositionRules(**opts), **hub_opts)
+        if spec.role == "microhub" and sc.inter_hub is not None and len(hubs) > 1:
+            opts = {k: (int(v) if k in ("overflow_after", "k_neighbours") else v) for k, v in sc.inter_hub.items()}
+            kwargs.update(peer_jids={x.name: x.jid for x in hubs if x.jid != spec.jid}, **opts)
         if spec.role == "microhub":
             kwargs.update(
-                t_pool=sc.t_pool, **market_settings(sc),
+                t_pool=sc.t_pool, pool_incentive_per_kg=sc.pool_incentive_per_kg, late_join=sc.late_join, **market_settings(sc),
                 network=self.network, payment_jid=sc.jid("payment"), reputation_jid=sc.jid("reputation"),
                 regulator_jid=sc.jid("regulator"), driver_jids=[s.jid for s in sc.roster() if s.role == "driver"])
         if spec.role not in AGENT_CLASSES:
@@ -206,7 +211,23 @@ def market_settings(sc: Scenario) -> dict:
         return {}
     return dict(reserve_margin=RESERVE_MARGIN, max_pickup_eta=MAX_PICKUP_ETA, retry_delay=RETRY_DELAY,
                 window_slack=WINDOW_SLACK, max_attempts=1000 if sc.patient else 4,
-                t_auction=60.0, t_award=40.0, t_escrow=300.0)
+                t_auction=60.0, t_award=40.0, t_escrow=300.0, t_pool_response=300.0)
+
+
+class _DeadHubNoise(logging.Filter):
+    """Hides spade's 'No behaviour matched' warning for messages addressed to a hub the scenario killed: drivers keep
+    sending it their status, which is expected (the neighbours have taken over) and only buries the report."""
+
+    def __init__(self, harness):
+        super().__init__()
+        self.h = harness
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        text = record.getMessage()
+        if not text.startswith("No behaviour matched"):
+            return True
+        killed = getattr(self.h.runner, "killed", ()) if self.h.runner is not None else ()
+        return not any(f'to="{hub}@' in text for hub in killed)
 
 
 async def _until_done(h, stop: asyncio.Event) -> None:
@@ -239,6 +260,7 @@ async def run(scenario: Scenario, check: bool, run_for: Optional[float], start_s
             print(format_results(results))
             return 0 if all(r.ok for r in results) else 1
         stop = asyncio.Event()
+        logging.getLogger("spade.Agent").addFilter(_DeadHubNoise(h))
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
             try:

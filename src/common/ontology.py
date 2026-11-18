@@ -58,6 +58,7 @@ class Protocol:
     TRAFFIC_UPDATE = "TrafficUpdateProtocol"
     DISRUPTION = "DisruptionProtocol"
     INTER_HUB = "InterHubCoordinationProtocol"
+    LATE_JOIN = "LateJoinProtocol"                  # a rider joins a pool whose driver is still on the way to the hub
     DEMAND_FORECAST = "DemandForecastProtocol"
     HEARTBEAT = "HeartbeatProtocol"                 # ping/pong liveness check (every agent)
 
@@ -345,6 +346,9 @@ class TripCompleted:
     # Posted SOLO reference fare per rider (hub -> Payment only); Payment reports the pooling
     # discount = solo - charged in each Settlement. Empty -> no discount reported.
     solo_fares: Dict[str, float] = field(default_factory=dict)
+    # CO2 pooling incentive per rider (hub -> Payment only), paid from the pooling fund on top of
+    # the fare (never taken from the driver). Empty -> none.
+    pool_incentives: Dict[str, float] = field(default_factory=dict)
 
 
 # TripExecutionProtocol: per-rider granularity (pooled riders board/alight separately).
@@ -500,6 +504,7 @@ class Settlement:
                                         # disbursed (no Platform/Treasury agent yet).
     excess_returned: float = 0.0        # part of the hold not charged (held - fare), returned
     pooling_discount: float = 0.0       # informational: reference solo fare - fare charged (>= 0)
+    pooling_incentive: float = 0.0      # CO2 incentive credited to the rider, paid from the pooling fund
 
 
 @concept
@@ -512,6 +517,7 @@ class SettlementComplete:
     total_paid: float                   # to the driver
     total_subsidy: float                # rebated to riders
     total_returned: float               # unused hold returned to riders
+    total_incentive: float = 0.0        # pooling incentive credited to riders
 
 
 @concept
@@ -659,6 +665,68 @@ class OverflowRequest:
     from_hub: str
     reason: FailureReason               # e.g. HUB_FAILED or capacity overload
     pending_requests: List[TripRequest]
+
+
+@concept
+@dataclass
+class HubHeartbeat:
+    """Hub -> neighbouring hubs: inform(HubHeartbeat). Proves the hub is up, says how much spare driver capacity it
+    sees, and carries a copy of the requests it has not matched yet, so that a neighbour can take them over if the
+    hub dies (protocols/inter_hub.py)."""
+    hub_id: str
+    sent_at: float                      # sim time
+    idle_drivers: int
+    queued: int                         # requests waiting for a pool or a driver
+    pending: List[TripRequest]
+
+
+@concept
+@dataclass
+class Handover:
+    """New hub -> rider: inform(Handover). Your request is now handled by `to_hub`; talk to it from now on."""
+    request_id: str
+    from_hub: str
+    to_hub: str
+    to_hub_jid: str
+    reason: FailureReason               # HUB_FAILED (takeover) or NO_BIDS (overflow)
+
+
+@concept
+@dataclass
+class LateJoinRequest:
+    """Hub -> Driver (request): a new rider wants to ride in the pool you are already driving to the hub for.
+    The driver answers agree (and applies the change at once, provisionally) or refuse(reason)."""
+    pool_id: str                        # the pool the driver is assigned to
+    join_pool_id: str                   # the new rider's own pool id (thread of everything about that rider)
+    request_id: str
+    rider_jid: str
+    destination: str
+    route: List[str]                    # the new full stop order, pickup first
+    extra_seconds: float                # extra driving the new rider causes
+    extra_pay: float                    # what the trip pays the driver on top of the first price
+
+
+@concept
+@dataclass
+class LateJoinDecision:
+    """Hub -> Driver (confirmed=True: the rider accepted and escrowed, keep it) or Driver/Hub (confirmed=False: the join
+    did not happen, undo it). `reason` says why when it is a cancellation."""
+    pool_id: str
+    join_pool_id: str
+    confirmed: bool
+    reason: str = ""
+
+
+@concept
+@dataclass
+class PoolAmended:
+    """Hub -> each rider already in the pool: inform. Someone joined; your new route and fare (never higher than before)."""
+    pool_id: str
+    rider_id: str
+    route: List[str]
+    old_fare: float
+    new_fare: float
+    riders: int                         # riders in the pool now
 
 
 @concept

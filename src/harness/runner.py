@@ -254,6 +254,25 @@ def report(h) -> str:
     run = getattr(h, "runner", None)
     if run is not None and (run.summary.issued or run.summary.skipped):
         lines.append(f"demand: {run.summary.issued} requests issued, {run.summary.skipped} skipped (no idle rider)")
+    metrics = [m for a in h.agents.values() if a.role == "microhub" for m in a.pool_metrics]
+    if metrics:
+        shared_riders = sum(m.riders for m in metrics if m.riders > 1)
+        pools = [m for m in metrics if m.riders > 1]
+        total = sum(m.riders for m in metrics)
+        shared, alone = sum(m.shared_m for m in metrics) / 1000, sum(m.alone_m for m in metrics) / 1000
+        g = next((a.emission_g_per_km for a in h.agents.values() if a.role == "microhub"), 0.0)
+        lines.append(f"pooling: {shared_riders} of {total} matched riders shared a vehicle ({len(pools)} pools"
+                     + (f", {shared_riders / len(pools):.1f} riders each" if pools else "") + ")")
+        lines.append(f"vehicle distance, loaded leg: {shared:.1f} km shared vs {alone:.1f} km if everyone rode alone: "
+                     f"{alone - shared:.1f} km saved, {(alone - shared) * g / 1000:.2f} kg CO2 ({g:.0f} g/km)")
+    joined = sum(len(a.late_joined) for a in h.agents.values() if a.role == "microhub")
+    if joined:
+        lines.append(f"late joins: {joined} rider(s) joined a pool whose driver was still on the way to the hub")
+    pay = next((a for a in h.agents.values() if a.role == "payment"), None)
+    if pay is not None and (pay.ledger.pooling_spent or pay.ledger.pooling_shortfall):
+        lines.append(f"pooling incentive: {pay.ledger.pooling_spent:.2f} EUR paid to riders of shared trips from the "
+                     f"pooling fund" + (f" ({pay.ledger.pooling_shortfall:.2f} EUR unpaid, fund empty)"
+                                         if pay.ledger.pooling_shortfall else ""))
     why = Counter(t.reason or "?" for r in riders for t in r.trips if t.outcome not in ("completed",))
     if why:
         lines.append("not completed, by reason: " + ", ".join(f"{k}={v}" for k, v in sorted(why.items())))

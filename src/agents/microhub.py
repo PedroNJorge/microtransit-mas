@@ -39,7 +39,7 @@ from common.messages import (
     make_request, make_template,
 )
 from common.ontology import (
-    AuctionOutcome, AuditData, AuditReport, AuditRequest, AuditTrip, DemandForecast, DriverState, DriverStatus, Escrow, EscrowStatus, FailureReason, MatchResult, Perf,
+    AuctionOutcome, AuditData, AuditReport, Handover, LateJoinDecision, LateJoinRequest, PoolAmended, OverflowRequest, AuditRequest, AuditTrip, DemandForecast, DriverState, DriverStatus, Escrow, EscrowStatus, FailureReason, MatchResult, Perf,
     Penalty, Policy, Pool, Refund, PoolProposal, PoolStatus, Protocol, ReputationScore, SettlementComplete,
     StagingPoint, TripCompleted, TripFailed, TripRequest, parse_payload,
 )
@@ -47,13 +47,17 @@ from common.settings import (
     AUCTION_PRICING, MAX_AUCTION_ATTEMPTS, T_AUCTION, T_AWARD, T_ESCROW, VALUE_OF_DETOUR,
     T_POOL_RESPONSE, T_REBALANCE, T_REPOSITION, T_STATUS, VALUE_OF_REPUTATION, VALUE_OF_TIME, WIDEN_DETOUR,
 )
-from common.pooling import GroupPlan, fare_ceiling, reference_solo_fare, split_fare_weighted
+from common.pooling import late_join_terms, GroupPlan, fare_ceiling, footprint, reference_solo_fare, split_fare_weighted
 from common.settings import (
     DETOUR_WEIGHT, DRIVER_BASE_COST, DRIVER_COST_PER_SECOND, MAX_BATCH, MAX_POOL_SIZE, PICKUP_ALLOWANCE,
-    POOL_SOLVER, T_POOL,
+    EMISSION_G_PER_KM, HUB_NEIGHBOURS, LATE_JOIN_MARKUP, T_LATE_REPLY, OVERFLOW_AFTER, POOL_SOLVER, T_FAILOVER, T_HEARTBEAT, T_OVERFLOW_REPLY, T_POOL,
 )
 from protocols.match_auction import AuctionContext, MATCHED, MatchAuctionFSM, RETRY
 from protocols.pool_formation import BatchWindow, QueuedRequest, handle_decline, window_closes_at
+from protocols.inter_hub import (
+    HANDED_OVER, OVERFLOW_PENDING, HeartbeatReceiver, InterHubWatcher, OverflowReceiver, OverflowReplies, OverflowWait,
+    PeerView, _Send, neighbours, overflow_target, refund_request,
+)
 from protocols.payment_common import bare
 from protocols.reposition import (
     ARRIVED, RepositionContext, RepositionFSM, RepositionPlan, RepositionPlanner, RepositionRules,
@@ -61,6 +65,40 @@ from protocols.reposition import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class PoolMetric:
+    """What one matched pool drove, against what the same riders would have driven in separate vehicles."""
+    pool_id: str
+    riders: int
+    shared_m: float                      # loaded leg of the shared route, metres
+    alone_m: float                       # sum of the riders' own hub -> home routes, metres
+
+    @property
+    def saved_m(self) -> float:
+        return self.alone_m - self.shared_m
+
+
+@dataclass
+class LateRider:
+    """A rider that joined an already-assigned pool: its own pool record, and what it pays."""
+    rec: "PoolRecord"
+    jid: str
+    request_id: str
+    fare: float
+
+
+@dataclass
+class LateJoinWait:
+    """A late-join request sent to the driver, waiting for its answer."""
+    req: TripRequest
+    sender: str
+    base: "PoolRecord"
+    pool_id: str                          # the new rider's pool id (reserved)
+    terms: object                         # LateJoinTerms
+    driver: str
+    deadline: float
 
 
 @dataclass
@@ -77,6 +115,10 @@ class PoolRecord:
     plan: Optional[GroupPlan] = None                         # the group's exact plan (pooling, M9)
     accepted: set = field(default_factory=set)               # request ids that accepted the proposal
     times: Dict[str, float] = field(default_factory=dict)    # sim-time milestones: confirmed, queued, auction_start, matched
+    late_of: str = ""                                        # this is a late joiner's pool: the pool it joined
+    late_terms: object = None                                # ... and the terms it was offered (LateJoinTerms)
+    late: List["LateRider"] = field(default_factory=list)    # riders that joined this (assigned) pool afterwards
+    late_old: Dict[str, float] = field(default_factory=dict)  # fares before the last join (to restore on an undo), by JID
 
 
 class TripRequestReceiver(CyclicBehaviour):
@@ -98,23 +140,33 @@ class TripRequestReceiver(CyclicBehaviour):
             hub.log(f"request {req.request_id} refused: {problem}")
             await self.send(make_reply(msg, Perf.REFUSE, problem, Protocol.TRIP_REQUEST))
             return
-        if hub.batching and req.pooling_willingness:                    # wait for the batch window
-            hub.queue.append(QueuedRequest(req, sender, clock.now()))
-            hub.log(f"request {req.request_id} queued for pooling ({len(hub.queue)} waiting)")
-            await self.send(make_message(sender, Perf.AGREE, Protocol.TRIP_REQUEST, "queued", req.request_id))
-            await self.send(make_message(sender, Perf.INFORM, Protocol.TRIP_REQUEST,
-                                         f"request_queued:{hub.batch_estimate():.0f}", req.request_id))
-            return
-        rec = hub.open_pool(req, sender)
-        await self.send(make_message(sender, Perf.AGREE, Protocol.TRIP_REQUEST, rec.pool, req.request_id))
-        await self.send(make_message(sender, Perf.INFORM, Protocol.TRIP_REQUEST,
+        await admit_request(self, hub, req, sender)
+
+
+async def admit_request(beh, hub, req: TripRequest, sender: str, allow_late: bool = True) -> None:
+    """A validated request enters the hub: offered to a pool whose driver is still on the way (late join), queued for
+    pooling, or an immediate pool. Used for requests from riders and for requests adopted from another hub
+    (protocols/inter_hub.py)."""
+    send = beh.send
+    if allow_late and hub.late_join and req.pooling_willingness and await hub.offer_late_join(beh, req, sender):
+        return                                                      # the driver's answer decides what happens next
+    if hub.batching and req.pooling_willingness:                    # wait for the batch window
+        hub.queue.append(QueuedRequest(req, sender, clock.now()))
+        hub.log(f"request {req.request_id} queued for pooling ({len(hub.queue)} waiting)")
+        await send(make_message(sender, Perf.AGREE, Protocol.TRIP_REQUEST, "queued", req.request_id))
+        await send(make_message(sender, Perf.INFORM, Protocol.TRIP_REQUEST,
                                      f"request_queued:{hub.batch_estimate():.0f}", req.request_id))
-        if hub.propose_pools:                                           # PoolFormationProtocol
-            await self.send(make_pool_proposal(sender, hub.proposal_for(rec, req)))
-        else:
-            hub.confirm_pool(rec)
-            if hub.payment_jid is None:
-                hub.start_auction(rec)
+        return
+    rec = hub.open_pool(req, sender)
+    await send(make_message(sender, Perf.AGREE, Protocol.TRIP_REQUEST, rec.pool, req.request_id))
+    await send(make_message(sender, Perf.INFORM, Protocol.TRIP_REQUEST,
+                                 f"request_queued:{hub.batch_estimate():.0f}", req.request_id))
+    if hub.propose_pools:                                           # PoolFormationProtocol
+        await send(make_pool_proposal(sender, hub.proposal_for(rec, req)))
+    else:
+        hub.confirm_pool(rec)
+        if hub.payment_jid is None:
+            hub.start_auction(rec)
 
 
 class PoolResponses(CyclicBehaviour):
@@ -140,11 +192,13 @@ class PoolResponses(CyclicBehaviour):
                                 hub.start_auction(rec)
                     elif perf == Perf.REJECT:
                         hub.log(f"pool {rec.pool.pool_id} rejected by {sender} ({msg.body})")
+                        hub.cancel_late_join(rec, "declined")
                         await handle_decline(self, hub, rec, [rid])
             for rec in list(hub.pools.values()):
                 if rec.state == "PROPOSED" and clock.now() >= rec.proposal_deadline:
                     silent = [r for r in rec.rider_jids if r not in rec.accepted]
                     hub.log(f"pool {rec.pool.pool_id}: no answer from {silent}; they are dropped")
+                    hub.cancel_late_join(rec, "no_answer")
                     await handle_decline(self, hub, rec, silent)
         except Exception:
             logger.exception("%s: error handling a pool response", hub.jid)
@@ -192,6 +246,7 @@ class EscrowWatcher(CyclicBehaviour):
         hub = self.agent
         rec.state = "DISSOLVED"
         rec.pool.status = PoolStatus.DISSOLVED
+        hub.cancel_late_join(rec, "escrow_failed")
         for rider in rec.rider_jids.values():
             await self.send(make_auction_failed(rider, rec.pool.pool_id, reason))
         if rec.escrows:                                  # someone did pay: give it back
@@ -199,6 +254,78 @@ class EscrowWatcher(CyclicBehaviour):
                 hub.payment_jid, Protocol.REFUND,
                 TripFailed(rec.pool.pool_id, reason, str(hub.jid.bare), list(rec.escrows.values())),
                 thread=rec.pool.pool_id))
+
+
+class LateJoinReplies(CyclicBehaviour):
+    """LateJoinProtocol, hub side: the driver's agree / refuse to a late-join request (or silence), and the driver
+    telling us it had to undo a joiner."""
+
+    async def run(self):
+        hub = self.agent
+        msg = await self.receive(timeout=1)
+        try:
+            if msg is not None:
+                await self.handle(msg)
+            now = clock.now()
+            for pid, w in list(hub.late_waits.items()):
+                if now >= w.deadline:
+                    hub.late_waits.pop(pid, None)
+                    hub.log(f"late join {pid}: the driver did not answer; normal pooling instead")
+                    await admit_request(self, hub, w.req, w.sender, allow_late=False)
+        except Exception:
+            logger.exception("%s: late-join round failed", hub.jid)
+
+    async def handle(self, msg):
+        hub, sender, perf = self.agent, bare(msg.sender), msg.get_metadata("performative")
+        pid = msg.thread or ""
+        w = hub.late_waits.get(pid)
+        if w is not None and sender == bare(w.driver) and perf in (Perf.AGREE, Perf.REFUSE):
+            hub.late_waits.pop(pid, None)
+            if perf == Perf.REFUSE:
+                hub.log(f"late join {pid} refused by the driver ({msg.body}); normal pooling instead")
+                await admit_request(self, hub, w.req, w.sender, allow_late=False)
+            else:
+                await self.start_proposal(w)
+            return
+        if perf == Perf.INFORM:                                   # driver: "not confirmed in time, I undid it"
+            try:
+                d = parse_payload(msg, strict=True)
+            except (ValueError, TypeError):
+                return
+            rec = hub.pools.get(getattr(d, "join_pool_id", ""))
+            if isinstance(d, LateJoinDecision) and not d.confirmed and rec is not None and rec.late_of:
+                await hub.abandon_late_join(self, rec, d.reason or "driver_undid")
+
+    async def start_proposal(self, w: LateJoinWait):
+        """The driver would take the rider: now the rider is told (as for any pool) and asked."""
+        hub, req, sender = self.agent, w.req, w.sender
+        now = clock.now()
+        pool = Pool(w.pool_id, hub.hub_id, [req], PoolStatus.LOCKED, now)
+        rec = PoolRecord(pool, {req.request_id: sender}, proposal_deadline=now + hub.t_pool_response,
+                         late_of=w.base.pool.pool_id, late_terms=w.terms)
+        hub.pools[w.pool_id] = rec
+        hub.log(f"request {req.request_id} from {sender} -> {w.pool_id}, late joiner of {rec.late_of}")
+        await self.send(make_message(sender, Perf.AGREE, Protocol.TRIP_REQUEST, rec.pool, req.request_id))
+        await self.send(make_message(sender, Perf.INFORM, Protocol.TRIP_REQUEST,
+                                     f"request_queued:{hub.batch_estimate():.0f}", req.request_id))
+        if hub.propose_pools:
+            eta = hub.hub_eta(w.driver, hub.hub_id, now) or 0.0
+            await self.send(make_pool_proposal(sender, PoolProposal(
+                w.pool_id, req.request_id, list(w.terms.plan.stops), w.terms.fares[req.request_id], eta,
+                w.terms.plan.detour.get(req.request_id, 0.0))))
+        else:
+            hub.confirm_pool(rec)
+            if hub.payment_jid is None:
+                hub.start_auction(rec)
+
+
+class _AbandonLate(OneShotBehaviour):
+    def __init__(self, rec: PoolRecord, reason: str):
+        super().__init__()
+        self.rec, self.reason = rec, reason
+
+    async def run(self):
+        await self.agent.abandon_late_join(self, self.rec, self.reason)
 
 
 class DriverStatusReceiver(CyclicBehaviour):
@@ -247,21 +374,48 @@ class TripReports(CyclicBehaviour):
         riders = [r for r in rep.rider_ids if r in match.rider_fares]           # never trust the driver's numbers
         rec.state, rec.pool.status = "COMPLETED", PoolStatus.COMPLETED
         hub.log(f"pool {rec.pool.pool_id} completed by {match.driver_id}; settling {len(riders)} rider(s)")
+        late_done = [lr.jid for lr in rec.late if lr.jid in rep.rider_ids]
+        pay = hub.pool_incentives(rec, riders + late_done)                       # one pot for everybody in the vehicle
         if hub.reputation_jid:                                  # trip registry: who may rate whom
             await self.send(make_inform(hub.reputation_jid, Protocol.REPUTATION,
-                                        TripCompleted(rep.trip_id, rec.pool.pool_id, match.driver_id, riders,
-                                                      clock.now()), rec.pool.pool_id))
+                                        TripCompleted(rep.trip_id, rec.pool.pool_id, match.driver_id,
+                                                      riders + late_done, clock.now()), rec.pool.pool_id))
         await self.send(make_inform(match.driver_id, Protocol.TRIP_EXECUTION,       # ID-08: now it may rate
                                     TripCompleted(rep.trip_id, rec.pool.pool_id, match.driver_id, riders,
                                                   clock.now()), rec.pool.pool_id))
         if hub.payment_jid:
-            await self.send(make_inform(
-                hub.payment_jid, Protocol.SETTLEMENT,
-                TripCompleted(rep.trip_id, rec.pool.pool_id, match.driver_id, riders, rep.completed_at,
-                              rep.distance_km, {r: match.rider_fares[r] for r in riders},
-                              hub.solo_fares(rec, riders)),
-                rec.pool.pool_id))
+            if riders:
+                await self.send(make_inform(
+                    hub.payment_jid, Protocol.SETTLEMENT,
+                    TripCompleted(rep.trip_id, rec.pool.pool_id, match.driver_id, riders, rep.completed_at,
+                                  rep.distance_km, {r: match.rider_fares[r] for r in riders},
+                                  hub.solo_fares(rec, riders), {j: pay[j] for j in riders if j in pay}),
+                    rec.pool.pool_id))
             await self.refund(rec, [j for j in rec.no_shows if j not in riders], FailureReason.RIDER_CANCELLED)
+        await self.complete_late_riders(rec, match, rep, pay)
+
+    async def complete_late_riders(self, rec: PoolRecord, match: MatchResult, rep: TripCompleted, pay: Dict[str, float]):
+        """Riders that joined late have their own pool (and escrow): settle each under it with the same driver."""
+        hub = self.agent
+        if not rec.late:
+            return
+        done = [lr for lr in rec.late if lr.jid in rep.rider_ids]
+        for lr in rec.late:
+            lrec = lr.rec
+            if lr not in done:                                              # did not show up / was not driven
+                lrec.state, lrec.pool.status = "CANCELLED", PoolStatus.DISSOLVED
+                await self.refund(lrec, [lr.jid], FailureReason.RIDER_CANCELLED)
+                continue
+            lrec.state, lrec.pool.status = "COMPLETED", PoolStatus.COMPLETED
+            hub.log(f"pool {lrec.pool.pool_id} (late joiner of {rec.pool.pool_id}) completed; settling {lr.jid}")
+            tc = TripCompleted(f"trip-{lrec.pool.pool_id}", lrec.pool.pool_id, match.driver_id, [lr.jid], rep.completed_at,
+                               rep.distance_km, {lr.jid: lr.fare}, {}, {lr.jid: pay[lr.jid]} if lr.jid in pay else {})
+            if hub.reputation_jid:
+                await self.send(make_inform(hub.reputation_jid, Protocol.REPUTATION,
+                                            TripCompleted(tc.trip_id, lrec.pool.pool_id, match.driver_id, [lr.jid],
+                                                          clock.now()), lrec.pool.pool_id))
+            if hub.payment_jid:
+                await self.send(make_inform(hub.payment_jid, Protocol.SETTLEMENT, tc, lrec.pool.pool_id))
 
     async def failed(self, rec: PoolRecord, rep: TripFailed, sender: str):
         hub = self.agent
@@ -279,6 +433,11 @@ class TripReports(CyclicBehaviour):
             for rider in rec.rider_jids.values():
                 await self.send(make_auction_failed(rider, rec.pool.pool_id, FailureReason.DRIVER_FAILED))
             await self.refund(rec, list(rec.rider_jids.values()), FailureReason.DRIVER_FAILED)
+            for lr in rec.late:                                          # the late joiners have their own escrows
+                if lr.rec.state == "ASSIGNED":
+                    lr.rec.state, lr.rec.pool.status = "DRIVER_FAILED", PoolStatus.DISSOLVED
+                    await self.send(make_auction_failed(lr.jid, lr.rec.pool.pool_id, FailureReason.DRIVER_FAILED))
+                    await self.refund(lr.rec, [lr.jid], FailureReason.DRIVER_FAILED)
 
     async def refund(self, rec: PoolRecord, rider_jids, reason: FailureReason):
         hub = self.agent
@@ -468,6 +627,11 @@ class MicrohubAgent(BaseAgent):
                  solo_fallback: bool = True, reserve_margin: Optional[float] = None,
                  pickup_allowance: float = PICKUP_ALLOWANCE, max_pickup_eta: Optional[float] = None,
                  retry_delay: float = 0.0, window_slack: float = 0.0, broadcast_demand: bool = False,
+                 peer_jids: Optional[Dict[str, str]] = None, t_heartbeat: float = T_HEARTBEAT,
+                 t_failover: float = T_FAILOVER, overflow_after: int = OVERFLOW_AFTER,
+                 k_neighbours: int = HUB_NEIGHBOURS, t_overflow_reply: float = T_OVERFLOW_REPLY,
+                 emission_g_per_km: float = EMISSION_G_PER_KM, pool_incentive_per_kg: float = 0.0,
+                 late_join: bool = False, late_join_markup: float = LATE_JOIN_MARKUP, t_late_reply: float = T_LATE_REPLY,
                  **kwargs):
         super().__init__(jid, password, **kwargs)
         self.hub_id = hub_id                  # node id in the road network (== MicrohubNode.id)
@@ -516,6 +680,24 @@ class MicrohubAgent(BaseAgent):
         self.broadcast_demand = broadcast_demand      # tell drivers that were not called about the request (BDI input)
         self.auction_queue: List[tuple] = []
         self.auction_running = False
+        # inter-hub coordination (M11): only with `peer_jids` (hub id -> JID of the OTHER hubs)
+        self.t_heartbeat, self.t_failover, self.overflow_after = t_heartbeat, t_failover, overflow_after
+        self.k_neighbours, self.t_overflow_reply = k_neighbours, t_overflow_reply
+        self.peer_jids = {h: bare(j) for h, j in (peer_jids or {}).items() if h != hub_id}
+        near = set(neighbours(network, hub_id, k_neighbours)) if network is not None and hub_id in network.hubs \
+            else set(self.peer_jids)
+        self.peers: Dict[str, PeerView] = {h: PeerView(h, j) for h, j in self.peer_jids.items() if h in near}
+        self.overflow_waits: Dict[str, OverflowWait] = {}
+        self.overflow_tried: set = set()                 # pool ids already offered to a neighbour
+        self.adopted: List[str] = []                     # request ids taken over from other hubs
+        self.emission_g_per_km = emission_g_per_km
+        self.pool_incentive_per_kg = pool_incentive_per_kg
+        self.late_join = late_join                       # offer riders a seat in pools whose driver is still on the way
+        self.late_join_markup = late_join_markup
+        self.t_late_reply = t_late_reply
+        self.late_waits: Dict[str, LateJoinWait] = {}    # late-join requests waiting for the driver's answer, by new pool id
+        self.late_joined: List[str] = []                 # pool ids of riders that joined late (the report counts them)
+        self.pool_metrics: List[PoolMetric] = []         # one per matched pool (footprint of sharing)
 
     # ---- helpers used by behaviours -----------------------------------------------------
     def log(self, text: str) -> None:
@@ -592,6 +774,65 @@ class MicrohubAgent(BaseAgent):
             if request_id in rec.rider_jids:
                 return rec
         return None
+
+    def record_pool_metrics(self, rec: PoolRecord) -> None:
+        """Footprint of a matched pool: vehicle metres on the shared route vs the riders' separate routes."""
+        if self.network is None:
+            return
+        dests = [r.destination_home for r in rec.pool.requests]
+        stops = list(rec.plan.stops[1:]) if rec.plan is not None else sorted(set(dests))
+        try:
+            fp = footprint(self.network, self.hub_id, stops, dests, clock.now())
+        except KeyError:
+            return
+        if fp is not None:
+            self.pool_metrics.append(PoolMetric(rec.pool.pool_id, len(dests), fp[0], fp[1]))
+
+    # ---- inter-hub coordination (protocols/inter_hub.py) ------------------------------------------
+    def idle_driver_count(self, now: float) -> int:
+        """Drivers whose fresh status says IDLE (the spare capacity a neighbour may count on)."""
+        return sum(1 for e in self.registry.values()
+                   if now - e[1] <= 3 * self.t_status and e[0].state == DriverState.IDLE)
+
+    def pending_requests(self) -> List[TripRequest]:
+        """Requests this hub owes an answer and has not matched: what a neighbour must take over if it dies."""
+        out = [q.req for q in self.queue] + [w.req for w in self.late_waits.values()]
+        for rec in self.pools.values():
+            if rec.state in ("PROPOSED", "AWAITING_ESCROW", "AUCTION_QUEUED", "AUCTIONING", OVERFLOW_PENDING):
+                out += list(rec.pool.requests)
+        return out
+
+    def maybe_overflow(self, rec: PoolRecord, next_attempt: int) -> bool:
+        """After a failed auction: offer the pool to a neighbour instead of retrying (True = the offer is out)."""
+        pid = rec.pool.pool_id
+        if not self.peers or self.network is None or not self.overflow_after or pid in self.overflow_tried \
+                or next_attempt < self.overflow_after:
+            return False
+        now = clock.now()
+        target = overflow_target(self.network, list(rec.pool.requests), self.peers, self.hub_id, now)
+        if target is None:
+            return False
+        self.overflow_tried.add(pid)
+        rec.state = OVERFLOW_PENDING
+        self.overflow_waits[pid] = OverflowWait(rec, next_attempt, now + self.t_overflow_reply, target)
+        self.log(f"pool {pid}: {next_attempt} failed attempts, offered to {target}")
+        self.add_behaviour(_Send(make_message(self.peers[target].jid, Perf.REQUEST, Protocol.INTER_HUB,
+                                              OverflowRequest(self.hub_id, FailureReason.NO_BIDS, list(rec.pool.requests)),
+                                              pid)))
+        return True
+
+    def resume_auction(self, w: OverflowWait) -> None:
+        if w.rec.state == OVERFLOW_PENDING:
+            self.start_auction(w.rec, w.attempt, 0.0)
+
+    def finish_overflow(self, w: OverflowWait) -> None:
+        """The neighbour took the pool: give it up and have the riders' escrows returned."""
+        rec = w.rec
+        rec.state, rec.pool.status = HANDED_OVER, PoolStatus.DISSOLVED
+        self.log(f"pool {rec.pool.pool_id} handed over to {w.target}")
+        msg = refund_request(self, rec)
+        if msg is not None:
+            self.add_behaviour(_Send(msg))
 
     def check_request(self, req: TripRequest, sender: str) -> str:
         if self.account(req.rider_id) != sender:
@@ -694,12 +935,159 @@ class MicrohubAgent(BaseAgent):
     def solo_fares(self, rec: PoolRecord, rider_jids: List[str]) -> Dict[str, float]:
         """Reference solo fare of each rider of a POOLED trip (so Payment can show the pooling
         discount). Empty for solo trips: there is nothing to compare with."""
-        if rec.plan is None or len(rec.pool.requests) < 2:
+        if rec.plan is None or len(rec.pool.requests) + len(rec.late) < 2:
             return {}
         by_req = {r.request_id: r for r in rec.pool.requests}
         return {rec.rider_jids[rid]: reference_solo_fare(rec.plan.direct[rid], DRIVER_BASE_COST,
                                                          DRIVER_COST_PER_SECOND, by_req[rid].max_fare)
                 for rid in rec.rider_jids if rec.rider_jids[rid] in rider_jids}
+
+    def pool_incentives(self, rec: PoolRecord, rider_jids: List[str]) -> Dict[str, float]:
+        """CO2 incentive of a shared trip: rate x kg saved, split among the riders by their experienced delay
+        (detour seconds + 1, so a rider who gave up more time gets more). Empty if off or nothing was saved."""
+        late = getattr(rec, "late", [])
+        if self.pool_incentive_per_kg <= 0 or rec.plan is None or len(rec.pool.requests) + len(late) < 2:
+            return {}
+        metric = next((m for m in self.pool_metrics if m.pool_id == rec.pool.pool_id), None)
+        if metric is None or metric.saved_m <= 0:
+            return {}
+        total = self.pool_incentive_per_kg * metric.saved_m * self.emission_g_per_km / 1e6
+        jid_of = {**rec.rider_jids, **{lr.request_id: lr.jid for lr in late}}
+        weights = {jid_of[rid]: rec.plan.detour.get(rid, 0.0) + 1.0 for rid in jid_of if jid_of[rid] in rider_jids}
+        scale = sum(weights.values())
+        return {jid: round(total * w / scale, 2) for jid, w in weights.items()} if scale else {}
+
+    # ---- late join (LateJoinProtocol) -----------------------------------------------------------
+    def _late_busy(self, base_id: str) -> bool:
+        """One joiner at a time per pool: its terms depend on who is in the pool."""
+        return any(w.base.pool.pool_id == base_id for w in self.late_waits.values()) or any(
+            r.late_of == base_id and r.state in ("PROPOSED", "AWAITING_ESCROW") for r in self.pools.values())
+
+    async def offer_late_join(self, beh, req: TripRequest, sender: str) -> bool:
+        """Is there a pool whose driver is still on the way to the hub that `req` could join? If so ask the driver
+        (True = the request is now in the driver's hands) - otherwise False and the request goes the normal way."""
+        if self.network is None:
+            return False
+        now = clock.now()
+        best = None
+        for base in self.pools.values():
+            match = self.matches.get(base.pool.pool_id)
+            if base.state != "ASSIGNED" or base.late_of or match is None or self._late_busy(base.pool.pool_id):
+                continue
+            eta = self.hub_eta(match.driver_id, self.hub_id, now)
+            if eta is None or eta < 15.0:                        # too close: no time to ask, propose, escrow
+                continue
+            existing = list(base.pool.requests) + [lr.rec.pool.requests[0] for lr in base.late]
+            old = {r.request_id: (match.rider_fares[base.rider_jids[r.request_id]] if r.request_id in base.rider_jids
+                                  else next(lr.fare for lr in base.late if lr.request_id == r.request_id))
+                   for r in existing}
+            terms = late_join_terms(self.network, self.hub_id, existing, req, old, now + eta, DRIVER_COST_PER_SECOND,
+                                    self.late_join_markup, self.max_pool_size)
+            if terms is not None and (best is None or terms.extra_seconds < best[0].extra_seconds):
+                best = (terms, base, match)
+        if best is None:
+            return False
+        terms, base, match = best
+        self._seq += 1
+        pid = f"{self.hub_id}-pool-{self._seq:04d}"
+        self.late_waits[pid] = LateJoinWait(req, sender, base, pid, terms, match.driver_id, now + self.t_late_reply)
+        self.log(f"request {req.request_id}: asks the driver of {base.pool.pool_id} (+{terms.extra_seconds:.0f}s, "
+                 f"+{terms.extra_pay:.2f})")
+        await beh.send(make_message(match.driver_id, Perf.REQUEST, Protocol.LATE_JOIN,
+                                    LateJoinRequest(base.pool.pool_id, pid, req.request_id, sender, req.destination_home,
+                                                    list(terms.plan.stops), terms.extra_seconds, terms.extra_pay), pid))
+        return True
+
+    def cancel_late_join(self, rec: PoolRecord, reason: str) -> None:
+        """The rider of a late-join pool said no / did not pay: tell the driver to take it back out."""
+        if not rec.late_of or rec.state == "ASSIGNED":
+            return
+        match = self.matches.get(rec.late_of)
+        if match is not None:
+            self.add_behaviour(_Send(make_message(match.driver_id, Perf.INFORM, Protocol.LATE_JOIN,
+                                                  LateJoinDecision(rec.late_of, rec.pool.pool_id, False, reason),
+                                                  rec.pool.pool_id)))
+
+    async def abandon_late_join(self, beh, rec: PoolRecord, reason: str) -> None:
+        """The driver could not keep the joiner (it was not confirmed in time). Undo it here too: refund, tell the rider, and
+        give back the fares of the others if the join had already been committed."""
+        base = self.pools.get(rec.late_of)
+        was_committed = rec.state == "ASSIGNED"
+        rec.state, rec.pool.status = "DISSOLVED", PoolStatus.DISSOLVED
+        self.log(f"late join {rec.pool.pool_id} into {rec.late_of} abandoned ({reason})")
+        if base is not None:
+            lr = next((x for x in base.late if x.rec is rec), None)
+            if lr is not None:
+                base.late.remove(lr)
+                match = self.matches.get(base.pool.pool_id)
+                if match is not None and base.late_old:
+                    match.rider_fares.update(base.late_old)
+                    match.final_fare = round(sum(match.rider_fares.values()), 2)
+        if rec.escrows and self.payment_jid:                      # the rider's money comes back; it escrows again later
+            await beh.send(make_request(self.payment_jid, Protocol.REFUND,
+                                        TripFailed(rec.pool.pool_id, FailureReason.NO_MATCH, str(self.jid.bare),
+                                                   list(rec.escrows.values())), thread=rec.pool.pool_id))
+        # The rider must not lose its trip because the join fell through: it goes the normal way (batch / own pool).
+        req = rec.pool.requests[0]
+        sender = rec.rider_jids[req.request_id]
+        await beh.send(make_message(sender, Perf.INFORM, Protocol.INTER_HUB,
+                                    Handover(req.request_id, self.hub_id, self.hub_id, str(self.jid.bare),
+                                             FailureReason.NO_MATCH), req.request_id))
+        await admit_request(beh, self, req, sender, allow_late=False)
+
+    def commit_late_join(self, rec: PoolRecord) -> None:
+        """The rider accepted and escrowed: the join is final. The driver keeps it, the first riders' fares drop to their
+        new shares (never up), and everybody is told."""
+        base, terms = self.pools.get(rec.late_of), rec.late_terms
+        match = self.matches.get(rec.late_of)
+        if base is None or match is None or base.state != "ASSIGNED" or terms is None:
+            self.add_behaviour(_AbandonLate(rec, "pool_gone"))
+            return
+        req = rec.pool.requests[0]
+        jid = rec.rider_jids[req.request_id]
+        base.late_old = dict(match.rider_fares)
+        for rid, jd in base.rider_jids.items():
+            old = match.rider_fares.get(jd)
+            if old is not None:
+                match.rider_fares[jd] = terms.fares[rid]
+        match.final_fare = round(sum(match.rider_fares.values()), 2)
+        for lr in base.late:
+            lr.fare = terms.fares[lr.request_id]
+        fare = terms.fares[req.request_id]
+        base.late.append(LateRider(rec, jid, req.request_id, fare))
+        base.plan = terms.plan
+        rec.state, rec.pool.status = "ASSIGNED", PoolStatus.ASSIGNED
+        rec.times["matched"] = clock.now()
+        mine = MatchResult(rec.pool.pool_id, match.driver_id, fare, match.pickup_eta, {jid: fare})
+        self.matches[rec.pool.pool_id] = mine
+        self.late_joined.append(rec.pool.pool_id)
+        self.refresh_pool_metric(base)
+        self.log(f"late joiner {rec.pool.pool_id} confirmed in {base.pool.pool_id}: fare {fare:.2f}, "
+                 f"others pay {{{', '.join(f'{k}: {v:.2f}' for k, v in sorted(match.rider_fares.items()))}}}")
+        self.add_behaviour(_Send(make_message(match.driver_id, Perf.INFORM, Protocol.LATE_JOIN,
+                                              LateJoinDecision(base.pool.pool_id, rec.pool.pool_id, True), rec.pool.pool_id)))
+        self.add_behaviour(_Send(make_message(jid, Perf.INFORM, Protocol.MATCH_AUCTION, mine, rec.pool.pool_id)))
+        n = len(base.rider_jids) + len(base.late)
+        for rid, jd in base.rider_jids.items():
+            self.add_behaviour(_Send(make_message(
+                jd, Perf.INFORM, Protocol.LATE_JOIN,
+                PoolAmended(base.pool.pool_id, jd, list(terms.plan.stops), base.late_old.get(jd, 0.0),
+                            match.rider_fares.get(jd, 0.0), n), base.pool.pool_id)))
+
+    def refresh_pool_metric(self, base: PoolRecord) -> None:
+        """Re-measure a pool's footprint now that riders joined it."""
+        if self.network is None or base.plan is None:
+            return
+        reqs = list(base.pool.requests) + [lr.rec.pool.requests[0] for lr in base.late]
+        dests = [r.destination_home for r in reqs]
+        try:
+            fp = footprint(self.network, self.hub_id, list(base.plan.stops[1:]), dests, clock.now())
+        except KeyError:
+            return
+        if fp is None:
+            return
+        self.pool_metrics = [m for m in self.pool_metrics if m.pool_id != base.pool.pool_id]
+        self.pool_metrics.append(PoolMetric(base.pool.pool_id, len(dests), fp[0], fp[1]))
 
     def confirm_pool(self, rec: PoolRecord) -> None:
         rec.state = "AWAITING_ESCROW"
@@ -712,6 +1100,9 @@ class MicrohubAgent(BaseAgent):
         drivers, and a driver holding a provisional lock for the first must refuse the second (CC-09),
         starving it of bids. A retry goes to the front of the line, after `retry_delay` (so the locks
         of the failed attempt have expired)."""
+        if rec.late_of:                                      # a late joiner has no auction: it rides with a driver already assigned
+            self.commit_late_join(rec)
+            return
         rec.state = "AUCTION_QUEUED"
         rec.times.setdefault("queued", clock.now())          # first time only: retries are part of the auction phase
         wait = (self.retry_delay if delay is None else delay) if attempt else 0.0
@@ -755,8 +1146,10 @@ class MicrohubAgent(BaseAgent):
             rec.state, rec.pool.status = "ASSIGNED", PoolStatus.ASSIGNED
             rec.times["matched"] = clock.now()
             self.matches[ctx.pool_id] = ctx.match
+            self.record_pool_metrics(rec)
         elif ctx.outcome == RETRY:
-            self.start_auction(rec, ctx.attempt + 1, self.retry_wait(ctx))
+            if not self.maybe_overflow(rec, ctx.attempt + 1):
+                self.start_auction(rec, ctx.attempt + 1, self.retry_wait(ctx))
         else:
             rec.state, rec.pool.status = "UNMATCHED", PoolStatus.DISSOLVED
         self._next_auction()
@@ -867,12 +1260,20 @@ class MicrohubAgent(BaseAgent):
         if self.reputation_jid:
             self.add_behaviour(ReputationReceiver(), make_template(Protocol.REPUTATION, Perf.INFORM))
         self.add_behaviour(DriverStatusReceiver(), make_template(Protocol.DRIVER_STATUS, Perf.INFORM))
+        if self.late_join:
+            self.add_behaviour(LateJoinReplies(), make_template(Protocol.LATE_JOIN))
         self.add_behaviour(TripReports(), make_template(Protocol.TRIP_EXECUTION, Perf.INFORM))
         if self.payment_jid:
             self.add_behaviour(EscrowWatcher(), make_template(Protocol.ESCROW))
             self.add_behaviour(SettlementReceiver(), make_template(Protocol.SETTLEMENT, Perf.INFORM))
             self.add_behaviour(RefundReceiver(), make_template(Protocol.REFUND, Perf.INFORM))
         self.add_behaviour(LateBidHandler(), make_template(Protocol.MATCH_AUCTION, Perf.PROPOSE))
+        if self.peers:                                                   # InterHubCoordinationProtocol (M11)
+            self.add_behaviour(HeartbeatReceiver(), make_template(Protocol.INTER_HUB, Perf.INFORM))
+            self.add_behaviour(OverflowReceiver(), make_template(Protocol.INTER_HUB, Perf.REQUEST))
+            self.add_behaviour(OverflowReplies(), make_template(Protocol.INTER_HUB, Perf.AGREE))
+            self.add_behaviour(OverflowReplies(), make_template(Protocol.INTER_HUB, Perf.REFUSE))
+            self.add_behaviour(InterHubWatcher())
         if self.reposition_rules is not None:
             self.add_behaviour(DemandForecastReceiver(), make_template(Protocol.DEMAND_FORECAST, Perf.INFORM))
             self.add_behaviour(RepositionPlanner())

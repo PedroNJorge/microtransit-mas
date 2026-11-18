@@ -28,6 +28,7 @@ for a pickup that took more than `lateness_tolerance` seconds longer than promis
 for waiting beyond the rider's own window.
 """
 import asyncio
+import math
 import logging
 import uuid
 from dataclasses import dataclass, field
@@ -39,11 +40,11 @@ from agents.base_agent import BaseAgent
 from common import clock
 from common.messages import make_inform, make_message, make_request, make_template
 from common.ontology import (
-    AuctionOutcome, DriverArriving, Escrow, Refund, EscrowRequest, FailureReason, MatchResult, Perf, Pool,
-    PoolProposal, Protocol, Rating, ReputationScore, RiderBoarded, RiderDroppedOff, RiderReady, Settlement, TripRequest,
+    AuctionOutcome, DriverArriving, Escrow, Handover, Refund, EscrowRequest, FailureReason, MatchResult, Perf, Pool,
+    PoolAmended, PoolProposal, Protocol, Rating, ReputationScore, RiderBoarded, RiderDroppedOff, RiderReady, Settlement, TripRequest,
     parse_payload,
 )
-from common.settings import READY_DELAY, T_POOL_RESPONSE, T_RIDER_PATIENCE
+from common.settings import T_RIDER_REPLY, READY_DELAY, T_POOL_RESPONSE, T_RIDER_PATIENCE
 from common.ws_server import broadcast_event
 from protocols.payment_common import bare
 
@@ -57,7 +58,7 @@ TRANSITIONS = {
     REQUESTING: {AWAITING_POOL, IDLE},
     AWAITING_POOL: {DECIDING, IDLE},
     DECIDING: {AWAITING_MATCH, AWAITING_POOL, IDLE},      # AWAITING_POOL again = re-pooled (a co-rider declined)
-    AWAITING_MATCH: {DRIVER_EN_ROUTE, IDLE},
+    AWAITING_MATCH: {DRIVER_EN_ROUTE, AWAITING_POOL, IDLE},   # AWAITING_POOL again = handed over to another hub
     DRIVER_EN_ROUTE: {IN_TRIP, IDLE},
     IN_TRIP: {RATING, IDLE},
     RATING: {IDLE},
@@ -78,6 +79,7 @@ class TripRecord:
     escrow: Optional[Escrow] = None
     settlement: Optional[Settlement] = None
     refund: Optional[Refund] = None
+    amended: List[PoolAmended] = field(default_factory=list)   # "someone joined your pool" notices (route, new fare)
     outcome: str = ""                              # one of the constants above, "" while running
     reason: str = ""
     requested_at: float = 0.0
@@ -86,6 +88,9 @@ class TripRecord:
     boarded_at: float = 0.0
     dropped_at: float = 0.0
     rating: Optional[Rating] = None
+    tried_hubs: List[str] = field(default_factory=list)   # hubs the request was sent to (a silent hub is skipped)
+    sent_at: float = 0.0                                  # when the request was last sent to a hub
+    retry_at: float = 0.0                                 # 0, or when to ask again after an outside_coverage refusal
     log: List[str] = field(default_factory=list)
 
     @property
@@ -152,7 +157,8 @@ class RiderAgent(BaseAgent):
     def __init__(self, jid: str, password: str, hub_jids: Optional[Dict[str, str]] = None,
                  network=None, payment_jid: Optional[str] = None, reputation_jid: Optional[str] = None,
                  rate_with: Optional[Callable[[TripRecord], int]] = None,
-                 t_pool_response: float = T_POOL_RESPONSE, patience: float = T_RIDER_PATIENCE,
+                 t_pool_response: float = T_POOL_RESPONSE, patience: float = T_RIDER_PATIENCE, match_patience: Optional[float] = None, reply_timeout: float = T_RIDER_REPLY,
+                 retry_coverage: float = 0.0, detour_ratio: Optional[float] = None,
                  ready_delay: float = READY_DELAY, no_show: bool = False, auto_escrow: bool = True,
                  auto_request_interval: Optional[float] = None, auto_request_max_fare: float = 100.0,
                  hub_policy: Optional[Callable] = None, **kwargs):
@@ -163,7 +169,12 @@ class RiderAgent(BaseAgent):
         self.reputation_jid = bare(reputation_jid) if reputation_jid else None
         self.rate_with = rate_with or default_rating
         self.t_pool_response, self.patience, self.ready_delay = t_pool_response, patience, ready_delay
+        self.match_patience = patience if match_patience is None else match_patience   # waiting for a DRIVER (after the pool is confirmed)
         self.no_show, self.auto_escrow = no_show, auto_escrow
+        self.retry_coverage = retry_coverage               # >0: after an outside_coverage refusal, keep asking for this long (s)
+        self.coverage_retry_delay = 120.0
+        self.detour_ratio = detour_ratio                   # tolerance = min(the request's cap, ratio x direct ride time); None = the cap
+        self.reply_timeout = reply_timeout                 # no answer from the hub for this long: try another one
         if auto_request_interval is not None and auto_request_interval <= 0:
             raise ValueError("auto_request_interval must be > 0")
         if auto_request_max_fare <= 0:
@@ -186,7 +197,8 @@ class RiderAgent(BaseAgent):
     async def setup(self):
         await super().setup()
         for proto in (Protocol.TRIP_REQUEST, Protocol.POOL_FORMATION, Protocol.ESCROW,
-                      Protocol.MATCH_AUCTION, Protocol.TRIP_EXECUTION, Protocol.SETTLEMENT, Protocol.REFUND, Protocol.REPUTATION):
+                      Protocol.MATCH_AUCTION, Protocol.TRIP_EXECUTION, Protocol.SETTLEMENT, Protocol.REFUND, Protocol.REPUTATION,
+                      Protocol.INTER_HUB, Protocol.LATE_JOIN):
             self.add_behaviour(RiderListener(), make_template(proto))
         if self.auto_request_interval is not None:
             if self.network is None:
@@ -274,11 +286,15 @@ class RiderAgent(BaseAgent):
             logger.info("[%s] no known hub covers %s", self.jid.user, destination)
             return None
         now = clock.now()
+        if self.detour_ratio is not None and self.network is not None:
+            direct = self.network.travel_time(hub_id, destination, now)          # solo ride time, seconds
+            if not math.isinf(direct):
+                detour_tolerance = min(detour_tolerance, self.detour_ratio * direct)
         start = now if window_start is None else window_start
         req = TripRequest(request_id or f"req-{uuid.uuid4().hex[:8]}", self.me, hub_id, destination,
                           start, start + window, detour_tolerance, max_fare, pooling_willingness,
                           subsidy_eligible, now)
-        self.trip = TripRecord(req, self.hubs[hub_id], requested_at=now)
+        self.trip = TripRecord(req, self.hubs[hub_id], requested_at=now, tried_hubs=[hub_id], sent_at=now)
         self.ended = asyncio.Event()
         self.go(REQUESTING, "request sent")
         self._deadline = now + self.patience
@@ -350,6 +366,53 @@ class RiderAgent(BaseAgent):
             self.on_auction(t, sender, perf, payload)
         elif proto == Protocol.TRIP_EXECUTION:
             await self.on_execution(beh, t, sender, payload)
+        elif proto == Protocol.INTER_HUB:
+            self.on_handover(t, sender, payload)
+        elif proto == Protocol.LATE_JOIN and isinstance(payload, PoolAmended) and sender == t.hub_jid:
+            t.amended.append(payload)                           # informed only: the hub checked our tolerance already
+            t.log.append(f"{self.state}: {payload.riders - 1} more rider(s) joined, fare {payload.old_fare:.2f} -> "
+                         f"{payload.new_fare:.2f}")
+
+    def _send_request(self, t, hub_id: str) -> None:
+        t.tried_hubs.append(hub_id)
+        t.hub_jid, t.sent_at, t.retry_at = self.hubs[hub_id], clock.now(), 0.0
+        self.add_behaviour(_Sender(make_message(t.hub_jid, Perf.REQUEST, Protocol.TRIP_REQUEST,
+                                                t.request, t.request.request_id)))
+
+    def retry_after_coverage_refusal(self, t) -> None:
+        """The hub says the destination is outside its coverage (disruptions lengthened its routes). Ask another hub that
+        covers it now; if none does, ask again later, for as long as `retry_coverage` allows."""
+        now = clock.now()
+        alt = [h for h in self.network.hubs_covering(t.request.destination_home, now)
+               if h in self.hubs and h not in t.tried_hubs]
+        if alt:
+            t.log.append(f"REQUESTING: outside coverage, trying {alt[0]}")
+            self._send_request(t, alt[0])
+        else:
+            t.tried_hubs = []                                              # forget: the roads may have reopened
+            t.retry_at = now + self.coverage_retry_delay
+            t.log.append(f"REQUESTING: outside coverage everywhere, asking again in {self.coverage_retry_delay:.0f}s")
+        self._deadline = max(self._deadline, now + self.retry_coverage)
+
+    def on_handover(self, t, sender, payload) -> None:
+        """InterHubCoordinationProtocol: another hub took our request over (its hub failed or was overloaded)."""
+        if not isinstance(payload, Handover) or payload.request_id != t.request.request_id:
+            return
+        new = bare(payload.to_hub_jid)
+        retry_here = payload.from_hub == payload.to_hub                    # same hub starts over (a late join fell through)
+        if sender != new or new not in self.hubs.values() or (new == t.hub_jid and not retry_here):
+            return
+        if self.state not in (REQUESTING, AWAITING_POOL, DECIDING, AWAITING_MATCH):
+            return                                                         # a driver is already on its way
+        t.hub_jid, t.pool_id, t.proposal = new, "", None
+        if payload.to_hub not in t.tried_hubs:
+            t.tried_hubs.append(payload.to_hub)
+        t.sent_at = clock.now()
+        if self.state in (DECIDING, AWAITING_MATCH):
+            self.go(AWAITING_POOL, f"handed over to {payload.to_hub}")
+        else:
+            t.log.append(f"{self.state}: handed over to {payload.to_hub}")
+        self._deadline = clock.now() + self.patience
 
     async def on_trip_request(self, beh, t, sender, perf, payload, msg):
         if sender != t.hub_jid:
@@ -359,6 +422,9 @@ class RiderAgent(BaseAgent):
                 t.pool_id = payload.pool_id
             self.go(AWAITING_POOL, "agreed" if t.pool_id else "queued for pooling")   # else: pool id comes with the proposal
         elif perf == Perf.REFUSE and self.state == REQUESTING:
+            if (msg.body or "") == "outside_coverage" and self.retry_coverage > 0 and self.network is not None:
+                self.retry_after_coverage_refusal(t)          # a blocked road shrank the hub's reach: wait or switch
+                return
             self.end_trip(REFUSED, msg.body or "")
         # inform(request_queued ...) is informational
 
@@ -379,6 +445,7 @@ class RiderAgent(BaseAgent):
         elif perf == Perf.INFORM and isinstance(payload, Pool) and payload.pool_id == t.pool_id \
                 and payload.status.value not in ("DISSOLVED", "FORMING") and self.state == DECIDING:   # pool_confirmed
             self.go(AWAITING_MATCH, "pool confirmed")
+            self._deadline = clock.now() + self.match_patience
             if self.payment_jid and self.auto_escrow:
                 esc = EscrowRequest(t.request.request_id, self.me, t.pool_id, t.request.max_fare,
                                     t.request.subsidy_eligibility, t.hub_jid)
@@ -460,6 +527,23 @@ class RiderAgent(BaseAgent):
 
     # ---- patience --------------------------------------------------------------------------------
     async def check_deadlines(self, beh) -> None:
+        t = self.trip
+        if t is not None and self.state == REQUESTING and t.retry_at and clock.now() >= t.retry_at:
+            hub_id = self.choose_hub(t.request.destination_home)
+            if hub_id is not None:
+                self._send_request(t, hub_id)
+            else:
+                t.retry_at = clock.now() + self.coverage_retry_delay
+        elif t is not None and self.state == REQUESTING and self.network is not None and not t.retry_at \
+                and clock.now() - t.sent_at > self.reply_timeout:
+            alt = [h for h in self.network.hubs_covering(t.request.destination_home, clock.now())
+                   if h in self.hubs and h not in t.tried_hubs]
+            if alt:                                                        # the hub is silent: ask the next one
+                t.tried_hubs.append(alt[0])
+                t.hub_jid, t.sent_at = self.hubs[alt[0]], clock.now()
+                t.log.append(f"REQUESTING: no answer, trying {alt[0]}")
+                self.add_behaviour(_Sender(make_message(t.hub_jid, Perf.REQUEST, Protocol.TRIP_REQUEST,
+                                                        t.request, t.request.request_id)))
         if self.trip is not None and self.state != IDLE and clock.now() > self._deadline:
             if self.state in (REQUESTING, AWAITING_POOL, DECIDING, AWAITING_MATCH):
                 self.end_trip(TIMED_OUT, f"no progress in {self.state}")

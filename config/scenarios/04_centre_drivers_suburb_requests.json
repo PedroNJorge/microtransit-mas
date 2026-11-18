@@ -18,12 +18,12 @@
         "hubs": {
           "centre": 2
         },
-        "count": 10
+        "count": 24
       }
     ]
   },
   "riders": {
-    "count": 28
+    "count": 72
   },
   "demand": [
     {
@@ -33,7 +33,7 @@
       },
       "start": 300,
       "end": 2400,
-      "count": 28,
+      "count": 72,
       "pattern": "random",
       "max_fare": 25,
       "pooling": 1.0

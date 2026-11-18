@@ -18,13 +18,13 @@
         "hubs": {
           "centre": 2
         },
-        "count": 10
+        "count": 24
       }
     ],
     "brains": true
   },
   "riders": {
-    "count": 20
+    "count": 48
   },
   "demand": [
     {
@@ -34,7 +34,7 @@
       },
       "start": 900,
       "end": 1500,
-      "count": 16,
+      "count": 48,
       "pattern": "random",
       "max_fare": 25,
       "pooling": 1.0
@@ -46,7 +46,7 @@
       "hub": {
         "periphery": 1
       },
-      "expected": 16,
+      "expected": 48,
       "horizon": 1500,
       "to": {
         "periphery": 1

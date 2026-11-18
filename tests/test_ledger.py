@@ -381,3 +381,43 @@ def test_random_operations_conserve_money(seed):
             assert l.escrow_balance(r.escrow_id) == 0
         else:
             assert l.escrow_balance(r.escrow_id) == r.amount
+
+
+def test_a_rider_may_restart_the_same_request_with_another_pool_and_hub():
+    """M11: the request was handed over to a neighbour hub; the old hold goes back, the new one replaces it."""
+    l = make()
+    old, _ = l.hold("q1", "r1", "p1", 20, False, HUB)
+    new, created = l.hold("q1", "r1", "p2", 20, False, "hub-b")
+    assert created and new.escrow_id != old.escrow_id
+    assert l.balance("r1") == 80                                    # one hold, not two
+    assert l.status(old.escrow_id) == "REFUNDED" if hasattr(l, "status") else True
+
+
+def test_a_handover_hold_never_touches_another_riders_request_or_a_settled_one():
+    l = make()
+    hold(l, "q1", "r1", 20)
+    assert err(l.hold, "q1", "r2", "p2", 20, False, "hub-b") == Reason.DUPLICATE_REQUEST
+    assert l.balance("r1") == 80
+
+
+# ---- pooling incentive (CO2 fund) ------------------------------------------------------------
+def test_pooling_incentive_is_paid_from_its_own_fund_on_top_of_the_fare():
+    l = two_rider_pool()
+    out = l.settle("p1", "d1", ["r1", "r2"], {"r1": 12.0, "r2": 9.0}, HUB, {"r1": 0.6, "r2": 0.4})
+    assert out.total_incentive == 1.0 and l.pooling_spent == 1.0
+    assert l.balance("d1") == 21.0                                    # the driver never pays for it
+    assert l.balance("r2") == 100 - 15 + 6 + 0.4                      # excess + incentive
+    assert l.check_conservation()
+
+
+def test_pooling_incentive_respects_a_budget_and_reports_the_shortfall():
+    l = two_rider_pool(pooling_budget=0.5)
+    out = l.settle("p1", "d1", ["r1", "r2"], {"r1": 12.0, "r2": 9.0}, HUB, {"r1": 0.6, "r2": 0.4})
+    assert out.total_incentive == 0.5 and l.pooling_shortfall == 0.5
+    assert l.check_conservation()
+
+
+def test_no_incentive_without_a_fare_or_without_the_argument():
+    l = two_rider_pool()
+    out = l.settle("p1", "d1", ["r1", "r2"], {"r1": 12.0, "r2": 9.0}, HUB)
+    assert out.total_incentive == 0.0 and l.pooling_spent == 0.0

@@ -90,12 +90,12 @@ class PaymentAgent(BaseAgent):
     def __init__(self, jid: str, password: str, default_rider_balance=None,
                  subsidy_budget=None, subsidy_discount: float = SUBSIDY_DISCOUNT,
                  hold_max: float = T_ESCROW_HOLD_MAX, sweep_every: float = T_ESCROW_SWEEP,
-                 reputation_jid=None, regulator_jid=None, **kwargs):
+                 reputation_jid=None, regulator_jid=None, pooling_budget=None, **kwargs):
         super().__init__(jid, password, **kwargs)
         if hold_max <= 0 or sweep_every <= 0:
             raise ValueError("hold_max and sweep_every must be > 0")
         self.ledger = Ledger(default_rider_balance, subsidy_budget, subsidy_discount,
-                             now=clock.now)
+                             now=clock.now, pooling_budget=pooling_budget)
         self.hold_max = hold_max
         self.sweep_every = sweep_every
         self.policy_version = -1
