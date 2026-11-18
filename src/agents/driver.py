@@ -249,6 +249,7 @@ class SettlementReceiver(CyclicBehaviour):
             return
         if isinstance(s, Settlement) and self.agent.payment_jid and bare(msg.sender) == self.agent.payment_jid:
             self.agent.payouts.append(s)
+            self.agent.payout_times.append(clock.now())
 
 
 class ReputationReceiver(CyclicBehaviour):
@@ -386,6 +387,10 @@ class DriverAgent(BaseAgent):
         self.offers: Dict[str, Offer] = {}
         self.assignment: Optional[Assignment] = None
         self.payouts: List[Settlement] = []
+        self.payout_times: List[float] = []           # sim time each payout arrived (aligned with payouts), for the metrics
+        self.odo_m = {"loaded": 0.0, "pickup": 0.0, "other": 0.0}      # metres driven, by what the vehicle was doing
+        self.odo_s = {"loaded": 0.0, "pickup": 0.0, "other": 0.0}      # seconds driven, same split
+        self.trip_log: Dict[str, dict] = {}           # pool id -> pickup/loaded metres and seconds, and when it ended
         self.completed: List[str] = []                # pool ids
         self.status_log: List[DriverStatus] = []
         self.last_status_at = -math.inf
@@ -726,10 +731,26 @@ class DriverAgent(BaseAgent):
                 if dt is None:
                     break                                   # road closed: re-plan from here
                 await clock.sim_sleep(dt)
+                self.record_hop(self.location, nxt, dt, a)
                 self.location = nxt
                 self.broadcast_viz()
             if a.cancelled:
                 raise _TripCancelled()
+
+    def record_hop(self, frm: str, to: str, seconds: float, a: Assignment) -> None:
+        """Odometer for the metrics: what this hop was (loaded / on the way to a pickup / anything else) and how long."""
+        kind = {"on_trip": "loaded", "to_pickup": "pickup"}.get(self.activity, "other")
+        try:
+            metres = float(self.network.g[frm][to].get("length", 0.0))
+        except (KeyError, AttributeError):
+            metres = 0.0
+        self.odo_m[kind] += metres
+        self.odo_s[kind] += seconds
+        if a is not None and a.match is not None and kind != "other":
+            row = self.trip_log.setdefault(a.match.pool_id, {"pickup_m": 0.0, "loaded_m": 0.0, "pickup_s": 0.0,
+                                                             "loaded_s": 0.0, "done": None})
+            row[kind + "_m"] += metres
+            row[kind + "_s"] += seconds
 
     async def run_trip(self, beh, a: Assignment) -> None:
         pool, cfp = a.match.pool_id, a.offer.cfp
@@ -814,6 +835,7 @@ class DriverAgent(BaseAgent):
         self.lock.finish(pool, clock.now())
         self.offers.pop(pool, None)
         self.completed.append(pool)
+        self.trip_log.setdefault(pool, {"pickup_m": 0.0, "loaded_m": 0.0, "pickup_s": 0.0, "loaded_s": 0.0})["done"] = clock.now()
         self.finished_trips[pool] = a
         self.log(f"{pool} completed, idle at {self.location}")
         self.return_after_trip()

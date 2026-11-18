@@ -33,6 +33,7 @@ from common.graph import TransitNetwork
 from common.ws_server import start_ws_server
 from harness.active import clear_active, write_active
 from harness.ping import PingResult, format_results, ping_agents
+from harness.live_metrics import MetricsCollector
 from harness.runner import ScenarioRunner, report
 from protocols.reposition import RepositionRules
 from harness.scenario import DEFAULT_SCENARIO, AgentSpec, Scenario, ScenarioError
@@ -57,6 +58,7 @@ class Harness:
         self._server: Optional[asyncio.subprocess.Process] = None
         self._server_dir: Optional[str] = None
         self._ws_server = None
+        self.metrics: Optional[MetricsCollector] = None  # live metrics for the viewer (harness/live_metrics.py)
         self.runner: Optional[ScenarioRunner] = None    # plays the scenario's demand / events / forecasts
 
     # ---- XMPP server -----------------------------------------------------------------
@@ -165,9 +167,13 @@ class Harness:
         if sc.demand or sc.events or sc.forecasts:
             self.runner = ScenarioRunner(self)
             self.runner.start()
+        self.metrics = MetricsCollector(self)
+        self.metrics.start()
         logger.info("Scenario %r up: %d agents", sc.name, len(self.agents))
 
     async def stop(self) -> None:
+        if self.metrics is not None:
+            await self.metrics.stop()
         if self.runner is not None:
             await self.runner.stop()
         for jid in reversed(list(self.agents)):

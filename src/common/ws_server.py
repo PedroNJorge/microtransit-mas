@@ -9,7 +9,7 @@ CONNECTED_CLIENTS: set = set()
 # Last known state of things that last for a while, replayed to every browser that connects
 # (so a map opened or refreshed mid-simulation still shows the blocked streets).
 # kind -> {key -> payload}; filled by broadcast_event.
-_STATE: dict = {"ROAD_BLOCKED": {}, "HUB_DOWN": {}, "TRAFFIC_LEVEL": {}, "FORECAST": {}, "REPOSITION": {}}
+_STATE: dict = {"ROAD_BLOCKED": {}, "HUB_DOWN": {}, "TRAFFIC_LEVEL": {}, "FORECAST": {}, "REPOSITION": {}, "METRICS": {}}
 
 
 def _snapshot_messages() -> list:
@@ -66,6 +66,8 @@ async def broadcast_event(event_type: str, data: dict):
         _STATE.setdefault("REPOSITION", {})[data["id"]] = data
     elif event_type == "REPOSITION_DONE":
         _STATE.setdefault("REPOSITION", {}).pop(data["id"], None)
+    elif event_type == "METRICS":                       # the whole history, so a viewer opened mid-run draws full charts
+        _STATE.setdefault("METRICS", {})[str(data.get("t"))] = data
     elif event_type == "HUB_DOWN":
         _STATE.setdefault("HUB_DOWN", {})[data["hub_id"]] = data
     elif event_type == "HUB_UP":

@@ -265,6 +265,17 @@ def report(h) -> str:
                      + (f", {shared_riders / len(pools):.1f} riders each" if pools else "") + ")")
         lines.append(f"vehicle distance, loaded leg: {shared:.1f} km shared vs {alone:.1f} km if everyone rode alone: "
                      f"{alone - shared:.1f} km saved, {(alone - shared) * g / 1000:.2f} kg CO2 ({g:.0f} g/km)")
+    mc = getattr(h, "metrics", None)
+    if mc is not None:
+        c = mc.snapshot()["cum"]
+        if c.get("co2_saved_all_kg") is not None:
+            lines.append(f"CO2 saved: {c['co2_saved_loaded_kg']:.2f} kg on the loaded leg (what the incentive pays on), "
+                         f"{c['co2_saved_all_kg']:.2f} kg counting pickup legs too ({100 * (c['co2_saved_all_pct'] or 0):.1f}% "
+                         f"of what the same trips would drive alone)")
+        if c.get("profit_per_trip") is not None:
+            lines.append(f"drivers: revenue {c['revenue_per_trip']:.2f} EUR and profit {c['profit_per_trip']:.2f} EUR per trip; "
+                         f"deadhead {100 * (c['deadhead_share'] or 0):.0f}% of km; earnings Gini "
+                         f"{(c['gini'] if c['gini'] is not None else float('nan')):.2f}")
     joined = sum(len(a.late_joined) for a in h.agents.values() if a.role == "microhub")
     if joined:
         lines.append(f"late joins: {joined} rider(s) joined a pool whose driver was still on the way to the hub")
