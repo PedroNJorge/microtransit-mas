@@ -45,6 +45,7 @@ class Protocol:
     MATCH_AUCTION = "MatchAuctionProtocol"          # FIPA contract-net
     TRIP_EXECUTION = "TripExecutionProtocol"
     REPOSITION = "RepositionProtocol"
+    DRIVER_BRAIN = "DriverBrainProtocol"           # Driver <-> its BDI layer (percepts / cruise commands)
     DRIVER_STATUS = "DriverStatusProtocol"
     CANCELLATION = "CancellationProtocol"
     DRIVER_FAILURE = "DriverFailureProtocol"
@@ -266,6 +267,9 @@ class CFP:
     # JID of each rider, aligned with rider_destinations AND with the key order of
     # rider_time_windows (request ids). The winning driver needs them to run the trip.
     rider_jids: List[str] = field(default_factory=list)
+    # Drop-off order planned by the hub (pool formation, M9); the driver prices exactly this order.
+    # Empty -> the driver plans its own.
+    stop_order: List[str] = field(default_factory=list)
 
 
 @concept
@@ -338,6 +342,9 @@ class TripCompleted:
     # auction, so it holds an upper bound; Payment charges THIS and returns the rest.
     # Empty -> charge each rider's full held amount.
     rider_fares: Dict[str, float] = field(default_factory=dict)
+    # Posted SOLO reference fare per rider (hub -> Payment only); Payment reports the pooling
+    # discount = solo - charged in each Settlement. Empty -> no discount reported.
+    solo_fares: Dict[str, float] = field(default_factory=dict)
 
 
 # TripExecutionProtocol: per-rider granularity (pooled riders board/alight separately).
@@ -401,6 +408,59 @@ class RepositionRequest:
     incentive: float = 0.0
 
 
+@concept
+@dataclass
+class BrainPercept:
+    """Driver -> its BDI brain: what the driver perceives right now (replaces the previous percept)."""
+    driver_id: str
+    state: str                          # idle | cruising | busy
+    location: str
+    at_hub: str                         # hub id while standing on a hub node, else ""
+    home: str                           # the hub where the shift started
+    hub_ids: List[str]                  # hubs the driver knows (heard a call from, or home)
+    etas: List[float]                   # seconds from `location` to each hub (inf -> -1)
+    pressures: List[float]              # requests per available driver observed around each hub
+    sent_at: float = 0.0
+
+    def __post_init__(self):
+        if not (len(self.hub_ids) == len(self.etas) == len(self.pressures)):
+            raise ValueError("hub_ids, etas and pressures must have the same length")
+
+
+@concept
+@dataclass
+class DemandSignal:
+    """Hub -> drivers that were NOT called for a pool (busy, or too far): 'a request is waiting here and
+    `callees` drivers were called'. Without it, a hub with no free driver nearby is invisible to the
+    drivers that could cover it (its calls go to nobody)."""
+    hub_id: str
+    pool_id: str
+    callees: float
+    sent_at: float = 0.0
+
+
+@concept
+@dataclass
+class CruiseCommand:
+    """Brain -> Driver: wait at this hub instead of where you are (self-directed repositioning)."""
+    driver_id: str
+    hub_id: str
+
+
+@concept
+@dataclass
+class BidPolicy:
+    """Brain -> Driver: price my bids at cost * (1 + markup) from now on. The markup is the driver's
+    opportunity cost: what it gives up by leaving where it is. Under the second-score rule a bid at the
+    driver's true (opportunity-adjusted) cost is still a dominant strategy (docs/auction_mechanism.md)."""
+    driver_id: str
+    markup: float
+
+    def __post_init__(self):
+        if not 0.0 <= self.markup <= 1.0:
+            raise ValueError("markup must lie in [0, 1]")
+
+
 # --- Financial -------------------------------------------------------------
 
 @concept
@@ -439,6 +499,7 @@ class Settlement:
     platform_fee: float = 0.0           # MVP: always 0. If non-zero it is recorded but not
                                         # disbursed (no Platform/Treasury agent yet).
     excess_returned: float = 0.0        # part of the hold not charged (held - fare), returned
+    pooling_discount: float = 0.0       # informational: reference solo fare - fare charged (>= 0)
 
 
 @concept

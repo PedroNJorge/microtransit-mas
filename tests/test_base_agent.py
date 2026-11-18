@@ -14,9 +14,9 @@ pytestmark = pytest.mark.integration
 
 
 def test_registry_covers_every_role():
-    assert set(AGENT_CLASSES) == {"rider", "driver", "microhub", "payment", "regulator",
-                                  "reputation", "environment"}
-    assert all(issubclass(c, BaseAgent) for c in AGENT_CLASSES.values())
+    core = {"rider", "driver", "microhub", "payment", "regulator", "reputation", "environment"}
+    assert core <= set(AGENT_CLASSES) <= core | {"driver_brain"}      # the BDI brain is registered when spade_bdi is installed
+    assert all(issubclass(AGENT_CLASSES[r], BaseAgent) for r in core)
     assert all(c.role == name for name, c in AGENT_CLASSES.items())
 
 

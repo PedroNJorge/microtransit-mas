@@ -28,11 +28,11 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional
 
-from spade.behaviour import CyclicBehaviour
+from spade.behaviour import CyclicBehaviour, OneShotBehaviour
 
 from agents.base_agent import BaseAgent
 from common import clock
-from common.auction import AuctionRules
+from common.auction import AuctionRules, ceil_cents
 from common.policy import PolicyBook
 from common.messages import (
     make_auction_failed, make_inform, make_message, make_pool_proposal, make_reject_proposal, make_reply,
@@ -47,7 +47,13 @@ from common.settings import (
     AUCTION_PRICING, MAX_AUCTION_ATTEMPTS, T_AUCTION, T_AWARD, T_ESCROW, VALUE_OF_DETOUR,
     T_POOL_RESPONSE, T_REBALANCE, T_REPOSITION, T_STATUS, VALUE_OF_REPUTATION, VALUE_OF_TIME, WIDEN_DETOUR,
 )
+from common.pooling import GroupPlan, fare_ceiling, reference_solo_fare, split_fare_weighted
+from common.settings import (
+    DETOUR_WEIGHT, DRIVER_BASE_COST, DRIVER_COST_PER_SECOND, MAX_BATCH, MAX_POOL_SIZE, PICKUP_ALLOWANCE,
+    POOL_SOLVER, T_POOL,
+)
 from protocols.match_auction import AuctionContext, MATCHED, MatchAuctionFSM, RETRY
+from protocols.pool_formation import BatchWindow, QueuedRequest, handle_decline, window_closes_at
 from protocols.payment_common import bare
 from protocols.reposition import (
     ARRIVED, RepositionContext, RepositionFSM, RepositionPlan, RepositionPlanner, RepositionRules,
@@ -68,6 +74,9 @@ class PoolRecord:
     contexts: List[AuctionContext] = field(default_factory=list)
     no_shows: List[str] = field(default_factory=list)       # rider JIDs reported by the driver
     proposal_deadline: float = 0.0
+    plan: Optional[GroupPlan] = None                         # the group's exact plan (pooling, M9)
+    accepted: set = field(default_factory=set)               # request ids that accepted the proposal
+    times: Dict[str, float] = field(default_factory=dict)    # sim-time milestones: confirmed, queued, auction_start, matched
 
 
 class TripRequestReceiver(CyclicBehaviour):
@@ -89,6 +98,13 @@ class TripRequestReceiver(CyclicBehaviour):
             hub.log(f"request {req.request_id} refused: {problem}")
             await self.send(make_reply(msg, Perf.REFUSE, problem, Protocol.TRIP_REQUEST))
             return
+        if hub.batching and req.pooling_willingness:                    # wait for the batch window
+            hub.queue.append(QueuedRequest(req, sender, clock.now()))
+            hub.log(f"request {req.request_id} queued for pooling ({len(hub.queue)} waiting)")
+            await self.send(make_message(sender, Perf.AGREE, Protocol.TRIP_REQUEST, "queued", req.request_id))
+            await self.send(make_message(sender, Perf.INFORM, Protocol.TRIP_REQUEST,
+                                         f"request_queued:{hub.batch_estimate():.0f}", req.request_id))
+            return
         rec = hub.open_pool(req, sender)
         await self.send(make_message(sender, Perf.AGREE, Protocol.TRIP_REQUEST, rec.pool, req.request_id))
         await self.send(make_message(sender, Perf.INFORM, Protocol.TRIP_REQUEST,
@@ -102,31 +118,36 @@ class TripRequestReceiver(CyclicBehaviour):
 
 
 class PoolResponses(CyclicBehaviour):
-    """PoolFormationProtocol, hub side: accept / reject / silence (= reject after T_pool_response)."""
+    """PoolFormationProtocol, hub side: accept / reject / silence (= reject after T_pool_response).
+    A pool is confirmed only when EVERY rider accepted; otherwise see protocols.pool_formation."""
 
     async def run(self):
         hub = self.agent
         msg = await self.receive(timeout=1)
-        if msg is not None:
-            rec = hub.pools.get(msg.thread or "")
-            sender, perf = bare(msg.sender), msg.get_metadata("performative")
-            if rec is not None and rec.state == "PROPOSED" and sender in rec.rider_jids.values():
-                if perf == Perf.ACCEPT:
-                    hub.confirm_pool(rec)
-                    await self.send(make_inform(sender, Protocol.POOL_FORMATION, rec.pool, rec.pool.pool_id))
-                    if hub.payment_jid is None:
-                        hub.start_auction(rec)
-                elif perf == Perf.REJECT:
-                    hub.log(f"pool {rec.pool.pool_id} rejected by the rider ({msg.body})")
-                    await self.dissolve(rec, sender)
-        for rec in list(hub.pools.values()):
-            if rec.state == "PROPOSED" and clock.now() >= rec.proposal_deadline:
-                hub.log(f"pool {rec.pool.pool_id}: no answer to the proposal; dissolved")
-                await self.dissolve(rec, next(iter(rec.rider_jids.values())))
-
-    async def dissolve(self, rec: PoolRecord, rider: str):
-        rec.state, rec.pool.status = "DISSOLVED", PoolStatus.DISSOLVED
-        await self.send(make_inform(rider, Protocol.POOL_FORMATION, rec.pool, rec.pool.pool_id))
+        try:
+            if msg is not None:
+                rec = hub.pools.get(msg.thread or "")
+                sender, perf = bare(msg.sender), msg.get_metadata("performative")
+                rid = next((r for r, j in rec.rider_jids.items() if j == sender), None) if rec else None
+                if rec is not None and rec.state == "PROPOSED" and rid is not None:
+                    if perf == Perf.ACCEPT:
+                        rec.accepted.add(rid)
+                        if rec.accepted == set(rec.rider_jids):
+                            hub.confirm_pool(rec)
+                            for jid in rec.rider_jids.values():
+                                await self.send(make_inform(jid, Protocol.POOL_FORMATION, rec.pool, rec.pool.pool_id))
+                            if hub.payment_jid is None:
+                                hub.start_auction(rec)
+                    elif perf == Perf.REJECT:
+                        hub.log(f"pool {rec.pool.pool_id} rejected by {sender} ({msg.body})")
+                        await handle_decline(self, hub, rec, [rid])
+            for rec in list(hub.pools.values()):
+                if rec.state == "PROPOSED" and clock.now() >= rec.proposal_deadline:
+                    silent = [r for r in rec.rider_jids if r not in rec.accepted]
+                    hub.log(f"pool {rec.pool.pool_id}: no answer from {silent}; they are dropped")
+                    await handle_decline(self, hub, rec, silent)
+        except Exception:
+            logger.exception("%s: error handling a pool response", hub.jid)
 
 
 class EscrowWatcher(CyclicBehaviour):
@@ -237,7 +258,8 @@ class TripReports(CyclicBehaviour):
             await self.send(make_inform(
                 hub.payment_jid, Protocol.SETTLEMENT,
                 TripCompleted(rep.trip_id, rec.pool.pool_id, match.driver_id, riders, rep.completed_at,
-                              rep.distance_km, {r: match.rider_fares[r] for r in riders}),
+                              rep.distance_km, {r: match.rider_fares[r] for r in riders},
+                              hub.solo_fares(rec, riders)),
                 rec.pool.pool_id))
             await self.refund(rec, [j for j in rec.no_shows if j not in riders], FailureReason.RIDER_CANCELLED)
 
@@ -413,6 +435,19 @@ class LateBidHandler(CyclicBehaviour):
             sender, AuctionOutcome(msg.thread, False, None, FailureReason.TIMEOUT)))
 
 
+class _Wake(OneShotBehaviour):
+    """Re-checks the auction queue once a delayed retry is due."""
+
+    def __init__(self, delay: float):
+        super().__init__()
+        self.delay = delay
+
+    async def run(self):
+        await clock.sim_sleep(self.delay + 0.1)
+        self.agent._waking = False
+        self.agent._next_auction()
+
+
 class MicrohubAgent(BaseAgent):
     role = "microhub"
     subscribes_to_traffic = True
@@ -424,11 +459,16 @@ class MicrohubAgent(BaseAgent):
                  fare_cap: Optional[float] = None, t_status: float = T_STATUS,
                  reputation_jid: Optional[str] = None, propose_pools: bool = True,
                  t_pool_response: float = T_POOL_RESPONSE, regulator_jid: Optional[str] = None,
-                 audit_logs_available: bool = True,
                  reposition: Optional[RepositionRules] = None, t_rebalance: float = T_REBALANCE,
                  t_reposition: float = T_REPOSITION,
                  demand_fn: Optional[Callable[[StagingPoint, float], float]] = None,
-                 forecast_jids: Optional[List[str]] = None, **kwargs):
+                 forecast_jids: Optional[List[str]] = None,
+                 audit_logs_available: bool = True, t_pool: float = 0.0, max_pool_size: int = MAX_POOL_SIZE,
+                 max_batch: int = MAX_BATCH, solver: str = POOL_SOLVER, detour_weight: float = DETOUR_WEIGHT,
+                 solo_fallback: bool = True, reserve_margin: Optional[float] = None,
+                 pickup_allowance: float = PICKUP_ALLOWANCE, max_pickup_eta: Optional[float] = None,
+                 retry_delay: float = 0.0, window_slack: float = 0.0, broadcast_demand: bool = False,
+                 **kwargs):
         super().__init__(jid, password, **kwargs)
         self.hub_id = hub_id                  # node id in the road network (== MicrohubNode.id)
         self.driver_jids: List[str] = [bare(j) for j in (driver_jids or [])]
@@ -466,6 +506,16 @@ class MicrohubAgent(BaseAgent):
         self.reposition_log: List[RepositionContext] = []          # finished ones
         self.reposition_cooldown: Dict[str, float] = {}            # driver JID -> not before (sim t)
         self._reposition_seq = 0
+        # pool formation (M9): t_pool = 0 disables batching (every request is an immediate solo pool)
+        self.t_pool, self.max_pool_size, self.max_batch = t_pool, max_pool_size, max_batch
+        self.solver, self.detour_weight, self.solo_fallback = solver, detour_weight, solo_fallback
+        self.queue: List[QueuedRequest] = []
+        self.reserve_margin, self.pickup_allowance = reserve_margin, pickup_allowance
+        self.max_pickup_eta, self.retry_delay, self.window_slack = max_pickup_eta, retry_delay, window_slack
+        self._waking = False
+        self.broadcast_demand = broadcast_demand      # tell drivers that were not called about the request (BDI input)
+        self.auction_queue: List[tuple] = []
+        self.auction_running = False
 
     # ---- helpers used by behaviours -----------------------------------------------------
     def log(self, text: str) -> None:
@@ -478,16 +528,53 @@ class MicrohubAgent(BaseAgent):
     def reputation_of(self, driver_jid: str) -> Optional[float]:
         return self.reputations.get(bare(driver_jid))
 
-    def eligible_drivers(self, now: float) -> List[str]:
-        """CC-08: do not call drivers known to hold a lock or be busy. A driver with no (fresh)
-        status is still called; it refuses `locked` itself if it must (CC-09)."""
+    def eligible_drivers(self, now: float, attempt: int = 0) -> List[str]:
+        """CC-08: do not call drivers known to hold a lock or be busy, nor (if `max_pickup_eta` is
+        set) drivers too far from the hub to be useful; each retry widens that radius. A driver with
+        no (fresh) status is still called; it refuses `locked` itself if it must (CC-09)."""
         out = []
         for jid in self.driver_jids:
             entry = self.registry.get(jid)
-            if entry and now - entry[1] <= 3 * self.t_status and entry[0].state != DriverState.IDLE:
-                continue
+            if entry and now - entry[1] <= 3 * self.t_status:
+                if entry[0].state != DriverState.IDLE:
+                    continue
+                if self.max_pickup_eta is not None:
+                    eta = self.hub_eta(jid, self.hub_id, now)
+                    if eta is not None and eta > self.max_pickup_eta + attempt * 300.0:
+                        continue
             out.append(jid)
         return out
+
+    def retry_wait(self, ctx: AuctionContext) -> float:
+        """How long to wait before re-running a failed auction. Normally `retry_delay`; but if the
+        drivers refused because they were locked by ANOTHER hub's open auction (or none was free to
+        call), the lock lasts up to t_auction + t_award, so waiting less is pointless."""
+        if not self.retry_delay:
+            return 0.0
+        locked = sum(1 for r in ctx.refusals.values() if r == "locked")
+        if not ctx.recipients or locked >= max(1, len(ctx.recipients) // 2):
+            return max(self.retry_delay, self.t_auction + self.t_award)
+        return self.retry_delay
+
+    def tariff_reserve(self, reqs, stop_order, attempt: int) -> Optional[float]:
+        """Reserve from the posted tariff of the planned route instead of the riders' max fare, so a
+        lone bidder cannot be paid the riders' whole budget: margin x (base + rate x (route + pickup
+        allowance)). None when disabled. Each retry allows a longer pickup leg."""
+        if self.reserve_margin is None or self.network is None:
+            return None
+        try:
+            if stop_order:
+                routed = self.network.route_through([self.hub_id, *stop_order], clock.now())
+                route = routed[1] if routed else None
+            else:
+                planned = self.network.best_stop_order(self.hub_id, [r.destination_home for r in reqs], clock.now())
+                route = planned[1] if planned else None
+        except KeyError:
+            return None
+        if route is None:
+            return None
+        cost = DRIVER_BASE_COST + DRIVER_COST_PER_SECOND * (route + self.pickup_allowance * (1 + attempt))
+        return ceil_cents(self.reserve_margin * cost) / 100
 
     def hub_eta(self, driver_jid: str, pickup: str, now: float) -> Optional[float]:
         """CC-10: the hub's own ETA from the driver's last reported position; None if unknown."""
@@ -501,7 +588,7 @@ class MicrohubAgent(BaseAgent):
         return None if eta == float("inf") else eta
 
     def pool_of_request(self, request_id: str) -> Optional[PoolRecord]:
-        for rec in self.pools.values():
+        for rec in reversed(list(self.pools.values())):          # newest first: a re-pooled request has several
             if request_id in rec.rider_jids:
                 return rec
         return None
@@ -550,34 +637,111 @@ class MicrohubAgent(BaseAgent):
                                    matched, zone, ctx.match.driver_id if matched else ""))
         return AuditData(req.audit_id, self.hub_id, req.period_start, req.period_end, trips)
 
-    def batch_estimate(self) -> float:
-        """Seconds until the pool is proposed (no batching window yet: pools are single trips)."""
-        return 0.0
+    @property
+    def batching(self) -> bool:
+        return self.t_pool > 0 and self.propose_pools
 
-    def proposal_for(self, rec: PoolRecord, req: TripRequest) -> PoolProposal:
-        """What the rider is told before committing: the route, the fare CEILING (the reserve of
-        the auction, so the final fare can only be lower) and the expected wait."""
-        route, route_time = [self.hub_id, req.destination_home], 0.0
-        if self.network is not None:
+    def batch_estimate(self) -> float:
+        """Seconds until the batch window closes and pools are proposed."""
+        if not self.queue:
+            return 0.0
+        return max(0.0, window_closes_at(self.queue, self.t_pool) - clock.now())
+
+    def open_group(self, members: List[QueuedRequest], plan: GroupPlan) -> PoolRecord:
+        """A pool of one or more requests built by the solver."""
+        self._seq += 1
+        reqs = [q.req for q in sorted(members, key=lambda q: q.req.request_id)]
+        pool = Pool(f"{self.hub_id}-pool-{self._seq:04d}", self.hub_id, reqs, PoolStatus.LOCKED, clock.now())
+        rec = PoolRecord(pool, {q.req.request_id: q.sender for q in members},
+                         proposal_deadline=clock.now() + self.t_pool_response, plan=plan)
+        self.pools[pool.pool_id] = rec
+        self.log(f"{pool.pool_id}: {len(reqs)} rider(s), route {list(plan.stops)}, "
+                 f"detours {{{', '.join(f'{k}: {v:.0f}s' for k, v in sorted(plan.detour.items()))}}}")
+        return rec
+
+    def fare_weights(self, rec: PoolRecord) -> Dict[str, float]:
+        """Proportional split: each rider pays in proportion to its direct hub->home time."""
+        if rec.plan is None or len(rec.pool.requests) < 2:
+            return {}
+        return {rid: max(1.0, d) for rid, d in rec.plan.direct.items()}
+
+    def proposal_for(self, rec: PoolRecord, req: TripRequest, plan: Optional[GroupPlan] = None) -> PoolProposal:
+        """What the rider is told before committing: the shared route, the fare CEILING (the reserve
+        of the auction, so the final fare can only be lower), its detour and the expected wait."""
+        route, route_time, detour = [self.hub_id, req.destination_home], 0.0, 0.0
+        if plan is not None:
+            route, detour = list(plan.stops), plan.detour.get(req.request_id, 0.0)
+        elif self.network is not None:
             planned = self.network.best_stop_order(self.hub_id, [req.destination_home], clock.now())
             if planned:
                 route, route_time = planned
         etas = [e for e in (self.hub_eta(j, self.hub_id, clock.now()) for j in self.eligible_drivers(clock.now()))
                 if e is not None]
         wait = min(etas) if etas else 0.0
+        if plan is not None:
+            wait += max(0.0, plan.departure - clock.now())
         cap = self.current_fare_cap()
-        ceiling = req.max_fare if cap is None else min(req.max_fare, cap)
-        return PoolProposal(rec.pool.pool_id, req.request_id, route, ceiling, wait, 0.0)
+        weights = self.fare_weights(rec)
+        if weights:
+            total = fare_ceiling({r.request_id: r.max_fare for r in rec.pool.requests}, weights)
+            if cap is not None:
+                total = min(total, cap)
+            ceiling = split_fare_weighted(total, weights)[req.request_id]
+        else:
+            ceiling = req.max_fare if cap is None else min(req.max_fare, cap)
+        return PoolProposal(rec.pool.pool_id, req.request_id, route, ceiling, wait, detour)
+
+    def solo_fares(self, rec: PoolRecord, rider_jids: List[str]) -> Dict[str, float]:
+        """Reference solo fare of each rider of a POOLED trip (so Payment can show the pooling
+        discount). Empty for solo trips: there is nothing to compare with."""
+        if rec.plan is None or len(rec.pool.requests) < 2:
+            return {}
+        by_req = {r.request_id: r for r in rec.pool.requests}
+        return {rec.rider_jids[rid]: reference_solo_fare(rec.plan.direct[rid], DRIVER_BASE_COST,
+                                                         DRIVER_COST_PER_SECOND, by_req[rid].max_fare)
+                for rid in rec.rider_jids if rec.rider_jids[rid] in rider_jids}
 
     def confirm_pool(self, rec: PoolRecord) -> None:
         rec.state = "AWAITING_ESCROW"
+        rec.times.setdefault("confirmed", clock.now())
         rec.escrow_deadline = clock.now() + self.t_escrow
         rec.pool.status = PoolStatus.LOCKED
 
-    def start_auction(self, rec: PoolRecord, attempt: int = 0) -> None:
+    def start_auction(self, rec: PoolRecord, attempt: int = 0, delay: Optional[float] = None) -> None:
+        """Auctions run ONE AT A TIME per hub: two simultaneous auctions would call the same idle
+        drivers, and a driver holding a provisional lock for the first must refuse the second (CC-09),
+        starving it of bids. A retry goes to the front of the line, after `retry_delay` (so the locks
+        of the failed attempt have expired)."""
+        rec.state = "AUCTION_QUEUED"
+        rec.times.setdefault("queued", clock.now())          # first time only: retries are part of the auction phase
+        wait = (self.retry_delay if delay is None else delay) if attempt else 0.0
+        entry = (rec, attempt, clock.now() + wait)
+        if attempt:
+            self.auction_queue.insert(0, entry)
+        else:
+            self.auction_queue.append(entry)
+        self._next_auction()
+
+    def _next_auction(self) -> None:
+        if self.auction_running or not self.auction_queue:
+            return
+        now = clock.now()
+        ready = next((e for e in self.auction_queue if e[2] <= now), None)
+        if ready is None:                                   # only delayed retries: wake up when the first is due
+            if not self._waking:
+                self._waking = True
+                self.add_behaviour(_Wake(min(e[2] for e in self.auction_queue) - now))
+            return
+        self.auction_queue.remove(ready)
+        rec, attempt, _ = ready
+        rec.times.setdefault("auction_start", now)
+        self.auction_running = True
         rec.state = "AUCTIONING"
         rec.pool.status = PoolStatus.AUCTIONING
-        ctx = AuctionContext(rec.pool, dict(rec.rider_jids), list(rec.escrows.values()), attempt)
+        ctx = AuctionContext(rec.pool, dict(rec.rider_jids), list(rec.escrows.values()), attempt,
+                             weights=self.fare_weights(rec))
+        if rec.plan is not None:
+            ctx.stop_order, ctx.plan_detour = list(rec.plan.stops[1:]), max(rec.plan.detour.values(), default=0.0)
         rec.contexts.append(ctx)
         self.add_behaviour(MatchAuctionFSM(ctx),
                            make_template(Protocol.MATCH_AUCTION, thread=rec.pool.pool_id))
@@ -586,13 +750,16 @@ class MicrohubAgent(BaseAgent):
         """Called by the FSM's END state."""
         rec = self.pools[ctx.pool_id]
         self.finished.append(ctx)
+        self.auction_running = False
         if ctx.outcome == MATCHED:
             rec.state, rec.pool.status = "ASSIGNED", PoolStatus.ASSIGNED
+            rec.times["matched"] = clock.now()
             self.matches[ctx.pool_id] = ctx.match
         elif ctx.outcome == RETRY:
-            self.start_auction(rec, ctx.attempt + 1)
+            self.start_auction(rec, ctx.attempt + 1, self.retry_wait(ctx))
         else:
             rec.state, rec.pool.status = "UNMATCHED", PoolStatus.DISSOLVED
+        self._next_auction()
 
     # ---- repositioning (protocols/reposition.py) ------------------------------------------
     def record_forecast(self, fc: DemandForecast) -> bool:
@@ -693,6 +860,8 @@ class MicrohubAgent(BaseAgent):
         self.add_behaviour(TripRequestReceiver(),
                            make_template(Protocol.TRIP_REQUEST, Perf.REQUEST))
         self.add_behaviour(PoolResponses(), make_template(Protocol.POOL_FORMATION))
+        if self.batching:
+            self.add_behaviour(BatchWindow())
         self.add_behaviour(PolicyReceiver(), make_template(Protocol.POLICY, Perf.REQUEST))
         self.add_behaviour(AuditResponder(), make_template(Protocol.AUDIT))
         if self.reputation_jid:

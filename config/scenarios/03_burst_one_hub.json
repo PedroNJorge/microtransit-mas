@@ -11,12 +11,12 @@
   },
   "graph": "config/porto_graph.json",
   "hubs": "all",
-  "duration": 3600,
+  "duration": 14400,
   "drivers": {
     "count": 10
   },
   "riders": {
-    "count": 30
+    "count": 32
   },
   "demand": [
     {
@@ -27,7 +27,7 @@
       "count": 8,
       "pattern": "random",
       "max_fare": 25,
-      "pooling": 0.5
+      "pooling": 1.0
     },
     {
       "id": "burst",
@@ -39,7 +39,7 @@
       "count": 24,
       "pattern": "random",
       "max_fare": 25,
-      "pooling": 0.7
+      "pooling": 1.0
     }
   ],
   "environment": {

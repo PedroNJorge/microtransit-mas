@@ -40,7 +40,7 @@ from common import clock
 from common.messages import make_inform, make_message, make_request, make_template
 from common.ontology import (
     AuctionOutcome, DriverArriving, Escrow, Refund, EscrowRequest, FailureReason, MatchResult, Perf, Pool,
-    PoolProposal, Protocol, Rating, RiderBoarded, RiderDroppedOff, RiderReady, Settlement, TripRequest,
+    PoolProposal, Protocol, Rating, ReputationScore, RiderBoarded, RiderDroppedOff, RiderReady, Settlement, TripRequest,
     parse_payload,
 )
 from common.settings import READY_DELAY, T_POOL_RESPONSE, T_RIDER_PATIENCE
@@ -56,7 +56,7 @@ TRANSITIONS = {
     IDLE: {REQUESTING},
     REQUESTING: {AWAITING_POOL, IDLE},
     AWAITING_POOL: {DECIDING, IDLE},
-    DECIDING: {AWAITING_MATCH, IDLE},
+    DECIDING: {AWAITING_MATCH, AWAITING_POOL, IDLE},      # AWAITING_POOL again = re-pooled (a co-rider declined)
     AWAITING_MATCH: {DRIVER_EN_ROUTE, IDLE},
     DRIVER_EN_ROUTE: {IN_TRIP, IDLE},
     IN_TRIP: {RATING, IDLE},
@@ -104,6 +104,17 @@ class TripRecord:
         return (self.boarded_at - self.matched_at) - (self.match.pickup_eta - self.matched_at)
 
 
+def balanced_hub_policy(rng, spread: float = 1.6):
+    """Hub choice for riders who shop around: among the covering hubs within `spread` x the nearest
+    one's travel time, pick at random weighted by 1/time. A stand-in for choosing by the hubs' quotes
+    (wait, fare, queue), which would need a hub-quote protocol."""
+    def choose(candidates):                       # [(hub_id, seconds)], nearest first
+        best = candidates[0][1]
+        pool = [(h, t) for h, t in candidates if t <= spread * max(best, 1.0)]
+        return rng.choices([h for h, _ in pool], weights=[1.0 / max(t, 1.0) for _, t in pool])[0]
+    return choose
+
+
 def default_rating(trip: TripRecord, lateness_tolerance: float = 120.0) -> int:
     score = 5
     if trip.pickup_delay > lateness_tolerance:
@@ -144,7 +155,7 @@ class RiderAgent(BaseAgent):
                  t_pool_response: float = T_POOL_RESPONSE, patience: float = T_RIDER_PATIENCE,
                  ready_delay: float = READY_DELAY, no_show: bool = False, auto_escrow: bool = True,
                  auto_request_interval: Optional[float] = None, auto_request_max_fare: float = 100.0,
-                 **kwargs):
+                 hub_policy: Optional[Callable] = None, **kwargs):
         super().__init__(jid, password, **kwargs)
         self.hubs: Dict[str, str] = {h: bare(j) for h, j in (hub_jids or {}).items()}   # hub node id -> JID
         self.network = network
@@ -162,6 +173,7 @@ class RiderAgent(BaseAgent):
         self._auto_destinations: List[str] = []
         self._auto_destination_index = 0
         self._last_auto_destination: Optional[str] = None
+        self.hub_policy = hub_policy                   # None = the nearest covering hub
         self.state = IDLE
         self.trip: Optional[TripRecord] = None
         self.trips: List[TripRecord] = []
@@ -169,11 +181,12 @@ class RiderAgent(BaseAgent):
         self.ended = asyncio.Event()                   # set each time a trip returns to IDLE
         self._deadline = float("inf")
         self._outbox: List = []
+        self.reputation_score: Optional[ReputationScore] = None   # newest score published about this rider
 
     async def setup(self):
         await super().setup()
         for proto in (Protocol.TRIP_REQUEST, Protocol.POOL_FORMATION, Protocol.ESCROW,
-                      Protocol.MATCH_AUCTION, Protocol.TRIP_EXECUTION, Protocol.SETTLEMENT, Protocol.REFUND):
+                      Protocol.MATCH_AUCTION, Protocol.TRIP_EXECUTION, Protocol.SETTLEMENT, Protocol.REFUND, Protocol.REPUTATION):
             self.add_behaviour(RiderListener(), make_template(proto))
         if self.auto_request_interval is not None:
             if self.network is None:
@@ -194,17 +207,16 @@ class RiderAgent(BaseAgent):
         hub_node = t.hub_jid.split("@")[0] if (t and t.hub_jid) else ""
         node = node_override or hub_node
         destination = dest_override or (t.request.destination_home if t else "")
-        coro = broadcast_event("RIDER_UPDATE", {
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:                          # no event loop (a unit test): nothing to broadcast to
+            return
+        loop.create_task(broadcast_event("RIDER_UPDATE", {
             "id": self.jid.user,
             "state": self.state,
             "node": node,
             "destination": destination,
-        })
-        try:
-            loop = asyncio.get_running_loop()
-            loop.create_task(coro)
-        except RuntimeError:
-            pass
+        }))
 
     # ---- state machine ---------------------------------------------------------------------
     @property
@@ -242,10 +254,12 @@ class RiderAgent(BaseAgent):
         """Nearest hub (by coverage) that covers the destination, among the hubs this rider knows."""
         if self.network is None:
             return next(iter(self.hubs), None)
-        for hid in self.network.hubs_covering(destination, clock.now()):
-            if hid in self.hubs:
-                return hid
-        return None
+        covering = [h for h in self.network.hubs_covering(destination, clock.now()) if h in self.hubs]
+        if not covering:
+            return None
+        if self.hub_policy is None or len(covering) == 1:
+            return covering[0]
+        return self.hub_policy([(h, self.network.travel_time(h, destination, clock.now())) for h in covering])
 
     # ---- TripRequestProtocol (initiator) ----------------------------------------------------
     def request_trip(self, destination: str, max_fare: float, window: float = 3600.0,
@@ -283,7 +297,7 @@ class RiderAgent(BaseAgent):
                 continue
             if not any(hub in self.hubs for hub in self.network.hubs_covering(destination, now)):
                 continue
-            request = self.request_trip(destination, self.auto_request_max_fare)
+            request = self.request_trip(destination, self.auto_request_max_fare, pooling_willingness=True)
             self._auto_destination_index = (index + 1) % len(self._auto_destinations)
             if request is not None:
                 self._last_auto_destination = destination
@@ -294,6 +308,14 @@ class RiderAgent(BaseAgent):
     async def on_message(self, beh, msg) -> None:
         t = self.trip
         proto, perf, sender = msg.get_metadata("protocol"), msg.get_metadata("performative"), bare(msg.sender)
+        if proto == Protocol.REPUTATION:                                   # the reputation agent's published score
+            try:
+                score = parse_payload(msg, strict=True)
+                if isinstance(score, ReputationScore) and (not self.reputation_jid or sender == self.reputation_jid):
+                    self.reputation_score = score
+            except (ValueError, TypeError):
+                logger.info("[%s] ignored malformed reputation score", self.jid.user)
+            return
         if proto == Protocol.REFUND:                                       # likewise: after the trip has ended
             try:
                 back = parse_payload(msg, strict=True)
@@ -332,9 +354,10 @@ class RiderAgent(BaseAgent):
     async def on_trip_request(self, beh, t, sender, perf, payload, msg):
         if sender != t.hub_jid:
             return
-        if perf == Perf.AGREE and isinstance(payload, Pool) and self.state == REQUESTING:
-            t.pool_id = payload.pool_id
-            self.go(AWAITING_POOL, "agreed")
+        if perf == Perf.AGREE and self.state == REQUESTING:
+            if isinstance(payload, Pool):                      # immediate (solo) pool
+                t.pool_id = payload.pool_id
+            self.go(AWAITING_POOL, "agreed" if t.pool_id else "queued for pooling")   # else: pool id comes with the proposal
         elif perf == Perf.REFUSE and self.state == REQUESTING:
             self.end_trip(REFUSED, msg.body or "")
         # inform(request_queued ...) is informational
@@ -342,10 +365,10 @@ class RiderAgent(BaseAgent):
     async def on_pool(self, beh, t, sender, perf, payload):
         if sender != t.hub_jid:
             return
-        if perf == Perf.PROPOSE and isinstance(payload, PoolProposal) and payload.pool_id == t.pool_id \
-                and self.state == AWAITING_POOL:
+        if perf == Perf.PROPOSE and isinstance(payload, PoolProposal) and self.state == AWAITING_POOL \
+                and payload.request_id == t.request.request_id and t.pool_id in ("", payload.pool_id):
             self.go(DECIDING, "proposal received")
-            t.proposal = payload
+            t.pool_id, t.proposal = payload.pool_id, payload
             reason = self.evaluate_pool(t, payload)
             if reason:
                 await beh.send(make_message(t.hub_jid, Perf.REJECT, Protocol.POOL_FORMATION, reason, t.pool_id))
@@ -354,12 +377,17 @@ class RiderAgent(BaseAgent):
                 await beh.send(make_message(t.hub_jid, Perf.ACCEPT, Protocol.POOL_FORMATION, None, t.pool_id))
                 self._deadline = clock.now() + self.patience
         elif perf == Perf.INFORM and isinstance(payload, Pool) and payload.pool_id == t.pool_id \
-                and payload.status.value != "DISSOLVED" and self.state == DECIDING:   # pool_confirmed
+                and payload.status.value not in ("DISSOLVED", "FORMING") and self.state == DECIDING:   # pool_confirmed
             self.go(AWAITING_MATCH, "pool confirmed")
             if self.payment_jid and self.auto_escrow:
                 esc = EscrowRequest(t.request.request_id, self.me, t.pool_id, t.request.max_fare,
                                     t.request.subsidy_eligibility, t.hub_jid)
                 await beh.send(make_request(self.payment_jid, Protocol.ESCROW, esc, t.request.request_id))
+        elif perf == Perf.INFORM and isinstance(payload, Pool) and payload.status.value == "FORMING" \
+                and payload.pool_id == t.pool_id and self.state == DECIDING:       # a co-rider left: back to the queue
+            t.pool_id, t.proposal = "", None
+            self.go(AWAITING_POOL, "re-pooling")
+            self._deadline = clock.now() + self.patience
         elif perf == Perf.INFORM and msg_is_dissolved(payload) and self.state in (AWAITING_POOL, DECIDING):
             self.end_trip(DISSOLVED, "pool dissolved")
 

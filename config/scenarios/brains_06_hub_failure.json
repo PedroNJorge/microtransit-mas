@@ -1,0 +1,55 @@
+{
+  "name": "06-hub-failure-brains",
+  "xmpp": {
+    "host": "localhost",
+    "port": 5222,
+    "server_port": 5269,
+    "password": "dev-password"
+  },
+  "clock": {
+    "speed": 60
+  },
+  "graph": "config/porto_graph.json",
+  "hubs": "all",
+  "duration": 14400,
+  "drivers": {
+    "count": 10,
+    "brains": true
+  },
+  "riders": {
+    "count": 24
+  },
+  "demand": [
+    {
+      "id": "steady",
+      "hubs": "all",
+      "start": 0,
+      "end": 3000,
+      "count": 24,
+      "pattern": "random",
+      "max_fare": 25,
+      "pooling": 1.0
+    }
+  ],
+  "events": [
+    {
+      "id": "hub-crash",
+      "at": 600,
+      "type": "kill_hub",
+      "hub": {
+        "centre": 1
+      }
+    }
+  ],
+  "environment": {
+    "t_traffic": 60,
+    "full_every": 10
+  },
+  "seed": 42,
+  "payment": {
+    "rider_balance": 100.0,
+    "subsidy_discount": 0.5,
+    "subsidy_budget": null,
+    "hold_max": 7200
+  }
+}

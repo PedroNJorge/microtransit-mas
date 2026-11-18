@@ -28,10 +28,13 @@ from typing import Dict, List, Optional, Sequence
 from agents.base_agent import BaseAgent
 from agents.registry import AGENT_CLASSES
 from common import clock
+from common.settings import MAX_PICKUP_ETA, RESERVE_MARGIN, RETRY_DELAY, WINDOW_SLACK
 from common.graph import TransitNetwork
 from common.ws_server import start_ws_server
 from harness.active import clear_active, write_active
 from harness.ping import PingResult, format_results, ping_agents
+from harness.runner import ScenarioRunner, report
+from protocols.reposition import RepositionRules
 from harness.scenario import DEFAULT_SCENARIO, AgentSpec, Scenario, ScenarioError
 
 logger = logging.getLogger(__name__)
@@ -54,6 +57,7 @@ class Harness:
         self._server: Optional[asyncio.subprocess.Process] = None
         self._server_dir: Optional[str] = None
         self._ws_server = None
+        self.runner: Optional[ScenarioRunner] = None    # plays the scenario's demand / events / forecasts
 
     # ---- XMPP server -----------------------------------------------------------------
     async def ensure_server(self, wait: float = 20.0) -> None:
@@ -116,16 +120,27 @@ class Harness:
         if spec.role == "rider":
             kwargs.update(network=self.network, payment_jid=sc.jid("payment"),
                           reputation_jid=sc.jid("reputation"), hub_jids={x.name: x.jid for x in hubs})
+            if sc.patient:
+                kwargs["patience"] = 1e9                 # waits for a driver as long as it takes
         if spec.role == "reputation":
             kwargs.update(hub_jids=[x.jid for x in hubs], payment_jid=sc.jid("payment"))
         if spec.role == "driver":
             kwargs.update(network=self.network, payment_jid=sc.jid("payment"),
                           regulator_jid=sc.jid("regulator"), reputation_jid=sc.jid("reputation"),
                           hub_jids=[s.jid for s in sc.roster() if s.role == "microhub"])
+        if spec.role == "microhub" and sc.reposition is not None:     # "reposition": {...} switches the heuristic on
+            opts = dict(sc.reposition)
+            hub_opts = {k: opts.pop(k) for k in ("t_rebalance", "t_reposition") if k in opts}
+            if "max_moves" in opts:
+                opts["max_moves"] = int(opts["max_moves"])
+            kwargs.update(reposition=RepositionRules(**opts), **hub_opts)
         if spec.role == "microhub":
             kwargs.update(
+                t_pool=sc.t_pool, **market_settings(sc),
                 network=self.network, payment_jid=sc.jid("payment"), reputation_jid=sc.jid("reputation"),
                 regulator_jid=sc.jid("regulator"), driver_jids=[s.jid for s in sc.roster() if s.role == "driver"])
+        if spec.role not in AGENT_CLASSES:
+            raise RuntimeError(f"agent role {spec.role!r} is not available (the BDI brain needs `uv add spade_bdi`)")
         return AGENT_CLASSES[spec.role](spec.jid, sc.xmpp.password, port=sc.xmpp.port, **kwargs)
 
     async def start(self) -> None:
@@ -142,9 +157,14 @@ class Harness:
         except BaseException:
             await self.stop()
             raise
+        if sc.demand or sc.events or sc.forecasts:
+            self.runner = ScenarioRunner(self)
+            self.runner.start()
         logger.info("Scenario %r up: %d agents", sc.name, len(self.agents))
 
     async def stop(self) -> None:
+        if self.runner is not None:
+            await self.runner.stop()
         for jid in reversed(list(self.agents)):
             try:
                 await self.agents[jid].stop()
@@ -176,8 +196,37 @@ def roster_table(scenario: Scenario) -> str:
                      + " ".join(f"{k}={v}" for k, v in s.kwargs.items()) for s in rows)
 
 
+def market_settings(sc: Scenario) -> dict:
+    """Hub settings of the demo's 'market fixes': without them a hub never retries a failed auction, calls
+    drivers of any distance and prices against the riders' cap. The windows are in sim seconds, so at clock
+    x60 they are short in real time: 30 sim s would be 0.5 real s, too little for XMPP latency. The escrow
+    window is generous because every hub waits on the one Payment agent; a slow machine hit it and dissolved
+    pools with reason TIMEOUT."""
+    if sc.legacy_market:
+        return {}
+    return dict(reserve_margin=RESERVE_MARGIN, max_pickup_eta=MAX_PICKUP_ETA, retry_delay=RETRY_DELAY,
+                window_slack=WINDOW_SLACK, max_attempts=1000 if sc.patient else 4,
+                t_auction=60.0, t_award=40.0, t_escrow=300.0)
+
+
+async def _until_done(h, stop: asyncio.Event) -> None:
+    """Wait for Ctrl-C or, when the scenario issues demand, until it has all been issued and every rider is
+    home (no trip in progress). The caller's timeout (the scenario's duration) is the safety cap."""
+    while not stop.is_set():
+        r = h.runner
+        if r is not None and r.sc.demand and r.finished():
+            if all(a.trip is None for a in h.agents.values() if a.role == "rider"):
+                print("Every rider is home.")
+                return
+        try:
+            await asyncio.wait_for(stop.wait(), 1.0)
+        except asyncio.TimeoutError:
+            pass
+
+
 async def run(scenario: Scenario, check: bool, run_for: Optional[float], start_server: bool,
               timeout: float) -> int:
+    summary = None
     async with Harness(scenario, start_server=start_server) as h:
         if scenario.source is not None and not check:
             write_active(scenario.source)               # lets `harness.ping` find this scenario
@@ -197,12 +246,20 @@ async def run(scenario: Scenario, check: bool, run_for: Optional[float], start_s
             except NotImplementedError:                 # Windows: fall back to KeyboardInterrupt
                 pass
         print("\nRunning. Ping with:  python -m harness.ping --all     Stop with Ctrl-C.")
+        if run_for is None and scenario.duration:         # the scenario says how long it lasts (sim seconds)
+            run_for = clock.to_real(scenario.duration)
         try:
-            await asyncio.wait_for(stop.wait(), run_for)
+            await asyncio.wait_for(_until_done(h, stop), run_for)
         except asyncio.TimeoutError:
             pass
         print("Stopping...")
+        if h.runner is not None:
+            summary = report(h)                         # computed now, printed after the agents have stopped
+        # agents stopping one by one still get each other's status messages: harmless, but very noisy
+        logging.getLogger("spade.Agent").setLevel(logging.ERROR)
         clear_active()
+    if summary:
+        print(summary)
     return 0
 
 

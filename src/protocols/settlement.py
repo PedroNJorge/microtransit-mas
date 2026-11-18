@@ -24,7 +24,7 @@ from typing import List
 
 from spade.message import Message
 
-from common.ledger import LedgerError, money
+from common.ledger import LedgerError, cents, money
 from common.messages import make_inform, make_message
 from common.ontology import Perf, Protocol, Settlement, SettlementComplete, TripCompleted
 from protocols.base import ServerFSM
@@ -41,6 +41,7 @@ def handle_settlement(agent, msg: Message) -> List[Message]:
     driver = agent.account(tc.driver_id)
     riders = [agent.account(r) for r in tc.rider_ids]
     fares = {agent.account(r): f for r, f in tc.rider_fares.items()} or None
+    solo = {agent.account(r): f for r, f in tc.solo_fares.items()}
     try:
         outcome = agent.ledger.settle(tc.pool_id, driver, riders, fares, sender)
     except LedgerError as e:
@@ -58,8 +59,9 @@ def handle_settlement(agent, msg: Message) -> List[Message]:
     else:
         agent.stats["settlements"] += 1
         for line in outcome.lines:
+            discount_c = max(0, cents(solo[line.rider]) - line.payout_c) if line.rider in solo else 0
             s = Settlement(line.escrow_id, driver, money(line.payout_c), money(line.subsidy_c),
-                           0.0, money(line.excess_c))
+                           0.0, money(line.excess_c), money(discount_c))
             out.append(make_inform(driver, Protocol.SETTLEMENT, s, thread))
             out.append(make_inform(line.rider, Protocol.SETTLEMENT, s, thread))
     out.append(make_inform(sender, Protocol.SETTLEMENT, complete, thread))

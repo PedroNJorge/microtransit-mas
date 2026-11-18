@@ -11,6 +11,18 @@ resolution-markers = [
 ]
 
 [[package]]
+name = "agentspeak"
+version = "0.2.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "colorama" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/d0/a3/f8e9292cfd47aa5558f4578c498ca12c068a3a1d60ddfd0af13a87c1e47a/agentspeak-0.2.2.tar.gz", hash = "sha256:7c7fcf689fd54460597be1798ce11535f42a60c3d79af59381af3e13ef7a41bb", size = 59628, upload-time = "2024-03-21T11:55:39.026Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/03/b5/e95cbd9d9e999ac8dc4e0bb7a940112a2751cf98880b4ff0626e53d14249/agentspeak-0.2.2-py3-none-any.whl", hash = "sha256:9b454bc0adf63cb0d73fb4a3a9a489e7d892d5fbf17f750de532670736c0c4dd", size = 61628, upload-time = "2024-03-21T11:55:36.741Z" },
+]
+
+[[package]]
 name = "aiodns"
 version = "4.0.4"
 source = { registry = "https://pypi.org/simple" }
@@ -1403,6 +1415,7 @@ dependencies = [
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "spade" },
+    { name = "spade-bdi" },
     { name = "sqlalchemy", extra = ["asyncio"] },
     { name = "websockets" },
 ]
@@ -1419,6 +1432,7 @@ requires-dist = [
     { name = "pytest", specifier = ">=9.2.0" },
     { name = "pytest-asyncio", specifier = ">=1.4.1.post1" },
     { name = "spade", specifier = ">=4.1.4" },
+    { name = "spade-bdi", specifier = ">=0.3.3" },
     { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.1.8" },
     { name = "websockets", specifier = ">=17.4" },
 ]
@@ -2568,6 +2582,20 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/c7/ee/bb57df48afbbed01522629c380aa366e41503e3f2680ef416a320921235b/spade-4.1.4.tar.gz", hash = "sha256:9fefa9ec4a566c74932b5c16d85af36dc9840d1f29dbd2cf2f59333e56fc92da", size = 491060, upload-time = "2026-05-26T08:38:08.775Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/e5/9f/4ed71298d67f95360e43096c9c30a62e01ae11e99ba40bad53bf797f5b6f/spade-4.1.4-py2.py3-none-any.whl", hash = "sha256:79a08b52ee4b3b7fdf285b0abad2a9788066a3922b1ba67bd29102b766e3ee5d", size = 44787, upload-time = "2026-05-26T08:38:06.711Z" },
+]
+
+[[package]]
+name = "spade-bdi"
+version = "0.3.3"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "agentspeak" },
+    { name = "loguru" },
+    { name = "spade" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/82/72/f9606b55579fcdbd1e6ff3cf07b67879a101ee531fe452eacfdee9ba6af1/spade_bdi-0.3.3.tar.gz", hash = "sha256:e87cd63658cec64f6812a10d19050c93b3dc1e9f47b3f5d0d56995f062e63ee6", size = 23090, upload-time = "2026-07-28T07:58:23.868Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/71/5c/5adbc56284ce4ec51f261fffc3f357afc5d9c80165fd3a9273269b23a911/spade_bdi-0.3.3-py3-none-any.whl", hash = "sha256:f82940edd3dd093cfd0e08fae3fafd5510af7c9673a66394ee8fb7e6b4035a04", size = 8539, upload-time = "2026-07-28T07:58:22.675Z" },
 ]
 
 [[package]]

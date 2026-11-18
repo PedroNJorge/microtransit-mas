@@ -235,6 +235,10 @@ class ScenarioRunner:
             t.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
 
+    def finished(self) -> bool:
+        """Every demand stream has issued its requests and every event/forecast has played out."""
+        return bool(self._tasks) and all(t.done() for t in self._tasks)
+
     def errors(self) -> List[BaseException]:
         return [t.exception() for t in self._tasks if t.done() and not t.cancelled() and t.exception()]
 
@@ -247,6 +251,12 @@ def report(h) -> str:
     busy = sum(1 for r in riders if r.trip is not None)
     lines = [f"riders: {sum(out.values())} trips ended " + ", ".join(f"{k}={v}" for k, v in sorted(out.items()))
              + (f"; {busy} still in progress" if busy else "")]
+    run = getattr(h, "runner", None)
+    if run is not None and (run.summary.issued or run.summary.skipped):
+        lines.append(f"demand: {run.summary.issued} requests issued, {run.summary.skipped} skipped (no idle rider)")
+    why = Counter(t.reason or "?" for r in riders for t in r.trips if t.outcome not in ("completed",))
+    if why:
+        lines.append("not completed, by reason: " + ", ".join(f"{k}={v}" for k, v in sorted(why.items())))
     waits = [t.boarded_at - t.requested_at for r in riders for t in r.trips if t.outcome == "completed"]
     if waits:
         lines.append(f"wait request -> boarding (completed trips): mean {sum(waits) / len(waits):.0f}s, "

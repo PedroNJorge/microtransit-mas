@@ -1,0 +1,68 @@
+{
+  "name": "02-heavy-traffic-brains",
+  "xmpp": {
+    "host": "localhost",
+    "port": 5222,
+    "server_port": 5269,
+    "password": "dev-password"
+  },
+  "clock": {
+    "speed": 60
+  },
+  "graph": "config/porto_graph.json",
+  "hubs": "all",
+  "duration": 14400,
+  "drivers": {
+    "count": 8,
+    "brains": true
+  },
+  "riders": {
+    "count": 20
+  },
+  "demand": [
+    {
+      "id": "steady",
+      "hubs": "all",
+      "start": 0,
+      "end": 3300,
+      "count": 20,
+      "pattern": "random",
+      "max_fare": 25,
+      "pooling": 1.0
+    }
+  ],
+  "events": [
+    {
+      "id": "rush-hour",
+      "at": 900,
+      "type": "traffic",
+      "duration": 1800,
+      "where": "all",
+      "profile": [
+        [
+          0,
+          1.5
+        ],
+        [
+          450,
+          3.0
+        ],
+        [
+          1350,
+          1.5
+        ]
+      ]
+    }
+  ],
+  "environment": {
+    "t_traffic": 60,
+    "full_every": 10
+  },
+  "seed": 42,
+  "payment": {
+    "rider_balance": 100.0,
+    "subsidy_discount": 0.5,
+    "subsidy_budget": null,
+    "hold_max": 7200
+  }
+}
