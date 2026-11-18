@@ -40,7 +40,7 @@ from common import clock
 from common.messages import make_inform, make_message, make_request, make_template
 from common.ontology import (
     AuctionOutcome, DriverArriving, Escrow, Refund, EscrowRequest, FailureReason, MatchResult, Perf, Pool,
-    PoolProposal, Protocol, Rating, RiderBoarded, RiderDroppedOff, RiderReady, Settlement, TripRequest,
+    PoolProposal, Protocol, Rating, ReputationScore, RiderBoarded, RiderDroppedOff, RiderReady, Settlement, TripRequest,
     parse_payload,
 )
 from common.settings import READY_DELAY, T_POOL_RESPONSE, T_RIDER_PATIENCE
@@ -181,11 +181,12 @@ class RiderAgent(BaseAgent):
         self.ended = asyncio.Event()                   # set each time a trip returns to IDLE
         self._deadline = float("inf")
         self._outbox: List = []
+        self.reputation_score: Optional[ReputationScore] = None   # newest score published about this rider
 
     async def setup(self):
         await super().setup()
         for proto in (Protocol.TRIP_REQUEST, Protocol.POOL_FORMATION, Protocol.ESCROW,
-                      Protocol.MATCH_AUCTION, Protocol.TRIP_EXECUTION, Protocol.SETTLEMENT, Protocol.REFUND):
+                      Protocol.MATCH_AUCTION, Protocol.TRIP_EXECUTION, Protocol.SETTLEMENT, Protocol.REFUND, Protocol.REPUTATION):
             self.add_behaviour(RiderListener(), make_template(proto))
         if self.auto_request_interval is not None:
             if self.network is None:
@@ -296,7 +297,7 @@ class RiderAgent(BaseAgent):
                 continue
             if not any(hub in self.hubs for hub in self.network.hubs_covering(destination, now)):
                 continue
-            request = self.request_trip(destination, self.auto_request_max_fare)
+            request = self.request_trip(destination, self.auto_request_max_fare, pooling_willingness=True)
             self._auto_destination_index = (index + 1) % len(self._auto_destinations)
             if request is not None:
                 self._last_auto_destination = destination
@@ -307,6 +308,14 @@ class RiderAgent(BaseAgent):
     async def on_message(self, beh, msg) -> None:
         t = self.trip
         proto, perf, sender = msg.get_metadata("protocol"), msg.get_metadata("performative"), bare(msg.sender)
+        if proto == Protocol.REPUTATION:                                   # the reputation agent's published score
+            try:
+                score = parse_payload(msg, strict=True)
+                if isinstance(score, ReputationScore) and (not self.reputation_jid or sender == self.reputation_jid):
+                    self.reputation_score = score
+            except (ValueError, TypeError):
+                logger.info("[%s] ignored malformed reputation score", self.jid.user)
+            return
         if proto == Protocol.REFUND:                                       # likewise: after the trip has ended
             try:
                 back = parse_payload(msg, strict=True)

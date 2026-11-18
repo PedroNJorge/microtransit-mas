@@ -49,7 +49,7 @@ from common.messages import make_inform, make_message, make_propose, make_refuse
 from common.ontology import (
     BrainPercept, BidPolicy, CruiseCommand, DemandSignal,
     AuctionOutcome, Bid, CFP, Policy, Rating, DriverArriving, DriverState, DriverStatus, FailureReason, MatchResult,
-    Perf, Protocol, RepositionRequest, RiderBoarded, RiderDroppedOff, RiderReady, Settlement,
+    Perf, Protocol, RepositionRequest, ReputationScore, RiderBoarded, RiderDroppedOff, RiderReady, Settlement,
     TripCompleted, TripFailed, parse_payload,
 )
 from common.settings import (
@@ -203,6 +203,21 @@ class SettlementReceiver(CyclicBehaviour):
             self.agent.payouts.append(s)
 
 
+class ReputationReceiver(CyclicBehaviour):
+    """ReputationProtocol: the reputation agent informs the ratee (here: the driver) of its published score."""
+    async def run(self):
+        msg = await self.receive(timeout=1)
+        if msg is None:
+            return
+        try:
+            score = parse_payload(msg, strict=True)
+        except (ValueError, TypeError):
+            return
+        d = self.agent
+        if isinstance(score, ReputationScore) and (not d.reputation_jid or bare(msg.sender) == d.reputation_jid):
+            d.reputation_score = score
+
+
 class PolicyReceiver(CyclicBehaviour):
     """PolicyProtocol (RI-04). The fare cap reaches the driver through the CFP reserve; the driver
     only acknowledges, and refuses what it cannot accept (stale, conflicting, malformed, not from the Regulator)."""
@@ -315,6 +330,7 @@ class DriverAgent(BaseAgent):
         self.policies = PolicyBook()
         self.finished_trips: Dict[str, Assignment] = {}
         self.rated: set = set()
+        self.reputation_score: Optional[ReputationScore] = None   # newest published score about this driver
         self.location: str = start_hub
         self.activity = "idle"                        # idle | repositioning | to_pickup | on_trip | offline
         self.passengers = 0
@@ -346,6 +362,7 @@ class DriverAgent(BaseAgent):
         self.add_behaviour(Housekeeping())
         self.add_behaviour(RepositionHandler(), make_template(Protocol.REPOSITION, Perf.REQUEST))
         self.add_behaviour(SettlementReceiver(), make_template(Protocol.SETTLEMENT, Perf.INFORM))
+        self.add_behaviour(ReputationReceiver(), make_template(Protocol.REPUTATION, Perf.INFORM))
         self.add_behaviour(PolicyReceiver(), make_template(Protocol.POLICY, Perf.REQUEST))
         self.add_behaviour(CompletionReceiver(), make_template(Protocol.TRIP_EXECUTION, Perf.INFORM))
         if self.brain_jid:

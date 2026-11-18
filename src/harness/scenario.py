@@ -36,6 +36,15 @@ subsidy_budget = size of the subsidy fund (null = unlimited); hold_max = sim sec
 which an unsettled escrow is returned to the rider.
 Unknown keys are rejected (a typo must not silently fall back to a default).
 
+Pooling is the standard: hubs batch requests for "t_pool" seconds (default 180; 0 turns it off), riders and
+demand streams are pooling-willing by default.
+
+"patient" (default true): nobody gives up. A hub whose auction gets no bids tries again (with a wider pickup radius)
+until a driver is free and a rider waits for as long as that takes. With false, a hub gives up after 4 attempts
+and the rider ends 'unmatched'.
+With a demand section the run ends by itself once every request has been issued and every rider is home;
+"duration" is then only the safety cap (sim seconds).
+
 Optional dynamic sections (what HAPPENS during the run; all times are sim seconds):
 {
   "duration": 3600,                             # the launcher stops by itself after this sim time
@@ -44,7 +53,7 @@ Optional dynamic sections (what HAPPENS during the run; all times are sim second
     {"id": "burst", "hubs": "hub_a", "start": 600, "end": 660, "count": 30,
      "pattern": "random",                       # "even" (default) or "random" times in [start, end)
      "max_fare": 20, "window": 3600, "detour_tolerance": 600,
-     "pooling": 0.5, "subsidy": 0.0}            # probabilities per request
+     "pooling": 1.0, "subsidy": 0.0}            # probabilities per request (default 1.0: everyone pools)
   ],
   "events": [
     {"at": 900, "type": "block_road", "duration": 1200,
@@ -72,7 +81,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
-from common.settings import FULL_SNAPSHOT_EVERY, SUBSIDY_DISCOUNT, T_ESCROW_HOLD_MAX, T_TRAFFIC
+from common.settings import FULL_SNAPSHOT_EVERY, SUBSIDY_DISCOUNT, T_ESCROW_HOLD_MAX, T_POOL, T_TRAFFIC
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]       # <root>/src/harness/scenario.py
 DEFAULT_SCENARIO = PROJECT_ROOT / "config" / "scenario.json"
@@ -104,7 +113,7 @@ class DemandSpec:
     max_fare: float = 20.0
     window: float = 3600.0
     detour_tolerance: float = 600.0
-    pooling: float = 0.0
+    pooling: float = 1.0
     subsidy: float = 0.0
 
 
@@ -158,6 +167,9 @@ class Scenario:
     events: List[EventSpec] = field(default_factory=list)
     forecasts: List[ForecastSpec] = field(default_factory=list)
     reposition: Optional[Dict[str, float]] = None   # None = hubs never move drivers
+    t_pool: float = T_POOL                     # batch window at the hubs (s); 0 switches pooling off
+    patient: bool = True                       # hubs keep retrying and riders keep waiting until a driver is free
+    legacy_market: bool = False                # True: hubs without the market fixes (reserve margin, pickup radius, retries)
     brains: bool = False                       # one BDI brain per driver (agents/brain.py)
     brain_bids: bool = False                   # the brain also owns the driver's bid markup
     return_policy: str = "none"                # fixed baseline: none | start_hub | nearest_hub
@@ -229,7 +241,7 @@ class Scenario:
     def from_dict(cls, data: dict, default_name: str = "scenario") -> "Scenario":
         _only_keys(data, {"name", "xmpp", "clock", "graph", "hubs", "drivers", "riders",
                           "environment", "payment", "seed", "duration", "demand", "events",
-                          "forecasts", "reposition"}, "scenario")
+                          "forecasts", "reposition", "t_pool", "legacy_market", "patient"}, "scenario")
         for required in ("graph", "hubs"):
             if required not in data:
                 raise ScenarioError(f"scenario: missing required key {required!r}")
@@ -347,6 +359,9 @@ class Scenario:
                                         positive=True),
                    seed=_int(data.get("seed", 42), "seed", 0), duration=duration,
                    demand=demand, events=events, forecasts=forecasts, reposition=reposition,
+                   t_pool=_num(data.get("t_pool", T_POOL), "t_pool"),
+                   patient=bool(data.get("patient", True)),
+                   legacy_market=bool(data.get("legacy_market", False)),
                    brains=brains, brain_bids=brain_bids, return_policy=return_policy)
 
 
@@ -469,7 +484,7 @@ def _parse_demand(items, sel: _Selector) -> List[DemandSpec]:
             max_fare=_num(d.get("max_fare", 20.0), f"{w}.max_fare"),
             window=_num(d.get("window", 3600.0), f"{w}.window", positive=True),
             detour_tolerance=_num(d.get("detour_tolerance", 600.0), f"{w}.detour_tolerance"),
-            pooling=_prob(d.get("pooling", 0.0), f"{w}.pooling"),
+            pooling=_prob(d.get("pooling", 1.0), f"{w}.pooling"),
             subsidy=_prob(d.get("subsidy", 0.0), f"{w}.subsidy"))
         if spec.start < 0 or spec.end <= spec.start:
             raise ScenarioError(f"{w}: need 0 <= start < end")
