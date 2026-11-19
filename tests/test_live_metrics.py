@@ -18,7 +18,8 @@ def build():
     """One pool of 2 riders (one joined late) and one solo pool, two drivers, one hub, payment."""
     a1 = NS(dropped=["r1", "r2"], riders=[("r1", "q1", "n1", "p1"), ("r2", "q2", "n2", "p2")])
     a2 = NS(dropped=["r3"], riders=[("r3", "q3", "n3", "p3")])
-    d1 = NS(role="driver", jid=jid("d1"), activity="on_trip", finished_trips={"p1": a1}, odo_m={"loaded": 3000.0, "pickup": 1000.0, "other": 500.0},
+    d1 = NS(role="driver", jid=jid("d1"), activity="on_trip", odo_s={"loaded": 300.0, "pickup": 100.0, "other": 100.0},
+            odo_sub_m={"return": 300.0, "move": 200.0, "reposition": 0.0}, finished_trips={"p1": a1}, odo_m={"loaded": 3000.0, "pickup": 1000.0, "other": 500.0},
             trip_log={"p1": dict(pickup_m=1000.0, loaded_m=3000.0, pickup_s=100.0, loaded_s=300.0, done=500.0)},
             payouts=[Settlement("e1", "d1", 6.0, 0.0), Settlement("e2", "d1", 4.0, 1.0, 0.0, 0.0, 2.0, 0.5)], payout_times=[510.0, 510.0])
     d2 = NS(role="driver", jid=jid("d2"), activity="idle", finished_trips={"p3": a2}, odo_m={"loaded": 2000.0, "pickup": 500.0, "other": 0.0},
@@ -94,3 +95,10 @@ def test_utilisation_is_sampled_per_interval():
 def test_helpers():
     assert gini([1, 1, 1, 1]) == 0 and gini([0, 0, 0, 10]) == pytest.approx(0.75)
     assert gini([5]) is None and percentile([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 0.9) == 9 and percentile([], 0.9) is None
+
+
+def test_empty_km_by_cause_and_revenue_per_hour_driven():
+    c = build().snapshot(1000.0)["cum"]
+    assert c["km_return"] == pytest.approx(0.3) and c["km_move"] == pytest.approx(0.2) and c["km_reposition"] == 0.0
+    assert c["km_return"] + c["km_move"] + c["km_reposition"] == pytest.approx(c["km_other"])
+    assert c["earnings_per_driven_hour"] == pytest.approx(15.0 / (500.0 / 3600.0))      # only d1 reports its seconds

@@ -23,6 +23,8 @@ Schema (all sections but "graph" and "hubs" are optional):
   # optional driver intelligence (all off by default):
   #   "brains": true          every driver gets a BDI brain agent (brain_01, ...) that picks where it waits
   #   "brain_bids": true      the brain also sets the driver's bid markup (needs "brains")
+  #   "brain_policy": "signal" | "pressure"   what the brain decides from: the hubs' published load, or the calls it heard
+  #   "brain_drive_cost": 0.0015   the brain's distance weight (pressure units per second of driving; larger = stays closer)
   #   "return_policy": "nearest_hub" | "start_hub" | "none"   fixed rule, no BDI (ignored when "brains")
   "riders":  {"count": 2},
   "environment": {"t_traffic": 60, "full_every": 10},
@@ -44,7 +46,7 @@ neighbour (protocols/inter_hub.py).
 "detour_ratio" (default 0.5): a rider accepts at most that fraction of its solo ride time as extra time when sharing
 (never more than the demand's "detour_tolerance", which is the cap); the time waited for the batch counts too.
 null = only the cap.
-Pooling is the standard: hubs batch requests for "t_pool" seconds (default 180; 0 turns it off), riders and
+Pooling is the standard: hubs batch requests for "t_pool" seconds (default 30; 0 = no batch window, pooling by late join only), riders and
 demand streams are pooling-willing by default.
 
 "patient" (default true): nobody gives up. A hub whose auction gets no bids tries again (with a wider pickup radius)
@@ -188,6 +190,8 @@ class Scenario:
     legacy_market: bool = False                # True: hubs without the market fixes (reserve margin, pickup radius, retries)
     brains: bool = False                       # one BDI brain per driver (agents/brain.py)
     brain_bids: bool = False                   # the brain also owns the driver's bid markup
+    brain_policy: str = "signal"               # "signal": decides from the hubs' published load; "pressure": from the calls it heard
+    brain_drive_cost: float = 0.0015           # the brain's distance weight: pressure units given up per second of driving
     return_policy: str = "none"                # fixed baseline: none | start_hub | nearest_hub
     source: Optional[Path] = None              # file it was loaded from (None: from_dict)
 
@@ -216,7 +220,8 @@ class Scenario:
                 specs.append(AgentSpec("driver_brain", f"brain_{i + 1:0{width}d}",
                                        self.jid(f"brain_{i + 1:0{width}d}"),
                                        {"driver_jid": self.jid(f"driver_{i + 1:0{width}d}"),
-                                        "bid_policy": self.brain_bids}))
+                                        "bid_policy": self.brain_bids, "drive_cost": self.brain_drive_cost,
+                                        "policy": self.brain_policy}))
         for i in range(self.n_drivers):
             name = f"driver_{i + 1:0{width}d}"
             kw = {"start_hub": self.driver_start_hubs[i % len(self.driver_start_hubs)]}
@@ -296,7 +301,7 @@ class Scenario:
 
         sel = _Selector(hub_ids, graph)
         d = dict(data.get("drivers", {}))
-        _only_keys(d, {"count", "start_hubs", "placement", "brains", "brain_bids", "return_policy"}, "drivers")
+        _only_keys(d, {"count", "start_hubs", "placement", "brains", "brain_bids", "brain_drive_cost", "brain_policy", "return_policy"}, "drivers")
         if "placement" in d:
             if "start_hubs" in d:
                 raise ScenarioError("drivers: use either start_hubs or placement, not both")
@@ -320,6 +325,12 @@ class Scenario:
 
         brains, brain_bids = d.get("brains", False), d.get("brain_bids", False)
         return_policy = d.get("return_policy", "none")
+        brain_policy = d.get("brain_policy", "signal")
+        if brain_policy not in ("signal", "pressure"):
+            raise ScenarioError("drivers.brain_policy must be signal or pressure")
+        drive_cost = d.get("brain_drive_cost", 0.0015)
+        if isinstance(drive_cost, bool) or not isinstance(drive_cost, (int, float)) or drive_cost < 0:
+            raise ScenarioError("drivers.brain_drive_cost must be a number >= 0")
         if not isinstance(brains, bool) or not isinstance(brain_bids, bool):
             raise ScenarioError("drivers.brains and drivers.brain_bids must be true or false")
         if brain_bids and not brains:
@@ -391,7 +402,7 @@ class Scenario:
                    else _num(data.get("detour_ratio", DETOUR_RATIO), "detour_ratio", positive=True),
                    patient=bool(data.get("patient", True)),
                    legacy_market=bool(data.get("legacy_market", False)), late_join=bool(data.get("late_join", True)),
-                   brains=brains, brain_bids=brain_bids, return_policy=return_policy)
+                   brains=brains, brain_bids=brain_bids, brain_drive_cost=float(drive_cost), brain_policy=brain_policy, return_policy=return_policy)
 
 
 # ---- helpers -------------------------------------------------------------------------------

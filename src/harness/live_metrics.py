@@ -33,7 +33,9 @@ Definitions (units: EUR, km, kg, seconds)
     completion_rate        completed / ended trips (cumulative only);  failures = ended trips by reason
   Drivers (per vehicle-trip unless stated)
     revenue_per_trip, profit_per_trip (revenue - base cost - cost per second x (pickup + loaded seconds))
-    earnings_per_hour      revenue per driver per hour
+    earnings_per_hour      revenue per driver per hour of the whole shift (idle included)
+    earnings_per_driven_hour  revenue per hour a driver actually spends driving (comparable with the 5.60 EUR/h wage)
+    km_return, km_move, km_reposition   the "other" km by cause: back to the nearest hub / to a better hub (brain) / ordered by a hub
     util_<state>           share of driver-time loaded / pickup / idle / cruising / repositioning (sampled each tick)
     deadhead_share         empty km (pickup + other) / all km
     gini                   inequality of the drivers' earnings (0 = equal)
@@ -56,6 +58,7 @@ logger = logging.getLogger(__name__)
 
 STATES = ("loaded", "pickup", "idle", "cruising", "repositioning")
 ODO_KINDS = ("loaded", "pickup", "other")
+ODO_SUB = ("return", "move", "reposition")        # what "other" is made of
 
 
 def gini(xs: List[float]) -> Optional[float]:
@@ -221,6 +224,8 @@ class MetricsCollector:
         for d in drivers:
             util[_activity_state(d)] += dt
         odo = {k: sum(d.odo_m[k] for d in drivers) for k in ODO_KINDS}
+        odo.update({"sub_" + k: sum(getattr(d, "odo_sub_m", {}).get(k, 0.0) for d in drivers) for k in ODO_SUB})
+        odo["driven_s"] = sum(sum(getattr(d, "odo_s", {}).values()) for d in drivers)
         self._util.append((now, util))
         self._odo.append((now, odo))
         self._last_t = now
@@ -235,8 +240,13 @@ class MetricsCollector:
             tot = sum(u.values())
             for s in STATES:
                 metrics[f"util_{s}"] = u.get(s, 0.0) / tot if tot > 0 else None
-            before = next((o for t, o in reversed(self._odo) if t <= since), dict.fromkeys(ODO_KINDS, 0.0))
+            before = next((o for t, o in reversed(self._odo) if t <= since), dict.fromkeys(odo, 0.0))
             km = {k: (odo[k] - before[k]) / 1000.0 for k in ODO_KINDS}
+            for k in ODO_SUB:
+                metrics["km_" + k] = (odo["sub_" + k] - before["sub_" + k]) / 1000.0
+            driven_h = (odo["driven_s"] - before["driven_s"]) / 3600.0
+            revenue = sum(y[2] for y in payouts if since < y[0] <= now)
+            metrics["earnings_per_driven_hour"] = revenue / driven_h if driven_h > 0 else None
             metrics["km_loaded"], metrics["km_pickup"], metrics["km_other"] = km["loaded"], km["pickup"], km["other"]
             allkm = sum(km.values())
             metrics["deadhead_share"] = (km["pickup"] + km["other"]) / allkm if allkm > 0 else None

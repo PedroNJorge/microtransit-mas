@@ -301,3 +301,16 @@ async def test_cfp_during_repositioning_is_refused(xmpp_server, sim_clock, net):
         reply = await r.cfp_and_wait(r.h2, pool="pool-B")
         assert reply.get_metadata("performative") == Perf.REFUSE and reply.body == "repositioning"
 
+
+
+async def test_empty_driving_is_attributed_to_its_cause(net):
+    from agents.driver import DriverAgent
+    d = DriverAgent("d@localhost", "pw", start_hub="n1_1", network=net, hub_jids=[])
+    d.location = "n1_2"
+    assert d.nearest_hub(0.0) == "n1_1"                      # going there is a "return"
+    d.activity, d.cruise_reason = "cruising", "move"
+    d.record_hop("n1_2", "n1_3", 10.0, None)
+    d.activity = "repositioning"
+    d.record_hop("n1_3", "n1_4", 10.0, None)
+    assert d.odo_sub_s == {"return": 0.0, "move": 10.0, "reposition": 10.0}
+    assert sum(d.odo_sub_m.values()) == pytest.approx(d.odo_m["other"])

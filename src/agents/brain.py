@@ -16,7 +16,7 @@ import asyncio
 import logging
 import uuid
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 import agentspeak as asp
 from spade.behaviour import CyclicBehaviour
@@ -29,7 +29,9 @@ from protocols.payment_common import bare
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_ASL = str(Path(__file__).parent / "brains" / "driver.asl")
+DEFAULT_ASL = str(Path(__file__).parent / "brains" / "driver.asl")              # v1: from the calls for proposals it heard
+SIGNAL_ASL = str(Path(__file__).parent / "brains" / "driver_signal.asl")        # v2: from the hubs' published load
+POLICIES = {"pressure": DEFAULT_ASL, "signal": SIGNAL_ASL}
 PERCEPT_TAG = frozenset([asp.Literal("source", (asp.Literal("percept"),))])
 
 
@@ -62,13 +64,19 @@ class PerceptReceiver(CyclicBehaviour):
 class DriverBrain(BDIAgent):
     role = "driver_brain"
 
-    def __init__(self, jid: str, password: str, driver_jid: str, asl: str = DEFAULT_ASL,
-                 cooldown: float = 240.0, bid_policy: bool = False, **kwargs):
+    def __init__(self, jid: str, password: str, driver_jid: str, asl: Optional[str] = None,
+                 cooldown: Optional[float] = None, bid_policy: bool = False, drive_cost: float = 0.0015,
+                 policy: str = "pressure", **kwargs):
+        if policy not in POLICIES:
+            raise ValueError(f"policy must be one of {sorted(POLICIES)}")
+        self.policy = policy
+        asl = asl or POLICIES[policy]
+        self.drive_cost = float(drive_cost)           # pressure units given up per second of driving (belief drive_cost)
         self.bid_policy = bid_policy                  # also own the driver's bid markup (opportunity cost)
         self.markups: list = []                       # markups this brain has set
         self._markup = 0.0
         self.driver_jid = bare(driver_jid)
-        self.cooldown = cooldown                      # sim seconds after a move during which no switch is considered
+        self.cooldown = cooldown if cooldown is not None else (600.0 if policy == "signal" else 240.0)                      # sim seconds after a move during which no switch is considered
         self.sim_now = 0.0                            # time of the latest percept (sim seconds)
         self.last_move = -1e18
         self.commands: list = []                      # hubs this brain has sent its driver to
@@ -146,6 +154,7 @@ class DriverBrain(BDIAgent):
     def apply_percept(self, p: BrainPercept) -> None:
         self.percepts_received += 1
         self.sim_now = p.sent_at
+        self._set({("drive_cost", ""): (self.drive_cost,)}, "drive_cost")
         self._set({("cooling", ""): ()} if p.sent_at - self.last_move < self.cooldown else {}, "cooling")
         self._set({("state", ""): (p.state,)}, "state")
         self._set({("at_hub", ""): (p.at_hub,)} if p.at_hub else {}, "at_hub")
@@ -153,3 +162,4 @@ class DriverBrain(BDIAgent):
         self._set({("bid_policy", ""): ()} if self.bid_policy else {}, "bid_policy")
         self._set({("eta", h): (h, e) for h, e in zip(p.hub_ids, p.etas) if e >= 0}, "eta")
         self._set({("pressure", h): (h, q) for h, q in zip(p.hub_ids, p.pressures)}, "pressure")
+        self._set({("deficit", h): (h, d) for h, d in zip(p.hub_ids, p.deficits)}, "deficit")

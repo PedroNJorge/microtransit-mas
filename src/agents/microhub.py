@@ -24,7 +24,7 @@ Reputation: `reputations` is the hub's own record (jid -> 1..5); the Reputation 
 """
 import logging
 import math
-from collections import Counter
+from collections import Counter, deque
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional
 
@@ -39,14 +39,15 @@ from common.messages import (
     make_request, make_template,
 )
 from common.ontology import (
-    AuctionOutcome, AuditData, AuditReport, Handover, LateJoinDecision, LateJoinRequest, PoolAmended, OverflowRequest, AuditRequest, AuditTrip, DemandForecast, DriverState, DriverStatus, Escrow, EscrowStatus, FailureReason, MatchResult, Perf,
+    AuctionOutcome, AuditData, AuditReport, Handover, LateJoinDecision, LateJoinRequest, PoolAmended, OverflowRequest, AuditRequest, AuditTrip, DemandForecast, HubLoad, DriverState, DriverStatus, Escrow, EscrowStatus, FailureReason, MatchResult, Perf,
     Penalty, Policy, Pool, Refund, PoolProposal, PoolStatus, Protocol, ReputationScore, SettlementComplete,
     StagingPoint, TripCompleted, TripFailed, TripRequest, parse_payload,
 )
 from common.settings import (
     AUCTION_PRICING, MAX_AUCTION_ATTEMPTS, T_AUCTION, T_AWARD, T_ESCROW, VALUE_OF_DETOUR,
-    T_POOL_RESPONSE, T_REBALANCE, T_REPOSITION, T_STATUS, VALUE_OF_REPUTATION, VALUE_OF_TIME, WIDEN_DETOUR,
+    T_LOAD, T_POOL_RESPONSE, T_REBALANCE, T_REPOSITION, T_STATUS, VALUE_OF_REPUTATION, VALUE_OF_TIME, WIDEN_DETOUR,
 )
+from common.cells import nearest_hub
 from common.costs import driver_cost, dwell_seconds, rate_per_second
 from common.pooling import late_join_terms, GroupPlan, fare_ceiling, footprint, reference_solo_fare, split_fare_weighted
 from common.settings import (
@@ -149,6 +150,7 @@ async def admit_request(beh, hub, req: TripRequest, sender: str, allow_late: boo
     pooling, or an immediate pool. Used for requests from riders and for requests adopted from another hub
     (protocols/inter_hub.py)."""
     send = beh.send
+    hub.arrivals.append(clock.now())
     if allow_late and hub.late_join and req.pooling_willingness and await hub.offer_late_join(beh, req, sender):
         return                                                      # the driver's answer decides what happens next
     if hub.batching and req.pooling_willingness:                    # wait for the batch window
@@ -327,6 +329,18 @@ class _AbandonLate(OneShotBehaviour):
 
     async def run(self):
         await self.agent.abandon_late_join(self, self.rec, self.reason)
+
+
+class LoadBroadcaster(CyclicBehaviour):
+    """Publishes the hub's HubLoad to every driver, once per `t_load` sim seconds (input of the drivers' brains)."""
+
+    async def run(self):
+        hub = self.agent
+        load = hub.load_snapshot(clock.now())
+        for jid in hub.driver_jids:
+            if jid in hub.registry:                                   # only drivers that are up (they announced themselves)
+                await self.send(make_inform(jid, Protocol.DRIVER_BRAIN, load, f"load-{hub.hub_id}"))
+        await clock.sim_sleep(hub.t_load)
 
 
 class DriverStatusReceiver(CyclicBehaviour):
@@ -679,6 +693,9 @@ class MicrohubAgent(BaseAgent):
         self.max_pickup_eta, self.retry_delay, self.window_slack = max_pickup_eta, retry_delay, window_slack
         self._waking = False
         self.broadcast_demand = broadcast_demand      # tell drivers that were not called about the request (BDI input)
+        self.arrivals: deque = deque()                # sim times of the requests that entered this hub (last 10 minutes kept)
+        self.t_load = T_LOAD                          # HubLoad broadcast period (only with broadcast_demand)
+        self._cell_cache: Dict[str, str] = {}
         self.auction_queue: List[tuple] = []
         self.auction_running = False
         # inter-hub coordination (M11): only with `peer_jids` (hub id -> JID of the OTHER hubs)
@@ -803,6 +820,19 @@ class MicrohubAgent(BaseAgent):
         """Drivers whose fresh status says IDLE (the spare capacity a neighbour may count on)."""
         return sum(1 for e in self.registry.values()
                    if now - e[1] <= 3 * self.t_status and e[0].state == DriverState.IDLE)
+
+    def load_snapshot(self, now: float) -> HubLoad:
+        """What this hub tells the drivers: requests without a driver, the recent arrival rate, and the free drivers that
+        count as supply of its cell (idle ones standing in it, cruisers heading to it)."""
+        while self.arrivals and now - self.arrivals[0] > 600.0:
+            self.arrivals.popleft()
+        supply = 0
+        for st, at in self.registry.values():
+            if now - at > 3 * self.t_status or st.state != DriverState.IDLE:
+                continue
+            cell = st.target or nearest_hub(self.network, st.location, self._cell_cache)
+            supply += 1 if cell == self.hub_id else 0
+        return HubLoad(self.hub_id, float(len(self.pending_requests())), len(self.arrivals) / 10.0, float(supply), now)
 
     def pending_requests(self) -> List[TripRequest]:
         """Requests this hub owes an answer and has not matched: what a neighbour must take over if it dies."""
@@ -1272,6 +1302,8 @@ class MicrohubAgent(BaseAgent):
         if self.reputation_jid:
             self.add_behaviour(ReputationReceiver(), make_template(Protocol.REPUTATION, Perf.INFORM))
         self.add_behaviour(DriverStatusReceiver(), make_template(Protocol.DRIVER_STATUS, Perf.INFORM))
+        if self.broadcast_demand and self.network is not None:
+            self.add_behaviour(LoadBroadcaster())
         if self.late_join:
             self.add_behaviour(LateJoinReplies(), make_template(Protocol.LATE_JOIN))
         self.add_behaviour(TripReports(), make_template(Protocol.TRIP_EXECUTION, Perf.INFORM))

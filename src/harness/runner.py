@@ -276,6 +276,12 @@ def report(h) -> str:
             lines.append(f"drivers: revenue {c['revenue_per_trip']:.2f} EUR and profit {c['profit_per_trip']:.2f} EUR per trip; "
                          f"deadhead {100 * (c['deadhead_share'] or 0):.0f}% of km; earnings Gini "
                          f"{(c['gini'] if c['gini'] is not None else float('nan')):.2f}")
+        if c.get("km_return") is not None:
+            lines.append(f"vehicle-km: loaded {c['km_loaded']:.1f}, to pickup {c['km_pickup']:.1f}, empty without a rider: "
+                         f"back to nearest hub {c['km_return']:.1f}, to a better hub {c['km_move']:.1f}, ordered by a hub "
+                         f"{c['km_reposition']:.1f} ({sum(len(getattr(a, 'cruises', [])) for a in h.agents.values() if a.role == 'driver')} "
+                         f"brain-ordered moves); revenue per hour driven "
+                         f"{(c['earnings_per_driven_hour'] or 0):.2f} EUR")
     joined = sum(len(a.late_joined) for a in h.agents.values() if a.role == "microhub")
     if joined:
         lines.append(f"late joins: {joined} rider(s) joined a pool whose driver was still on the way to the hub")
@@ -291,6 +297,29 @@ def report(h) -> str:
     if waits:
         lines.append(f"wait request -> boarding (completed trips): mean {sum(waits) / len(waits):.0f}s, "
                      f"max {max(waits):.0f}s")
+        ok = [t for r in riders for t in r.trips if t.outcome == "completed" and t.matched_at]
+        if ok:
+            lines.append(f"wait split: request -> matched {sum(t.matched_at - t.requested_at for t in ok) / len(ok):.0f}s "
+                         f"(pooling window + auctions), matched -> boarding "
+                         f"{sum(t.boarded_at - t.matched_at for t in ok) / len(ok):.0f}s (driver to the pickup)")
+            for t in sorted(ok, key=lambda x: x.requested_at - x.boarded_at)[:3]:
+                lines.append(f"  longest: requested at +{t.requested_at - min(x.requested_at for x in ok):.0f}s, matched after "
+                             f"{t.matched_at - t.requested_at:.0f}s, boarded {t.boarded_at - t.matched_at:.0f}s after the match, "
+                             f"hubs tried {len(t.tried_hubs)}")
+                ctxs = [c for a in h.agents.values() if a.role == "microhub" for c in getattr(a, "finished", [])
+                        if c.pool.pool_id == t.pool_id]
+                why = Counter(r for c in ctxs for r in c.refusals.values())
+                lines.append(f"    its auctions: {len(ctxs)}, outcomes {dict(Counter(c.outcome for c in ctxs))}, "
+                             f"drivers' refusals {dict(why)}")
+        done = sorted((t.requested_at, t.boarded_at - t.requested_at) for r in riders for t in r.trips
+                      if t.outcome == "completed")
+        q = max(1, len(done) // 4)
+        quarters = [done[i:i + q] for i in range(0, len(done), q)][:4]
+        lines.append("wait by order of request (quarters of the riders, earliest first): "
+                     + ", ".join(f"{sum(w for _, w in part) / len(part):.0f}s" for part in quarters if part))
+        t0 = done[0][0]
+        worst = sorted(done, key=lambda x: -x[1])[:3]
+        lines.append("longest waits: " + ", ".join(f"{w:.0f}s (requested at +{t - t0:.0f}s)" for t, w in worst))
     hubs = [a for a in h.agents.values() if a.role == "microhub"]
     repo = Counter(c.outcome for a in hubs for c in a.reposition_log)
     if repo:

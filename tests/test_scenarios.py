@@ -57,7 +57,7 @@ def _clock():
 # ---- schema ----------------------------------------------------------------------------------------
 def test_shipped_scenarios_load_and_have_expected_shape():
     files = sorted(glob.glob(str(ROOT / "config" / "scenarios" / "0*.json")))
-    assert len(files) == 6
+    assert len(files) == 7                       # 01..07 (07 = migrating demand)
     for f in files:
         d = json.load(open(f))
         d["graph"] = GRAPH

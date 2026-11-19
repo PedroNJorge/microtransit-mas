@@ -1038,7 +1038,7 @@
       { t: "CO₂ saved", u: "kg", note: "loaded leg = what the incentive pays on; all miles = the honest footprint (adds the pickup legs riders would each have needed alone)",
         s: [["co2_saved_loaded_kg", "loaded leg"], ["co2_saved_all_kg", "all miles"]] },
       { t: "All-miles saving, share of solo driving", u: "pct", s: [["co2_saved_all_pct", "all-miles saving"]] },
-      { t: "Vehicle-km by activity", u: "km", s: [["km_loaded", "loaded"], ["km_pickup", "to pickup"], ["km_other", "cruising / repositioning"]] },
+      { t: "Vehicle-km by activity", u: "km", s: [["km_loaded", "loaded"], ["km_pickup", "to pickup"], ["km_return", "back to nearest hub"], ["km_move", "to a better hub"], ["km_reposition", "hub-ordered repositioning"]] },
       { t: "Pool size mix", u: "pct", s: [["size_1", "1 rider"], ["size_2", "2"], ["size_3", "3"], ["size_4", "4"]] } ] },
     { id: "riders", name: "Riders", charts: [
       { t: "Fare per rider", u: "eur", s: [["fare_gross", "gross"], ["fare_net", "net (after rebates)"]] },
@@ -1049,7 +1049,7 @@
       { t: "Completion rate", u: "pct", cumOnly: true, note: "cumulative only", s: [["completion_rate", "completed / ended"]] } ] },
     { id: "drivers", name: "Drivers", charts: [
       { t: "Per vehicle-trip", u: "eur", s: [["revenue_per_trip", "revenue"], ["profit_per_trip", "profit"]] },
-      { t: "Earnings per driver-hour", u: "h", s: [["earnings_per_hour", "€ / h"]] },
+      { t: "Earnings per driver-hour", u: "h", s: [["earnings_per_hour", "per shift hour"], ["earnings_per_driven_hour", "per hour driven"]] },
       { t: "Utilisation", u: "pct", note: "sampled once a minute of simulated time",
         s: [["util_loaded", "loaded"], ["util_pickup", "to pickup"], ["util_idle", "idle"], ["util_cruising", "cruising"], ["util_repositioning", "repositioning"]] },
       { t: "Deadhead share of km", u: "pct", s: [["deadhead_share", "empty km / all km"]] },
