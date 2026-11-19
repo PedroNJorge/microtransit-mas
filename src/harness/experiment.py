@@ -50,7 +50,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 from common import clock
 from common.costs import driver_cost, dwell_seconds
 from harness.launcher import Harness
-from harness.live_metrics import mover_stats, percentile
+from harness.live_metrics import gini, mover_stats, percentile
 from harness.scenario import PROJECT_ROOT, Scenario, ScenarioError
 
 # two-sided 95 % Student-t critical values by degrees of freedom (1..30); beyond that ~1.96
@@ -66,7 +66,8 @@ KEY_METRICS = (
     "km_loaded", "km_pickup", "km_return", "km_move", "km_reposition", "deadhead_share",
     "util_idle", "util_loaded", "util_cruising",
     "auction_attempts", "refuse_locked", "refuse_too_late", "late_joins",
-    "brain_moves", "mover_dispersion", "mover_share_in_group", "speed_achieved", "sim_seconds",
+    "brain_moves", "mover_dispersion", "mover_share_in_group", "hub_wait_gini", "hub_wait_cv", "hub_wait_max_over_min",
+    "hub_wait_worst", "speed_achieved", "sim_seconds",
 )
 COUNT_PREFIXES = ("fail_", "refuse_", "outcome_")      # a count that is absent in a run was zero
 
@@ -224,7 +225,7 @@ def trip_table(h) -> List[dict]:
             if t.outcome != "completed" or not t.dropped_at:
                 continue
             rows.append(dict(requested=t.requested_at, matched=t.matched_at or None, boarded=t.boarded_at,
-                             dropped=t.dropped_at, window_end=t.request.time_window_end,
+                             dropped=t.dropped_at, window_end=t.request.time_window_end, hub=t.request.origin_node,
                              rating=(t.rating.score if t.rating is not None else None)))
     rows.sort(key=lambda x: x["requested"])
     return rows
@@ -254,6 +255,30 @@ def wait_metrics(trips: List[dict], streams) -> Dict[str, float]:
         part = [t for t in trips if lo <= t["requested"] < hi]
         out[f"wait_stream_{sid}"] = _mean(t["boarded"] - t["requested"] for t in part)
         out[f"n_stream_{sid}"] = float(len(part))
+    return out
+
+
+def hub_metrics(trips: List[dict], hubs: Sequence[str], not_completed: Dict[str, int]) -> Dict[str, float]:
+    """Equity: what each hub's riders got, and how unequal that is. `hubs`: every hub of the run; `not_completed`: trips that
+    did not finish (failed, or still travelling) per hub. Fairness numbers use only hubs that had completed trips."""
+    out: Dict[str, float] = {}
+    n_all = len(trips)
+    means = []
+    for hub in hubs:
+        mine = [t["boarded"] - t["requested"] for t in trips if t.get("hub") == hub]
+        key = hub.replace(" ", "_")
+        out[f"hub_{key}_n"] = float(len(mine))
+        out[f"hub_{key}_share"] = len(mine) / n_all if n_all else math.nan
+        out[f"hub_{key}_wait_mean"] = _mean(mine)
+        out[f"hub_{key}_wait_p90"] = _pct(mine, 0.9)
+        out[f"hub_{key}_not_completed"] = float(not_completed.get(hub, 0))
+        if mine:
+            means.append(sum(mine) / len(mine))
+    out["hubs_served"] = float(len(means))
+    out["hub_wait_gini"] = gini(means) if len(means) > 1 and gini(means) is not None else math.nan
+    out["hub_wait_cv"] = (statistics.pstdev(means) / _mean(means)) if len(means) > 1 and _mean(means) > 0 else math.nan
+    out["hub_wait_max_over_min"] = (max(means) / min(means)) if len(means) > 1 and min(means) > 0 else math.nan
+    out["hub_wait_worst"] = max(means) if means else math.nan
     return out
 
 
@@ -346,6 +371,10 @@ def collect(h, sc: Scenario, real_seconds: float, ended_by: str) -> Dict[str, fl
     runner = getattr(h, "runner", None)
     streams = [(d.id, float(d.start), float(d.end)) for d in sc.demand] if sc.demand else []
     row.update(wait_metrics(trips, streams))
+    hub_ids = sorted(a.hub_id for a in h.agents.values() if a.role == "microhub")
+    lost = Counter(t.request.origin_node for r in riders for t in r.trips if t.outcome and t.outcome != "completed")
+    lost.update(r.trip.request.origin_node for r in riders if r.trip is not None)
+    row.update(hub_metrics(trips, hub_ids, lost))
     row["completed"] = float(len(trips))
     row["unfinished"] = float(sum(1 for r in riders if r.trip is not None))
     row["riders"] = float(len(riders))
@@ -574,7 +603,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     print(f"{len(arms)} arm(s) x {len(seeds)} seed(s) x {repeats} repeat(s) = {total} runs at clock speed {speed:g}; "
           f"at most {est:.1f} h if every run used its whole cap (they usually end when every rider is home)")
     for x, sc in scs:
-        print(f"  {x.name}: {x.scenario} {x.overrides or ''} (duration cap {sc.duration:g} s)")
+        print(f"  {x.name}: {x.scenario} {x.overrides or ''} (duration cap {("%g s" % sc.duration) if sc.duration else "none, ends when every rider is home (1 h real-time cutoff)"})")
     if a.dry_run:
         return 0
 

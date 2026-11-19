@@ -1,0 +1,28 @@
+{
+  "speed": 15,
+  "seeds": [
+    1,
+    2,
+    3,
+    4,
+    5
+  ],
+  "repeats": 1,
+  "arms": {
+    "baseline_plain": {
+      "scenario": "config/scenarios/full_8hubs.json"
+    },
+    "pool_brains_signal": {
+      "scenario": "config/scenarios/brains_full_8hubs.json"
+    },
+    "pool_brains_proportional": {
+      "scenario": "config/scenarios/brains_full_8hubs.json",
+      "set": {
+        "drivers.brain_policy": "proportional"
+      }
+    },
+    "nopool_brains_signal": {
+      "scenario": "config/scenarios/brains_nopool_8hubs.json"
+    }
+  }
+}

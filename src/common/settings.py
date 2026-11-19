@@ -33,8 +33,8 @@ T_REPOSITION = 30.0         # hub waits this long for an answer to a reposition 
 DWELL_PICKUP = 15.0         # seconds spent boarding riders
 DWELL_DROPOFF = 10.0        # seconds spent per drop-off
 # Driver cost model (the driver's true cost c_i, docs/auction_mechanism.md): distance + time, no fixed fee.
-DRIVER_COST_PER_KM = 0.18        # EUR per km driven (fuel + wear), empty or loaded
-DRIVER_COST_PER_HOUR = 5.60      # EUR per hour: Portuguese minimum wage 2027, charged for ALL driving and boarding time
+DRIVER_COST_PER_KM = 0.15        # EUR per km driven (fuel + wear), empty or loaded (our own estimate)
+DRIVER_COST_PER_HOUR = 4.96      # EUR per hour (net minimum wage, Portugal 2027), charged for ALL driving and boarding time
 DRIVER_COST_PER_SECOND = DRIVER_COST_PER_HOUR / 3600.0
 DRIVER_BASE_COST = 0.0           # EUR fixed cost of taking a job: none (opportunity cost lives in bid_markup)
 NOMINAL_SPEED_KMH = 30.0         # urban speed, only to turn km into time-equivalents where the route length is not known

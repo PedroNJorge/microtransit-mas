@@ -2,7 +2,7 @@
 
     cost = base + per_km x km + per_second x (driving seconds + dwell seconds)
 
-Defaults come from common/settings.py (0.18 EUR/km, 5.60 EUR/h, no fixed fee). Driving is charged whether the vehicle
+Defaults come from common/settings.py (0.15 EUR/km, 4.96 EUR/h, no fixed fee). Driving is charged whether the vehicle
 is loaded, on its way to a pickup or empty (cruising, repositioning); boarding and alighting are charged too
 (DWELL_PICKUP once, DWELL_DROPOFF per drop-off). Idle time is free."""
 from __future__ import annotations

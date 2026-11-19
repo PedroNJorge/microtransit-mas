@@ -2,15 +2,23 @@
 import csv
 import json
 import math
+from pathlib import Path
 
 import pytest
 
-from harness.experiment import (Arm, load_plan, mean_ci, metric_names, normalise, paired_difference, parse_arm,
+from harness.experiment import (Arm, hub_metrics, load_plan, mean_ci, metric_names, normalise, paired_difference, parse_arm,
                                 parse_value, repeat_noise, report, set_path, significant, summary_rows, wait_metrics,
                                 write_runs_csv, write_summary_csv)
 from harness.scenario import ScenarioError
 
+ROOT = Path(__file__).resolve().parent.parent
 SCENARIO = "config/scenarios/07_migrating_demand.json"
+
+
+@pytest.fixture(autouse=True)
+def _from_the_project_root(monkeypatch):
+    """Plans and arms name their files relative to the project root, as when run from there."""
+    monkeypatch.chdir(ROOT)
 
 
 # ---- statistics --------------------------------------------------------------------------------------------------------
@@ -168,3 +176,28 @@ def test_the_csv_files_have_one_row_per_run_and_every_metric(tmp_path):
 def test_the_terminal_report_shows_arms_and_differences():
     txt = report(["a", "b"], normalise(runs()), metrics=("wait_mean", "profit_per_trip", "not_a_metric"))
     assert "wait_mean" in txt and "vs a: b -20" in txt and "*" in txt and "not_a_metric" not in txt
+
+
+def test_hub_metrics_show_what_each_hub_got_and_how_unequal_it_is():
+    ts = [dict(requested=0, boarded=100, hub="a"), dict(requested=0, boarded=300, hub="a"),
+          dict(requested=0, boarded=600, hub="b"), dict(requested=0, boarded=50, hub="c")]
+    out = hub_metrics(ts, ["a", "b", "c", "d"], {"b": 2})
+    assert out["hub_a_n"] == 2 and out["hub_a_share"] == 0.5 and out["hub_a_wait_mean"] == 200
+    assert out["hub_b_not_completed"] == 2 and out["hub_c_wait_mean"] == 50
+    assert out["hub_d_n"] == 0 and math.isnan(out["hub_d_wait_mean"])          # a hub nobody used: no wait, and not in the fairness
+    assert out["hubs_served"] == 3 and out["hub_wait_worst"] == 600 and out["hub_wait_max_over_min"] == 12
+    assert 0 < out["hub_wait_gini"] < 1 and out["hub_wait_cv"] > 0
+
+
+def test_hub_metrics_with_one_hub_has_no_fairness_number():
+    out = hub_metrics([dict(requested=0, boarded=10, hub="a")], ["a"], {})
+    assert out["hubs_served"] == 1 and math.isnan(out["hub_wait_gini"]) and math.isnan(out["hub_wait_cv"])
+
+
+def test_every_shipped_plan_loads_and_every_arm_is_a_valid_scenario():
+    plans = sorted(Path("config/experiments").glob("*.json"))
+    assert len(plans) >= 8
+    for p in plans:
+        arms, opts = load_plan(str(p))
+        for a in arms:
+            a.scenario_for(1, opts.get("speed", 15))

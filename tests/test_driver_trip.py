@@ -110,7 +110,7 @@ async def test_two_drivers_compete_winner_drives_the_trip_and_returns_to_idle(xm
         ctx = w.hub.finished[-1]
         assert ctx.outcome == "matched" and ctx.match.driver_id == str(near.jid.bare)
         assert [b.driver_id for b in ctx.bids] == sorted(b.driver_id for b in ctx.bids) or len(ctx.bids) == 2
-        assert ctx.match.final_fare == pytest.approx(1.23)       # own bid 0.23 + (second score - own score): second-score price
+        assert ctx.match.final_fare == pytest.approx(1.17)       # own bid + (second score - own score): second-score price (cost constants 0.15 EUR/km, 4.96 EUR/h)
         trace = [e["event"] for e in ctx.trace]
         assert trace.count("reject-proposal") == 1 and "driver confirmed" in trace
 
@@ -136,11 +136,11 @@ async def test_two_drivers_compete_winner_drives_the_trip_and_returns_to_idle(xm
         # ---- the money: escrowed, then paid to the driver exactly the auction price -----------
         rec = w.ledger.pool_escrows(ctx.pool_id)[0]
         assert w.ledger.status(rec.escrow_id) == EscrowStatus.SETTLED
-        assert w.ledger.balance(str(near.jid.bare)) == pytest.approx(1.23)
-        assert w.ledger.balance(str(w.rider.jid.bare)) == pytest.approx(100.0 - 1.23)
+        assert w.ledger.balance(str(near.jid.bare)) == pytest.approx(1.17)
+        assert w.ledger.balance(str(w.rider.jid.bare)) == pytest.approx(100.0 - 1.17)
         assert w.ledger.balance(str(far.jid.bare)) == 0 and w.ledger.check_conservation()
-        assert near.payouts and near.payouts[0].driver_payout == pytest.approx(1.23)
-        assert w.hub.settlements[ctx.pool_id].total_paid == pytest.approx(1.23)
+        assert near.payouts and near.payouts[0].driver_payout == pytest.approx(1.17)
+        assert w.hub.settlements[ctx.pool_id].total_paid == pytest.approx(1.17)
         assert w.hub.pools[ctx.pool_id].state == "COMPLETED"
 
 

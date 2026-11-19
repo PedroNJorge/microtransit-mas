@@ -7,6 +7,8 @@ import asyncio
 import uuid
 
 import pytest
+
+from common.settings import DRIVER_COST_PER_HOUR, DRIVER_COST_PER_KM
 from spade.agent import Agent
 from spade.behaviour import CyclicBehaviour, OneShotBehaviour
 
@@ -127,8 +129,8 @@ async def test_idle_driver_bids_its_true_cost_and_takes_the_lock(xmpp_server, si
         reply = await r.cfp_and_wait(r.h1)
         assert reply.get_metadata("performative") == Perf.PROPOSE
         bid = parse_payload(reply)
-        # eta 0 (at the hub), route n1_1 -> n2_2 = 120 s, 2 m: cost = 0.18/km + 5.60/h x (120 s + boarding 15 s + 1 alighting 10 s)
-        assert bid.price == pytest.approx(0.18 * 0.002 + 5.60 / 3600 * 145, abs=0.011) and bid.eta == 0 and bid.max_detour == 0
+        # eta 0 (at the hub), route n1_1 -> n2_2 = 120 s, 2 m: cost = per-km + per-hour cost x (120 s + boarding 15 s + 1 alighting 10 s)
+        assert bid.price == pytest.approx(DRIVER_COST_PER_KM * 0.002 + DRIVER_COST_PER_HOUR / 3600 * 145, abs=0.011) and bid.eta == 0 and bid.max_detour == 0
         assert bid.driver_id == str(r.drv.jid.bare) and bid.attempt == 0
         assert r.drv.lock.state == LockState.PROVISIONAL and r.drv.state == DriverState.BIDDING
 

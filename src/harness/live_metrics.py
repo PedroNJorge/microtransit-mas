@@ -34,7 +34,7 @@ Definitions (units: EUR, km, kg, seconds)
   Drivers (per vehicle-trip unless stated)
     revenue_per_trip, profit_per_trip (revenue - base cost - cost per second x (pickup + loaded seconds))
     earnings_per_hour      revenue per driver per hour of the whole shift (idle included)
-    earnings_per_driven_hour  revenue per hour a driver actually spends driving (comparable with the 5.60 EUR/h wage)
+    earnings_per_driven_hour  revenue per hour a driver actually spends driving (comparable with the 4.96 EUR/h wage)
     km_return, km_move, km_reposition   the "other" km by cause: back to the nearest hub / to a better hub (brain) / ordered by a hub
     util_<state>           share of driver-time loaded / pickup / idle / cruising / repositioning (sampled each tick)
     deadhead_share         empty km (pickup + other) / all km
