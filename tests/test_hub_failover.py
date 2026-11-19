@@ -107,3 +107,18 @@ async def test_a_hub_with_no_driver_passes_the_pool_to_a_neighbour_that_has_one(
         assert req.request_id in w.b.adopted
         assert any(rec.state == "HANDED_OVER" for rec in w.a.pools.values())
         assert trip.hub_jid == str(w.b.jid.bare)
+
+
+async def test_a_rider_is_never_served_by_both_hubs_when_the_overflow_answer_is_late(xmpp_server, sim_clock, net):
+    """A stops waiting almost at once (t_overflow_reply tiny), so B's agree may arrive after A carried on alone. B adopts
+    only on A's accept: whichever way the race goes, the request is with exactly one hub."""
+    async with World(net, a_pool=0.0, overflow_after=1, retry_delay=20.0, max_attempts=4, t_overflow_reply=0.001) as w:
+        assert await until(lambda: w.a.peers[B].idle_drivers == 1, timeout=15)
+        req = w.rider.request_trip(DEST, 20.0, hub_id=A, pooling_willingness=False)
+        assert req is not None
+        await asyncio.wait_for(w.rider.ended.wait(), 120)
+        await asyncio.sleep(2)
+        at_b = req.request_id in w.b.adopted
+        handed_over = any(rec.state == "HANDED_OVER" for rec in w.a.pools.values())
+        assert at_b == handed_over, (at_b, handed_over)                   # B adopted <=> A gave it up
+        assert sum(1 for rec in w.b.pools.values() if req.request_id in [r.request_id for r in rec.pool.requests]) <= 1

@@ -118,3 +118,13 @@ def test_balanced_policy_spreads_over_close_hubs_but_not_far_ones():
     picks = {choose([("a", 100.0), ("b", 120.0), ("far", 900.0)]) for _ in range(200)}
     assert picks == {"a", "b"}
     assert choose([("only", 50.0)]) == "only"
+
+
+def test_cfp_windows_restart_for_a_patient_run_once_the_window_has_run_out():
+    from types import SimpleNamespace as NS
+    from protocols.match_auction import cfp_windows
+    reqs = [NS(request_id="a", time_window_start=0.0, time_window_end=3600.0),
+            NS(request_id="b", time_window_start=100.0, time_window_end=9000.0)]
+    assert cfp_windows(reqs, now=1000.0, relax_expired=True) == {"a": [0.0, 3600.0], "b": [100.0, 9000.0]}   # untouched while open
+    assert cfp_windows(reqs, now=5000.0, relax_expired=True) == {"a": [0.0, 8600.0], "b": [100.0, 9000.0]}   # a's ran out: now + 1 h
+    assert cfp_windows(reqs, now=5000.0, relax_expired=False)["a"] == [0.0, 3600.0]                          # impatient run: as before

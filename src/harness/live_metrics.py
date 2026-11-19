@@ -292,3 +292,23 @@ class MetricsCollector:
                     await broadcast_event("METRICS", snap)
             except Exception:                              # one bad snapshot must not stop the run
                 logger.exception("metrics snapshot failed")
+
+
+def mover_stats(command_times, tick: float = 60.0):
+    """How the brain-ordered moves are spread over the hubs' load ticks. `command_times`: one list of sim times per brain.
+    Returns None when nobody moved, else {ticks (with a move), movers, mean (per such tick), dispersion}: the variance of
+    the movers per tick over their mean (over the ticks with a move; 1 = Poisson-like, below 1 = more even than chance,
+    above 1 = herding), plus `share_in_group` = the share of movers that moved in a tick with at least one other mover."""
+    per_tick: dict = {}
+    for times in command_times:
+        for t in times:
+            k = int(t // tick)
+            per_tick[k] = per_tick.get(k, 0) + 1
+    if not per_tick:
+        return None
+    counts = list(per_tick.values())
+    n = len(counts)
+    mean = sum(counts) / n
+    var = sum((c - mean) ** 2 for c in counts) / n
+    return {"ticks": n, "movers": sum(counts), "mean": mean, "dispersion": (var / mean if mean else 0.0),
+            "share_in_group": sum(c for c in counts if c > 1) / sum(counts)}

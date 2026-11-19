@@ -27,6 +27,7 @@ from common import clock
 from common.graph import TransitNetwork
 from common.messages import make_inform
 from common.ontology import DemandForecast, Disruption, DisruptionType, Protocol
+from harness.live_metrics import mover_stats
 from harness.scenario import DemandSpec, EventSpec, Scenario, ScenarioError
 
 logger = logging.getLogger(__name__)
@@ -251,6 +252,48 @@ def report(h) -> str:
     busy = sum(1 for r in riders if r.trip is not None)
     lines = [f"riders: {sum(out.values())} trips ended " + ", ".join(f"{k}={v}" for k, v in sorted(out.items()))
              + (f"; {busy} still in progress" if busy else "")]
+    for r in [r for r in riders if r.trip is not None][:6]:               # what the unfinished riders were doing
+        try:
+            last = r.trip.log[-1] if getattr(r.trip, "log", None) else "-"
+            since = r.history[-1][0] if getattr(r, "history", None) else 0.0
+            lines.append(f"  still in progress: {r.jid.user} in state {r.state} since +{since:.0f}s; last note: {last}")
+            d = h.agents.get(r.trip.driver) if r.trip.driver else None
+            hub = h.agents.get(r.trip.hub_jid)
+            pool = getattr(hub, "pools", {}).get(r.trip.pool_id) if hub is not None else None
+            me = str(r.jid.bare)
+            for hb in (a for a in h.agents.values() if a.role == "microhub"):          # every pool this rider is in, at any hub
+                for pid, rec in hb.pools.items():
+                    if me in rec.rider_jids.values():
+                        last = rec.contexts[-1] if rec.contexts else None
+                        lines.append(f"    at {hb.hub_id}: pool {pid} state {rec.state}, {len(rec.contexts)} auction(s)"
+                                     f"{', last outcome ' + str(last.outcome) if last is not None else ''}; hub auction "
+                                     f"running={hb.auction_running}, queue={[(e[0].pool.pool_id, e[1]) for e in hb.auction_queue]}, "
+                                     f"overflow waits={list(hb.overflow_waits)}")
+            req = r.trip.request
+            net = getattr(h, "network", None)
+            for hb in (a for a in h.agents.values() if a.role == "microhub"):          # why an auction that keeps failing fails
+                for pid, rec in hb.pools.items():
+                    if me in rec.rider_jids.values() and len(rec.contexts) >= 3 and rec.state in ("AUCTIONING", "AUCTION_QUEUED"):
+                        reach = None
+                        if net is not None:
+                            try:
+                                reach = net.travel_time(hb.hub_id, req.destination_home, 0.0)
+                            except Exception as e:
+                                reach = repr(e)
+                        lines.append(f"    stuck pool {pid}: destination {req.destination_home}, hub -> destination travel time {reach}")
+                        for ctx in rec.contexts[-3:-1]:
+                            evs = Counter(e.get("event") for e in ctx.trace)
+                            why = Counter(ctx.refusals.values())
+                            lines.append(f"      attempt {ctx.attempt}: outcome {ctx.outcome}, called {len(ctx.recipients)} drivers, "
+                                         f"{len(ctx.bids)} bid(s), refusals {dict(why)}, events {dict(evs)}")
+            if d is not None:
+                asg = getattr(d, "assignment", None)
+                lines.append(f"    its driver {d.jid.user}: state {getattr(d.state, 'value', d.state)}, activity {d.activity}, lock "
+                             f"{d.lock.state.value}, assignment "
+                             f"{(asg.match.pool_id if asg is not None and asg.match is not None else None)!r} (rider's pool "
+                             f"{r.trip.pool_id!r}), at {d.location}; hub pool state {getattr(pool, 'state', None)}")
+        except Exception as e:                                       # a diagnostic must never lose the report
+            lines.append(f"    (could not inspect {r.jid.user}: {e!r})")
     run = getattr(h, "runner", None)
     if run is not None and (run.summary.issued or run.summary.skipped):
         lines.append(f"demand: {run.summary.issued} requests issued, {run.summary.skipped} skipped (no idle rider)")
@@ -282,6 +325,11 @@ def report(h) -> str:
                          f"{c['km_reposition']:.1f} ({sum(len(getattr(a, 'cruises', [])) for a in h.agents.values() if a.role == 'driver')} "
                          f"brain-ordered moves); revenue per hour driven "
                          f"{(c['earnings_per_driven_hour'] or 0):.2f} EUR")
+    ms = mover_stats([a.command_times for a in h.agents.values() if a.role == "driver_brain" and hasattr(a, "command_times")])
+    if ms:
+        lines.append(f"brain moves per minute with a move: {ms['mean']:.2f} on average over {ms['ticks']} minutes; dispersion "
+                     f"{ms['dispersion']:.2f} (1 = chance, <1 evener, >1 herding); {100 * ms['share_in_group']:.0f}% of the "
+                     f"{ms['movers']} moves had another driver move in the same minute")
     joined = sum(len(a.late_joined) for a in h.agents.values() if a.role == "microhub")
     if joined:
         lines.append(f"late joins: {joined} rider(s) joined a pool whose driver was still on the way to the hub")

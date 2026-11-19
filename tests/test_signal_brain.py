@@ -190,3 +190,60 @@ def test_the_cooldown_blocks_a_second_move_and_then_ends():
 def test_the_policy_name_is_checked():
     with pytest.raises(ValueError):
         DriverBrain("brain@localhost", "pw", DRIVER, policy="nope")
+
+
+# ---- v3: move with probability needed / spare --------------------------------------------------------------------------
+class FixedDice:
+    def __init__(self, u):
+        self.u = u
+
+    def random(self):
+        return self.u
+
+
+def make_prop(u):
+    b = DriverBrain("brain@localhost", "pw", DRIVER, policy="proportional")
+    b.rng = FixedDice(u)
+    return b
+
+
+def test_proportional_driver_moves_when_its_draw_is_below_needed_over_spare():
+    b = make_prop(0.5)
+    feed(b, deficits=(-8.0, 4.0, 0.0))                         # needs 4 of its 8 spare drivers: chance 0.5 -> 0.5 < 0.5 is false
+    assert list(b.commands) == []
+    b = make_prop(0.49)
+    feed(b, deficits=(-8.0, 4.0, 0.0))
+    assert list(b.commands) == ["hub_b"]
+
+
+def test_proportional_driver_always_moves_when_the_need_covers_all_the_spare():
+    b = make_prop(0.999)
+    feed(b, deficits=(-5.0, 8.0, 0.0))                         # min(8, 5) / 5 = 1
+    assert list(b.commands) == ["hub_b"]
+
+
+def test_proportional_driver_still_needs_the_gain_test():
+    b = make_prop(0.0)
+    feed(b, deficits=(-1.0, 8.0, 0.0))                         # same stay as v2: its cell has hardly a driver to spare
+    assert list(b.commands) == []
+
+
+def test_a_fresh_draw_comes_with_each_change_of_the_published_load():
+    b = make_prop(0.9)
+    feed(b, deficits=(-8.0, 4.0, 0.0))
+    assert list(b.commands) == []
+    b.rng = FixedDice(0.1)
+    feed(b, deficits=(-8.0, 4.0, 0.0))                         # same load: same draw, nothing new
+    assert list(b.commands) == []
+    feed(b, deficits=(-8.0, 4.5, 0.0), t=60.0)                 # load changed: new draw 0.1 < 0.5625
+    assert list(b.commands) == ["hub_b"]
+    assert [round(u, 1) for _, u in b.draws] == [0.9, 0.1]
+    assert b.command_times == [60.0]
+
+
+def test_the_default_dice_differ_between_brains_but_repeat_for_one_jid():
+    a1 = DriverBrain("a@localhost", "pw", DRIVER, policy="proportional")
+    a2 = DriverBrain("a@localhost", "pw", DRIVER, policy="proportional")
+    b = DriverBrain("b@localhost", "pw", DRIVER, policy="proportional")
+    assert a1.rng.random() == a2.rng.random()
+    assert a1.rng.random() != b.rng.random()

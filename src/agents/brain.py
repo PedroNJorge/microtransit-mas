@@ -14,7 +14,9 @@ unchanged beliefs do not re-trigger plans.
 """
 import asyncio
 import logging
+import random
 import uuid
+import zlib
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
@@ -31,7 +33,8 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_ASL = str(Path(__file__).parent / "brains" / "driver.asl")              # v1: from the calls for proposals it heard
 SIGNAL_ASL = str(Path(__file__).parent / "brains" / "driver_signal.asl")        # v2: from the hubs' published load
-POLICIES = {"pressure": DEFAULT_ASL, "signal": SIGNAL_ASL}
+PROPORTIONAL_ASL = str(Path(__file__).parent / "brains" / "driver_proportional.asl")   # v3: v2 + move with probability needed/spare
+POLICIES = {"pressure": DEFAULT_ASL, "signal": SIGNAL_ASL, "proportional": PROPORTIONAL_ASL}
 PERCEPT_TAG = frozenset([asp.Literal("source", (asp.Literal("percept"),))])
 
 
@@ -66,7 +69,7 @@ class DriverBrain(BDIAgent):
 
     def __init__(self, jid: str, password: str, driver_jid: str, asl: Optional[str] = None,
                  cooldown: Optional[float] = None, bid_policy: bool = False, drive_cost: float = 0.0015,
-                 policy: str = "pressure", **kwargs):
+                 policy: str = "pressure", seed: Optional[int] = None, **kwargs):
         if policy not in POLICIES:
             raise ValueError(f"policy must be one of {sorted(POLICIES)}")
         self.policy = policy
@@ -76,7 +79,11 @@ class DriverBrain(BDIAgent):
         self.markups: list = []                       # markups this brain has set
         self._markup = 0.0
         self.driver_jid = bare(driver_jid)
-        self.cooldown = cooldown if cooldown is not None else (600.0 if policy == "signal" else 240.0)                      # sim seconds after a move during which no switch is considered
+        self.cooldown = cooldown if cooldown is not None else (240.0 if policy == "pressure" else 600.0)                      # sim seconds after a move during which no switch is considered
+        self.rng = random.Random(zlib.crc32(jid.encode()) if seed is None else seed)   # the brain's own dice (belief draw)
+        self._deficits_seen: tuple = ()
+        self.draws: list = []                         # (sim time, draw) each time the published load changed
+        self.command_times: list = []                 # sim time of each command in `commands`
         self.sim_now = 0.0                            # time of the latest percept (sim seconds)
         self.last_move = -1e18
         self.commands: list = []                      # hubs this brain has sent its driver to
@@ -93,6 +100,7 @@ class DriverBrain(BDIAgent):
         def _cruise_to(agent, term, intention):
             hub = str(asp.grounded(term.args[0], intention.scope))
             self.commands.append(hub)
+            self.command_times.append(self.sim_now)
             self.last_move = self.sim_now
             msg = make_message(self.driver_jid, Perf.REQUEST, Protocol.DRIVER_BRAIN,
                                CruiseCommand(self.driver_jid, hub), f"cruise-{uuid.uuid4().hex[:8]}")
@@ -162,4 +170,9 @@ class DriverBrain(BDIAgent):
         self._set({("bid_policy", ""): ()} if self.bid_policy else {}, "bid_policy")
         self._set({("eta", h): (h, e) for h, e in zip(p.hub_ids, p.etas) if e >= 0}, "eta")
         self._set({("pressure", h): (h, q) for h, q in zip(p.hub_ids, p.pressures)}, "pressure")
+        if tuple(p.deficits) != self._deficits_seen:                          # new published load: a fresh draw
+            self._deficits_seen = tuple(p.deficits)
+            u = self.rng.random()
+            self.draws.append((p.sent_at, u))
+            self._set({("draw", ""): (u,)}, "draw")
         self._set({("deficit", h): (h, d) for h, d in zip(p.hub_ids, p.deficits)}, "deficit")

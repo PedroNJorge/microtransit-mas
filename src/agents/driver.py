@@ -350,6 +350,12 @@ class TripRunner(OneShotBehaviour):
 
 
 # ---------------------------------------------------------------------------------------------
+def stop_needed(stop: str, boarding, dropped) -> bool:
+    """Does anybody still on board get off at `stop`? The planned route has a stop for every rider of the pool, including
+    one who did not show up: driving there would be empty, unpaid km, shown on the map as a trip with nobody inside."""
+    return any(dest == stop and jid not in dropped for jid, _, dest, _ in boarding)
+
+
 class DriverAgent(BaseAgent):
     role = "driver"
     subscribes_to_traffic = True
@@ -863,6 +869,8 @@ class DriverAgent(BaseAgent):
         await self.announce(beh)
         # drive the planned order, dropping off as we go
         for stop in (a.route or a.offer.route)[1:]:
+            if not stop_needed(stop, boarding, a.dropped):
+                continue                                           # nobody on board goes there (a no-show's stop, or all dropped)
             await self.drive(stop, a)
             await clock.sim_sleep(self.dwell_dropoff)
             for jid, req, dest, rpool in boarding:

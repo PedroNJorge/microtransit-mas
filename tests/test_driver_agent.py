@@ -314,3 +314,12 @@ async def test_empty_driving_is_attributed_to_its_cause(net):
     d.record_hop("n1_3", "n1_4", 10.0, None)
     assert d.odo_sub_s == {"return": 0.0, "move": 10.0, "reposition": 10.0}
     assert sum(d.odo_sub_m.values()) == pytest.approx(d.odo_m["other"])
+
+
+def test_a_stop_is_driven_to_only_if_somebody_on_board_gets_off_there():
+    from agents.driver import stop_needed
+    boarding = [("r1@l", "q1", "n2_2", "p"), ("r2@l", "q2", "n3_3", "p")]        # r3 (to n4_4) did not show up
+    assert stop_needed("n2_2", boarding, dropped=[])
+    assert not stop_needed("n4_4", boarding, dropped=[])                           # the no-show's stop
+    assert not stop_needed("n2_2", boarding, dropped=["r1@l"])                     # already dropped
+    assert stop_needed("n3_3", boarding, dropped=["r1@l"])

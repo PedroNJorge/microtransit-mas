@@ -23,7 +23,8 @@ Schema (all sections but "graph" and "hubs" are optional):
   # optional driver intelligence (all off by default):
   #   "brains": true          every driver gets a BDI brain agent (brain_01, ...) that picks where it waits
   #   "brain_bids": true      the brain also sets the driver's bid markup (needs "brains")
-  #   "brain_policy": "signal" | "pressure"   what the brain decides from: the hubs' published load, or the calls it heard
+  #   "brain_policy": "signal" | "proportional" | "pressure"   what the brain decides from: the hubs' published load (all
+  #                    eligible drivers move, or each with probability needed/spare), or the calls it heard
   #   "brain_drive_cost": 0.0015   the brain's distance weight (pressure units per second of driving; larger = stays closer)
   #   "return_policy": "nearest_hub" | "start_hub" | "none"   fixed rule, no BDI (ignored when "brains")
   "riders":  {"count": 2},
@@ -326,8 +327,8 @@ class Scenario:
         brains, brain_bids = d.get("brains", False), d.get("brain_bids", False)
         return_policy = d.get("return_policy", "none")
         brain_policy = d.get("brain_policy", "signal")
-        if brain_policy not in ("signal", "pressure"):
-            raise ScenarioError("drivers.brain_policy must be signal or pressure")
+        if brain_policy not in ("signal", "proportional", "pressure"):
+            raise ScenarioError("drivers.brain_policy must be signal, proportional or pressure")
         drive_cost = d.get("brain_drive_cost", 0.0015)
         if isinstance(drive_cost, bool) or not isinstance(drive_cost, (int, float)) or drive_cost < 0:
             raise ScenarioError("drivers.brain_drive_cost must be a number >= 0")

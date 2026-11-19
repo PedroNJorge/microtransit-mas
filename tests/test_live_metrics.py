@@ -102,3 +102,12 @@ def test_empty_km_by_cause_and_revenue_per_hour_driven():
     assert c["km_return"] == pytest.approx(0.3) and c["km_move"] == pytest.approx(0.2) and c["km_reposition"] == 0.0
     assert c["km_return"] + c["km_move"] + c["km_reposition"] == pytest.approx(c["km_other"])
     assert c["earnings_per_driven_hour"] == pytest.approx(15.0 / (500.0 / 3600.0))      # only d1 reports its seconds
+
+
+def test_mover_stats_counts_moves_per_minute_and_their_dispersion():
+    from harness.live_metrics import mover_stats
+    assert mover_stats([[], []]) is None
+    even = mover_stats([[10.0], [70.0], [130.0]])                 # one mover in each of three minutes
+    assert even["ticks"] == 3 and even["movers"] == 3 and even["dispersion"] == 0.0 and even["share_in_group"] == 0.0
+    herd = mover_stats([[10.0, 70.0], [20.0], [30.0], [40.0]])    # four movers in minute 0, one in minute 1
+    assert herd["movers"] == 5 and herd["share_in_group"] == 0.8 and herd["dispersion"] > 0

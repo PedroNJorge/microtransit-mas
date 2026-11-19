@@ -57,7 +57,7 @@ from common.settings import (
 from protocols.match_auction import AuctionContext, MATCHED, MatchAuctionFSM, RETRY
 from protocols.pool_formation import BatchWindow, QueuedRequest, handle_decline, window_closes_at
 from protocols.inter_hub import (
-    HANDED_OVER, OVERFLOW_PENDING, HeartbeatReceiver, InterHubWatcher, OverflowReceiver, OverflowReplies, OverflowWait,
+    HANDED_OVER, OVERFLOW_PENDING, HeartbeatReceiver, InterHubWatcher, OverflowAccepted, OverflowReceiver, OverflowReplies, OverflowWait,
     PeerView, _Send, neighbours, overflow_target, refund_request,
 )
 from protocols.payment_common import bare
@@ -641,7 +641,7 @@ class MicrohubAgent(BaseAgent):
                  max_batch: int = MAX_BATCH, solver: str = POOL_SOLVER, detour_weight: float = DETOUR_WEIGHT,
                  solo_fallback: bool = True, reserve_margin: Optional[float] = None,
                  pickup_allowance: float = PICKUP_ALLOWANCE, max_pickup_eta: Optional[float] = None,
-                 retry_delay: float = 0.0, window_slack: float = 0.0, broadcast_demand: bool = False,
+                 retry_delay: float = 0.0, window_slack: float = 0.0, broadcast_demand: bool = False, relax_expired_windows: bool = False,
                  peer_jids: Optional[Dict[str, str]] = None, t_heartbeat: float = T_HEARTBEAT,
                  t_failover: float = T_FAILOVER, overflow_after: int = OVERFLOW_AFTER,
                  k_neighbours: int = HUB_NEIGHBOURS, t_overflow_reply: float = T_OVERFLOW_REPLY,
@@ -691,6 +691,7 @@ class MicrohubAgent(BaseAgent):
         self.queue: List[QueuedRequest] = []
         self.reserve_margin, self.pickup_allowance = reserve_margin, pickup_allowance
         self.max_pickup_eta, self.retry_delay, self.window_slack = max_pickup_eta, retry_delay, window_slack
+        self.relax_expired_windows = relax_expired_windows   # patient runs: a window that has run out is restarted for the drivers
         self._waking = False
         self.broadcast_demand = broadcast_demand      # tell drivers that were not called about the request (BDI input)
         self.arrivals: deque = deque()                # sim times of the requests that entered this hub (last 10 minutes kept)
@@ -706,6 +707,7 @@ class MicrohubAgent(BaseAgent):
             else set(self.peer_jids)
         self.peers: Dict[str, PeerView] = {h: PeerView(h, j) for h, j in self.peer_jids.items() if h in near}
         self.overflow_waits: Dict[str, OverflowWait] = {}
+        self.overflow_offers: Dict[str, tuple] = {}     # pool id -> (requests, from_hub, reason, from jid, keep until): agreed, not yet accepted
         self.overflow_tried: set = set()                 # pool ids already offered to a neighbour
         self.adopted: List[str] = []                     # request ids taken over from other hubs
         self.emission_g_per_km = emission_g_per_km
@@ -1317,6 +1319,7 @@ class MicrohubAgent(BaseAgent):
             self.add_behaviour(OverflowReceiver(), make_template(Protocol.INTER_HUB, Perf.REQUEST))
             self.add_behaviour(OverflowReplies(), make_template(Protocol.INTER_HUB, Perf.AGREE))
             self.add_behaviour(OverflowReplies(), make_template(Protocol.INTER_HUB, Perf.REFUSE))
+            self.add_behaviour(OverflowAccepted(), make_template(Protocol.INTER_HUB, Perf.ACCEPT))
             self.add_behaviour(InterHubWatcher())
         if self.reposition_rules is not None:
             self.add_behaviour(DemandForecastReceiver(), make_template(Protocol.DEMAND_FORECAST, Perf.INFORM))
