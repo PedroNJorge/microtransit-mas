@@ -50,9 +50,10 @@ def port_open(host: str, port: int, timeout: float = 0.3) -> bool:
 
 
 class Harness:
-    def __init__(self, scenario: Scenario, start_server: bool = True):
+    def __init__(self, scenario: Scenario, start_server: bool = True, viewer: bool = True):
         self.scenario = scenario
         self.start_server = start_server
+        self.viewer = viewer                            # False (experiments): no WebSocket server for the map
         self.agents: Dict[str, BaseAgent] = {}          # jid -> agent, in start order
         self.network: Optional[TransitNetwork] = None
         self._server: Optional[asyncio.subprocess.Process] = None
@@ -159,7 +160,8 @@ class Harness:
         sc = self.scenario
         await self.ensure_server()
         self.network = TransitNetwork.from_file(str(sc.graph_path))
-        self._ws_server = await start_ws_server()       # <-- Liga o WebSocket na porta 8765
+        if self.viewer:
+            self._ws_server = await start_ws_server()   # <-- Liga o WebSocket na porta 8765
         clock.start(sc.speed)
         try:
             for spec in sc.roster():
@@ -172,7 +174,7 @@ class Harness:
         if sc.demand or sc.events or sc.forecasts:
             self.runner = ScenarioRunner(self)
             self.runner.start()
-        self.metrics = MetricsCollector(self)
+        self.metrics = MetricsCollector(self, broadcast=self.viewer)
         self.metrics.start()
         self._health = asyncio.create_task(self._watch_health())
         logger.info("Scenario %r up: %d agents", sc.name, len(self.agents))

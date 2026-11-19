@@ -417,9 +417,17 @@ class TripReports(CyclicBehaviour):
         done = [lr for lr in rec.late if lr.jid in rep.rider_ids]
         for lr in rec.late:
             lrec = lr.rec
-            if lr not in done:                                              # did not show up / was not driven
+            if lr not in done:                                              # the driver did not carry him
                 lrec.state, lrec.pool.status = "CANCELLED", PoolStatus.DISSOLVED
-                await self.refund(lrec, [lr.jid], FailureReason.RIDER_CANCELLED)
+                await self.refund(lrec, [lr.jid], FailureReason.NO_MATCH)
+                # He was told "matched" and must not wait for ever for a ride that is not coming: he starts over at this
+                # hub (as when a late join is abandoned), through the normal pooling and auction.
+                req = lrec.pool.requests[0]
+                hub.log(f"late joiner {lrec.pool.pool_id} was not driven by {match.driver_id}: back to the queue")
+                await self.send(make_message(lr.jid, Perf.INFORM, Protocol.INTER_HUB,
+                                             Handover(req.request_id, hub.hub_id, hub.hub_id, str(hub.jid.bare),
+                                                      FailureReason.NO_MATCH), req.request_id))
+                await admit_request(self, hub, req, lr.jid, allow_late=False)
                 continue
             lrec.state, lrec.pool.status = "COMPLETED", PoolStatus.COMPLETED
             hub.log(f"pool {lrec.pool.pool_id} (late joiner of {rec.pool.pool_id}) completed; settling {lr.jid}")

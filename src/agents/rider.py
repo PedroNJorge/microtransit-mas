@@ -59,7 +59,7 @@ TRANSITIONS = {
     AWAITING_POOL: {DECIDING, IDLE},
     DECIDING: {AWAITING_MATCH, AWAITING_POOL, IDLE},      # AWAITING_POOL again = re-pooled (a co-rider declined)
     AWAITING_MATCH: {DRIVER_EN_ROUTE, AWAITING_POOL, IDLE},   # AWAITING_POOL again = handed over to another hub
-    DRIVER_EN_ROUTE: {IN_TRIP, IDLE},
+    DRIVER_EN_ROUTE: {IN_TRIP, AWAITING_POOL, IDLE},   # AWAITING_POOL again = a late join fell through: start over at the same hub
     IN_TRIP: {RATING, IDLE},
     RATING: {IDLE},
 }
@@ -402,13 +402,15 @@ class RiderAgent(BaseAgent):
         retry_here = payload.from_hub == payload.to_hub                    # same hub starts over (a late join fell through)
         if sender != new or new not in self.hubs.values() or (new == t.hub_jid and not retry_here):
             return
-        if self.state not in (REQUESTING, AWAITING_POOL, DECIDING, AWAITING_MATCH):
+        if self.state not in (REQUESTING, AWAITING_POOL, DECIDING, AWAITING_MATCH) \
+                and not (retry_here and self.state == DRIVER_EN_ROUTE):     # a late join can fall through after the match
             return                                                         # a driver is already on its way
         t.hub_jid, t.pool_id, t.proposal = new, "", None
+        t.match, t.matched_at = None, 0.0
         if payload.to_hub not in t.tried_hubs:
             t.tried_hubs.append(payload.to_hub)
         t.sent_at = clock.now()
-        if self.state in (DECIDING, AWAITING_MATCH):
+        if self.state in (DECIDING, AWAITING_MATCH, DRIVER_EN_ROUTE):
             self.go(AWAITING_POOL, f"handed over to {payload.to_hub}")
         else:
             t.log.append(f"{self.state}: handed over to {payload.to_hub}")

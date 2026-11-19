@@ -77,7 +77,7 @@ def test_default_rating_penalises_a_late_pickup_and_a_window_miss():
 
 def test_a_match_does_not_start_the_trip_only_boarding_does():
     assert IN_TRIP not in TRANSITIONS[AWAITING_MATCH]            # you cannot be "in trip" straight from the match
-    assert TRANSITIONS[DRIVER_EN_ROUTE] == {IN_TRIP, IDLE}
+    assert TRANSITIONS[DRIVER_EN_ROUTE] == {IN_TRIP, AWAITING_POOL, IDLE}    # AWAITING_POOL: a late join fell through
 
 
 def _refuse_outside_coverage(r):
@@ -124,3 +124,28 @@ def test_the_cap_still_applies_when_the_ratio_would_allow_more():
 
 def test_without_a_ratio_the_tolerance_is_what_the_request_says():
     assert rider().request_trip("n2_2", 10.0, detour_tolerance=600.0).detour_tolerance == 600.0
+
+
+def _matched_rider():
+    r, t = rider(), record()
+    r.trip = t
+    r.state = DRIVER_EN_ROUTE
+    t.pool_id = "pool-late"
+    t.match = MatchResult("pool-late", "d@localhost", 3.0, pickup_eta=100.0, rider_fares={})
+    t.matched_at = 10.0
+    return r, t
+
+
+def test_a_late_join_that_falls_through_after_the_match_sends_the_rider_back_to_the_queue():
+    from common.ontology import FailureReason, Handover
+    r, t = _matched_rider()
+    r.on_handover(t, "hub@localhost", Handover("q", "n1_1", "n1_1", "hub@localhost", FailureReason.NO_MATCH))
+    assert r.state == AWAITING_POOL and t.match is None and t.pool_id == ""
+
+
+def test_a_handover_to_another_hub_is_still_ignored_once_a_driver_is_on_the_way():
+    from common.ontology import FailureReason, Handover
+    r, t = _matched_rider()
+    r.hubs["n1_4"] = "other@localhost"
+    r.on_handover(t, "other@localhost", Handover("q", "n1_1", "n1_4", "other@localhost", FailureReason.HUB_FAILED))
+    assert r.state == DRIVER_EN_ROUTE and t.match is not None
