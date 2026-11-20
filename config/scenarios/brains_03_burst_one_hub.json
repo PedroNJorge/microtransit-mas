@@ -7,7 +7,7 @@
     "password": "dev-password"
   },
   "clock": {
-    "speed": 15
+    "speed": 60
   },
   "graph": "config/porto_graph.json",
   "hubs": "all",

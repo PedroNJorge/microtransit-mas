@@ -1,0 +1,29 @@
+{
+ "arms": [
+  {
+   "name": "no_brain",
+   "scenario": "config/scenarios/06_hub_failure.json",
+   "set": {}
+  },
+  {
+   "name": "signal",
+   "scenario": "config/scenarios/brains_06_hub_failure.json",
+   "set": {}
+  },
+  {
+   "name": "proportional",
+   "scenario": "config/scenarios/brains_06_hub_failure.json",
+   "set": {
+    "drivers.brain_policy": "proportional"
+   }
+  }
+ ],
+ "seeds": [
+  1,
+  2,
+  3
+ ],
+ "repeats": 1,
+ "speed": 15.0,
+ "timeout": 0.0
+}
