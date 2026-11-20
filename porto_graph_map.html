@@ -979,4 +979,189 @@
         }
     };
 </script>
+<!-- ===== Metrics panel: headline strip + one toggle tab at a time (data: METRICS events, see harness/live_metrics.py) ===== -->
+<style>
+  #mx-bar { position: fixed; bottom: 14px; left: 50%; transform: translateX(-50%); z-index: 1000; display: flex; gap: 14px;
+            align-items: center; background: rgba(255,255,255,0.96); padding: 8px 14px; border-radius: 10px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.25); font-family: sans-serif; font-size: 12px; color: #222; max-width: 96vw; flex-wrap: nowrap; overflow-x: auto; }
+  #mx-tabs { display: flex; gap: 6px; }
+  .mx-tab { white-space: nowrap; }
+  #mx-bar .kpi { text-align: center; min-width: 70px; }
+  #mx-bar .kpi b { display: block; font-size: 16px; }
+  #mx-bar .kpi span { color: #666; font-size: 10px; text-transform: uppercase; letter-spacing: .03em; }
+  #mx-bar .sep { width: 1px; align-self: stretch; background: #ddd; }
+  .mx-tab { border: 1px solid #cbd5e1; background: #f8fafc; border-radius: 6px; padding: 5px 10px; cursor: pointer; font-size: 12px; }
+  .mx-tab:hover { background: #e2e8f0; }
+  .mx-tab.open { background: #0f766e; color: #fff; border-color: #0f766e; }
+  #mx-drawer { position: fixed; top: 235px; right: 15px; width: 430px; max-height: calc(100vh - 335px); overflow-y: auto; z-index: 1000;
+               background: rgba(255,255,255,0.97); border-radius: 10px; box-shadow: 0 2px 12px rgba(0,0,0,0.3);
+               font-family: sans-serif; font-size: 12px; display: none; padding: 10px 12px; }
+  #mx-drawer h4 { margin: 0; font-size: 14px; }
+  #mx-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+  .mx-mode button { border: 1px solid #cbd5e1; background: #fff; padding: 3px 9px; cursor: pointer; font-size: 11px; }
+  .mx-mode button:first-child { border-radius: 6px 0 0 6px; } .mx-mode button:last-child { border-radius: 0 6px 6px 0; }
+  .mx-mode button.on { background: #0f766e; color: #fff; border-color: #0f766e; }
+  .mx-chart { margin-bottom: 12px; }
+  .mx-chart .t { font-weight: bold; margin-bottom: 2px; }
+  .mx-chart .note { color: #777; font-size: 10px; }
+  .mx-chart canvas { width: 100%; height: 118px; display: block; }
+  .mx-legend { display: flex; flex-wrap: wrap; gap: 4px 12px; font-size: 11px; margin-top: 2px; }
+  .mx-legend i { display: inline-block; width: 10px; height: 3px; margin-right: 4px; vertical-align: middle; }
+</style>
+<div id="mx-bar">
+  <div class="kpi"><b id="kpi-rpv">–</b><span>riders / vehicle</span></div>
+  <div class="kpi"><b id="kpi-co2">–</b><span>CO₂ saved, all miles</span></div>
+  <div class="kpi"><b id="kpi-wait">–</b><span>mean wait</span></div>
+  <div class="kpi"><b id="kpi-profit">–</b><span>profit / trip</span></div>
+  <div class="sep"></div>
+  <div id="mx-tabs"></div>
+</div>
+<div id="mx-drawer">
+  <div id="mx-head"><h4 id="mx-title"></h4>
+    <div class="mx-mode"><button id="mx-cum" class="on">Cumulative</button><button id="mx-roll">Rolling 10 min</button></div></div>
+  <div id="mx-charts"></div>
+</div>
+<script>
+(function () {
+  // unit -> formatter
+  const F = {
+    pct: v => (100 * v).toFixed(0) + "%", eur: v => v.toFixed(2) + " €", kg: v => v.toFixed(2) + " kg", s: v => v.toFixed(0) + " s",
+    km: v => v.toFixed(1) + " km", n: v => v.toFixed(2), x: v => v.toFixed(2) + "×", h: v => v.toFixed(1) + " €/h", int: v => v.toFixed(0)
+  };
+  const C = ["#0f766e", "#2563eb", "#d97706", "#dc2626", "#7c3aed", "#64748b"];
+  // series: [key, label]; src: "m" metric of cum/roll, "now" instantaneous; cumOnly: always cumulative
+  const TABS = [
+    { id: "pool", name: "Pooling & environment", charts: [
+      { t: "Riders per vehicle", u: "n", s: [["riders_per_vehicle", "riders / vehicle"]] },
+      { t: "Direct passenger-km per vehicle-km", u: "n", s: [["pax_km_per_veh_km", "pax-km / veh-km"]] },
+      { t: "Riders who pooled / joined late", u: "pct", s: [["pooled_share", "pooled"], ["late_share", "late join"]] },
+      { t: "CO₂ saved", u: "kg", note: "loaded leg = what the incentive pays on; all miles = the honest footprint (adds the pickup legs riders would each have needed alone)",
+        s: [["co2_saved_loaded_kg", "loaded leg"], ["co2_saved_all_kg", "all miles"]] },
+      { t: "All-miles saving, share of solo driving", u: "pct", s: [["co2_saved_all_pct", "all-miles saving"]] },
+      { t: "Vehicle-km by activity", u: "km", s: [["km_loaded", "loaded"], ["km_pickup", "to pickup"], ["km_return", "back to nearest hub"], ["km_move", "to a better hub"], ["km_reposition", "hub-ordered repositioning"]] },
+      { t: "Pool size mix", u: "pct", s: [["size_1", "1 rider"], ["size_2", "2"], ["size_3", "3"], ["size_4", "4"]] } ] },
+    { id: "riders", name: "Riders", charts: [
+      { t: "Fare per rider", u: "eur", s: [["fare_gross", "gross"], ["fare_net", "net (after rebates)"]] },
+      { t: "Fare per direct minute", u: "eur", s: [["fare_per_min", "€ / min"]] },
+      { t: "Rebates per rider", u: "eur", s: [["subsidy", "subsidy"], ["incentive", "CO₂ incentive"], ["pooling_discount", "pooling discount (pooled)"]] },
+      { t: "Wait, request to boarding", u: "s", s: [["wait_mean", "mean"], ["wait_p90", "p90"], ["wait_max", "max"]] },
+      { t: "Detour (ride time / direct time)", u: "x", s: [["detour_mean", "mean"]] },
+      { t: "Completion rate", u: "pct", cumOnly: true, note: "cumulative only", s: [["completion_rate", "completed / ended"]] } ] },
+    { id: "drivers", name: "Drivers", charts: [
+      { t: "Per vehicle-trip", u: "eur", s: [["revenue_per_trip", "revenue"], ["profit_per_trip", "profit"]] },
+      { t: "Earnings per driver-hour", u: "h", s: [["earnings_per_hour", "per shift hour"], ["earnings_per_driven_hour", "per hour driven"]] },
+      { t: "Utilisation", u: "pct", note: "sampled once a minute of simulated time",
+        s: [["util_loaded", "loaded"], ["util_pickup", "to pickup"], ["util_idle", "idle"], ["util_cruising", "cruising"], ["util_repositioning", "repositioning"]] },
+      { t: "Deadhead share of km", u: "pct", s: [["deadhead_share", "empty km / all km"]] },
+      { t: "Earnings inequality (Gini)", u: "n", s: [["gini", "Gini"]] } ] },
+    { id: "market", name: "Market & system", charts: [
+      { t: "Time to match", u: "s", s: [["time_to_match", "request → matched"]] },
+      { t: "Auction attempts per pool", u: "n", cumOnly: true, note: "cumulative only", s: [["auction_attempts", "mean attempts"]] },
+      { t: "Hub queues and idle drivers", u: "int", src: "now", s: [["queue_len", "queued requests"], ["idle_drivers", "idle drivers"]] },
+      { t: "Fund spending", u: "eur", cumOnly: true, note: "cumulative only", s: [["subsidy_spent", "subsidy"], ["pooling_spent", "pooling incentive"]] },
+      { t: "Incentive cost per kg CO₂ saved", u: "eur", cumOnly: true, note: "cumulative only", s: [["pooling_eur_per_kg", "€ / kg"]] } ] }
+  ];
+  const history = [];
+  let mode = "cum", openTab = null;
+
+  const bar = document.getElementById("mx-tabs"), drawer = document.getElementById("mx-drawer");
+  TABS.forEach(tab => {
+    const b = document.createElement("button");
+    b.className = "mx-tab"; b.textContent = tab.name; b.dataset.id = tab.id;
+    b.onclick = () => { openTab = (openTab === tab.id) ? null : tab.id; render(); };   // one open at a time; a second click closes
+    bar.appendChild(b);
+  });
+  document.getElementById("mx-cum").onclick = () => { mode = "cum"; render(); };
+  document.getElementById("mx-roll").onclick = () => { mode = "roll"; render(); };
+
+  function val(snap, chart, key) {
+    if (chart.src === "now") return snap.now ? snap.now[key] : null;
+    const m = (chart.cumOnly || mode === "cum") ? snap.cum : snap.roll;
+    const v = m ? m[key] : null;
+    return v === undefined ? null : v;
+  }
+
+  function drawChart(canvas, chart) {
+    const dpr = window.devicePixelRatio || 1, w = canvas.clientWidth, h = canvas.clientHeight;
+    canvas.width = w * dpr; canvas.height = h * dpr;
+    const g = canvas.getContext("2d"); g.scale(dpr, dpr); g.clearRect(0, 0, w, h);
+    const pad = { l: 46, r: 8, t: 6, b: 18 };
+    const pts = chart.s.map(([k]) => history.map(s => [s.t, val(s, chart, k)]));
+    const ys = pts.flat().map(p => p[1]).filter(v => v !== null && isFinite(v));
+    const t0 = history.length ? history[0].t : 0, t1 = history.length ? history[history.length - 1].t : 1;
+    g.font = "10px sans-serif"; g.fillStyle = "#666"; g.strokeStyle = "#e5e7eb";
+    if (!ys.length) { g.fillText("no data yet", pad.l + 6, h / 2); return; }
+    let lo = Math.min(0, ...ys), hi = Math.max(...ys);
+    if (hi === lo) hi = lo + 1;
+    hi += (hi - lo) * 0.05;
+    const X = t => pad.l + (t1 === t0 ? 0 : (t - t0) / (t1 - t0)) * (w - pad.l - pad.r);
+    const Y = v => h - pad.b - (v - lo) / (hi - lo) * (h - pad.t - pad.b);
+    const f = F[chart.u] || F.n;
+    for (let i = 0; i <= 3; i++) {                                   // gridlines + y labels
+      const v = lo + (hi - lo) * i / 3, y = Y(v);
+      g.beginPath(); g.moveTo(pad.l, y); g.lineTo(w - pad.r, y); g.stroke();
+      g.fillText(f(v), 2, y + 3);
+    }
+    g.fillText((t0 / 60).toFixed(0) + " min", pad.l, h - 4);
+    const e = (t1 / 60).toFixed(0) + " min"; g.fillText(e, w - pad.r - g.measureText(e).width, h - 4);
+    pts.forEach((line, i) => {
+      g.strokeStyle = C[i % C.length]; g.lineWidth = 1.8; g.beginPath();
+      let pen = false;
+      line.forEach(([t, v]) => {
+        if (v === null || !isFinite(v)) { pen = false; return; }     // gaps where the metric is undefined
+        if (!pen) { g.moveTo(X(t), Y(v)); pen = true; } else g.lineTo(X(t), Y(v));
+      });
+      g.stroke();
+    });
+  }
+
+  function render() {
+    document.querySelectorAll(".mx-tab").forEach(b => b.classList.toggle("open", b.dataset.id === openTab));
+    document.getElementById("mx-cum").classList.toggle("on", mode === "cum");
+    document.getElementById("mx-roll").classList.toggle("on", mode === "roll");
+    const tab = TABS.find(t => t.id === openTab);
+    drawer.style.display = tab ? "block" : "none";
+    if (tab) {
+      document.getElementById("mx-title").textContent = tab.name;
+      const box = document.getElementById("mx-charts");
+      if (box.dataset.tab !== tab.id) {                                // build the charts of this tab once
+        box.dataset.tab = tab.id; box.innerHTML = "";
+        tab.charts.forEach((ch, ci) => {
+          const d = document.createElement("div"); d.className = "mx-chart";
+          d.innerHTML = `<div class="t">${ch.t}${ch.note ? ` <span class="note">(${ch.note})</span>` : ""}</div><canvas></canvas><div class="mx-legend"></div>`;
+          box.appendChild(d);
+        });
+      }
+      const last = history[history.length - 1];
+      box.querySelectorAll(".mx-chart").forEach((d, ci) => {
+        const ch = tab.charts[ci];
+        drawChart(d.querySelector("canvas"), ch);
+        d.querySelector(".mx-legend").innerHTML = ch.s.map(([k, label], i) => {
+          const v = last ? val(last, ch, k) : null, f = F[ch.u] || F.n;
+          return `<span><i style="background:${C[i % C.length]}"></i>${label}: <b>${v === null || v === undefined ? "–" : f(v)}</b></span>`;
+        }).join("");
+      });
+    }
+    const last = history[history.length - 1];                          // headline strip: always cumulative
+    if (last) {
+      const c = last.cum, set = (id, v, f) => { document.getElementById(id).textContent = (v === null || v === undefined) ? "–" : f(v); };
+      set("kpi-rpv", c.riders_per_vehicle, F.n); set("kpi-co2", c.co2_saved_all_kg, F.kg);
+      set("kpi-wait", c.wait_mean, F.s); set("kpi-profit", c.profit_per_trip, F.eur);
+    }
+  }
+
+  const sock = (typeof ws !== "undefined") ? ws : null;
+  if (sock) {
+    sock.addEventListener("open", () => { history.length = 0; render(); });      // the server replays the whole history
+    sock.addEventListener("message", ev => {
+      let msg; try { msg = JSON.parse(ev.data); } catch (e) { return; }
+      if (msg.type !== "METRICS") return;
+      history.push(msg.data);
+      if (!render.pending) { render.pending = true; requestAnimationFrame(() => { render.pending = false; render(); }); }
+    });
+  }
+  window.addEventListener("resize", render);
+  render();
+})();
+</script>
 </html>

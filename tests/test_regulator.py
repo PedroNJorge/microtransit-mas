@@ -108,7 +108,7 @@ async def test_new_version_keeps_what_it_does_not_change(xmpp_server, sim_clock,
 async def test_a_cap_below_the_sustainable_driver_level_is_not_published(xmpp_server, sim_clock, net):
     async with World(net) as w:
         with pytest.raises(ValueError):
-            w.reg.publish_policy(fare_caps={"max": 1.0})
+            w.reg.publish_policy(fare_caps={"max": 0.9})            # driver_floor is 1.00
         assert w.reg.book.latest is None
 
 
@@ -142,19 +142,19 @@ async def test_a_policy_can_take_effect_later(xmpp_server, sim_clock, net):
 # ---- RI-01: the cap binds the auction -------------------------------------------------------------
 
 async def test_fare_never_exceeds_the_cap(xmpp_server, sim_clock, net):
-    async with World(net, drivers=(HUB, "n4_1")) as w:
-        w.reg.publish_policy(fare_caps={"max": 3.0})
+    async with World(net, drivers=(HUB, "n4_1"), reg_kw={"driver_floor": 0.1}) as w:
+        w.reg.publish_policy(fare_caps={"max": 0.28})
         assert await w.acked(n=1 + 2 + 1)
         trip = await w.ride()
-        assert trip.outcome == COMPLETED and trip.match.final_fare <= 3.0 + 1e-9
-        assert trip.proposal.split_fare == 3.0                           # the rider is told the ceiling up front
-        # the 3-hop driver's cost (3.20) is above the cap: it refused, only one bid reached the hub
+        assert trip.outcome == COMPLETED and trip.match.final_fare <= 0.28 + 1e-9
+        assert trip.proposal.split_fare == 0.28                           # the rider is told the ceiling up front
+        # the 3-hop driver's cost (0.32) is above the cap: it refused, only one bid reached the hub
         assert len(w.hub.finished[-1].bids) == 1
 
 
 async def test_a_cap_below_every_drivers_cost_leaves_the_rider_unmatched_and_refunded(xmpp_server, sim_clock, net):
-    async with World(net, hub_kw={"t_auction": 40.0}) as w:
-        w.reg.publish_policy(fare_caps={"max": 2.2})                      # above the floor (2.0), below the cost (2.48)
+    async with World(net, hub_kw={"t_auction": 40.0}, reg_kw={"driver_floor": 0.1}) as w:
+        w.reg.publish_policy(fare_caps={"max": 0.2})                      # above the floor (0.1), below the cost (0.23)
         assert await w.acked()
         trip = await w.ride()
         assert trip.outcome == UNMATCHED

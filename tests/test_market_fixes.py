@@ -10,7 +10,7 @@ from agents.rider import balanced_hub_policy
 from common import clock
 from common.graph import build_grid_network
 from common.ontology import DriverState, DriverStatus, TripRequest
-from common.settings import DRIVER_BASE_COST, DRIVER_COST_PER_SECOND
+from common.costs import driver_cost, dwell_seconds
 from harness.demand import DemandGenerator
 from protocols.pool_formation import QueuedRequest, batch_due
 
@@ -47,7 +47,10 @@ def test_tariff_reserve_is_off_by_default_and_bounded_when_on(net):
     h = hub(net, reserve_margin=1.5, pickup_allowance=300.0)
     r = h.tariff_reserve([req("n1_3")], ["n1_3"], 0)
     route = net.travel_time(HUB, "n1_3")
-    assert r == pytest.approx(1.5 * (DRIVER_BASE_COST + DRIVER_COST_PER_SECOND * (route + 300)), abs=0.011)
+    metres = net.route_length([HUB, "n1_3"])
+    speed = metres / route
+    cost = driver_cost((metres + speed * 300) / 1000.0, route + 300, dwell_seconds(1))
+    assert r == pytest.approx(1.5 * cost, abs=0.011)
     assert r < 25.0                                              # far below the riders' max fare
     assert h.tariff_reserve([req("n1_3")], ["n1_3"], 1) > r      # a retry allows a longer pickup leg
 
@@ -55,7 +58,7 @@ def test_tariff_reserve_is_off_by_default_and_bounded_when_on(net):
 def test_a_driver_at_the_hub_can_always_bid_under_the_tariff_reserve(net):
     h = hub(net, reserve_margin=1.5)
     reserve = h.tariff_reserve([req("n1_3")], ["n1_3"], 0)
-    cost_at_hub = DRIVER_BASE_COST + DRIVER_COST_PER_SECOND * net.travel_time(HUB, "n1_3")
+    cost_at_hub = driver_cost(net.route_length([HUB, "n1_3"]) / 1000.0, net.travel_time(HUB, "n1_3"), dwell_seconds(1))
     assert cost_at_hub <= reserve
 
 
@@ -115,3 +118,13 @@ def test_balanced_policy_spreads_over_close_hubs_but_not_far_ones():
     picks = {choose([("a", 100.0), ("b", 120.0), ("far", 900.0)]) for _ in range(200)}
     assert picks == {"a", "b"}
     assert choose([("only", 50.0)]) == "only"
+
+
+def test_cfp_windows_restart_for_a_patient_run_once_the_window_has_run_out():
+    from types import SimpleNamespace as NS
+    from protocols.match_auction import cfp_windows
+    reqs = [NS(request_id="a", time_window_start=0.0, time_window_end=3600.0),
+            NS(request_id="b", time_window_start=100.0, time_window_end=9000.0)]
+    assert cfp_windows(reqs, now=1000.0, relax_expired=True) == {"a": [0.0, 3600.0], "b": [100.0, 9000.0]}   # untouched while open
+    assert cfp_windows(reqs, now=5000.0, relax_expired=True) == {"a": [0.0, 8600.0], "b": [100.0, 9000.0]}   # a's ran out: now + 1 h
+    assert cfp_windows(reqs, now=5000.0, relax_expired=False)["a"] == [0.0, 3600.0]                          # impatient run: as before

@@ -33,7 +33,7 @@ from common.ontology import (
 )
 from common.policy import PolicyBook
 from common.settings import (
-    DRIVER_BASE_COST, PENALTY_FARE_VIOLATION, PENALTY_NON_COOPERATION, T_AUDIT, T_AUDIT_RESPONSE,
+    DRIVER_FLOOR, PENALTY_FARE_VIOLATION, PENALTY_NON_COOPERATION, T_AUDIT, T_AUDIT_RESPONSE,
     T_POLICY_ACK,
 )
 from protocols.payment_common import bare
@@ -82,7 +82,7 @@ class RegulatorAgent(BaseAgent):
     def __init__(self, jid: str, password: str, hub_jids: Iterable[str] = (), driver_jids: Iterable[str] = (),
                  payment_jid: Optional[str] = None, t_audit: float = T_AUDIT,
                  t_audit_response: float = T_AUDIT_RESPONSE, t_policy_ack: float = T_POLICY_ACK,
-                 driver_floor: float = DRIVER_BASE_COST, auto_audit: bool = True, **kwargs):
+                 driver_floor: float = DRIVER_FLOOR, auto_audit: bool = True, **kwargs):
         super().__init__(jid, password, **kwargs)
         self.hub_jids = [bare(j) for j in hub_jids]
         self.driver_jids = [bare(j) for j in driver_jids]

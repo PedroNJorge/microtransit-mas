@@ -209,6 +209,7 @@ class DriverStatus:
     current_passengers: int
     shift_end: float
     reserve_price: float
+    target: str = ""                    # hub node a free driver is cruising to ("" = it is not on a self-directed move)
 
     def __post_init__(self):
         if self.current_passengers > self.max_capacity:
@@ -425,10 +426,13 @@ class BrainPercept:
     etas: List[float]                   # seconds from `location` to each hub (inf -> -1)
     pressures: List[float]              # requests per available driver observed around each hub
     sent_at: float = 0.0
+    deficits: List[float] = field(default_factory=list)   # per hub: drivers it is short of (empty = no hub-load signal heard)
 
     def __post_init__(self):
         if not (len(self.hub_ids) == len(self.etas) == len(self.pressures)):
             raise ValueError("hub_ids, etas and pressures must have the same length")
+        if self.deficits and len(self.deficits) != len(self.hub_ids):
+            raise ValueError("deficits must be empty or have one entry per hub")
 
 
 @concept
@@ -440,6 +444,19 @@ class DemandSignal:
     hub_id: str
     pool_id: str
     callees: float
+    sent_at: float = 0.0
+
+
+@concept
+@dataclass
+class HubLoad:
+    """Hub -> every driver, about once a simulated minute: how loaded the hub's cell is. The cell is the part of the map
+    nearer to this hub than to any other (a Voronoi cell by straight-line distance). Drivers turn it into a deficit
+    (drivers the cell is short of) and decide whether moving there pays."""
+    hub_id: str
+    waiting: float                      # requests at the hub that have no driver yet (window, proposal, auction)
+    rate: float                         # requests per minute that arrived over the last 10 minutes
+    supply: float                       # free drivers counted for the cell: idle ones standing in it + cruisers heading to it
     sent_at: float = 0.0
 
 

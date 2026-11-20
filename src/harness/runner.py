@@ -27,6 +27,7 @@ from common import clock
 from common.graph import TransitNetwork
 from common.messages import make_inform
 from common.ontology import DemandForecast, Disruption, DisruptionType, Protocol
+from harness.live_metrics import mover_stats
 from harness.scenario import DemandSpec, EventSpec, Scenario, ScenarioError
 
 logger = logging.getLogger(__name__)
@@ -251,6 +252,48 @@ def report(h) -> str:
     busy = sum(1 for r in riders if r.trip is not None)
     lines = [f"riders: {sum(out.values())} trips ended " + ", ".join(f"{k}={v}" for k, v in sorted(out.items()))
              + (f"; {busy} still in progress" if busy else "")]
+    for r in [r for r in riders if r.trip is not None][:6]:               # what the unfinished riders were doing
+        try:
+            last = r.trip.log[-1] if getattr(r.trip, "log", None) else "-"
+            since = r.history[-1][0] if getattr(r, "history", None) else 0.0
+            lines.append(f"  still in progress: {r.jid.user} in state {r.state} since +{since:.0f}s; last note: {last}")
+            d = h.agents.get(r.trip.driver) if r.trip.driver else None
+            hub = h.agents.get(r.trip.hub_jid)
+            pool = getattr(hub, "pools", {}).get(r.trip.pool_id) if hub is not None else None
+            me = str(r.jid.bare)
+            for hb in (a for a in h.agents.values() if a.role == "microhub"):          # every pool this rider is in, at any hub
+                for pid, rec in hb.pools.items():
+                    if me in rec.rider_jids.values():
+                        last = rec.contexts[-1] if rec.contexts else None
+                        lines.append(f"    at {hb.hub_id}: pool {pid} state {rec.state}, {len(rec.contexts)} auction(s)"
+                                     f"{', last outcome ' + str(last.outcome) if last is not None else ''}; hub auction "
+                                     f"running={hb.auction_running}, queue={[(e[0].pool.pool_id, e[1]) for e in hb.auction_queue]}, "
+                                     f"overflow waits={list(hb.overflow_waits)}")
+            req = r.trip.request
+            net = getattr(h, "network", None)
+            for hb in (a for a in h.agents.values() if a.role == "microhub"):          # why an auction that keeps failing fails
+                for pid, rec in hb.pools.items():
+                    if me in rec.rider_jids.values() and len(rec.contexts) >= 3 and rec.state in ("AUCTIONING", "AUCTION_QUEUED"):
+                        reach = None
+                        if net is not None:
+                            try:
+                                reach = net.travel_time(hb.hub_id, req.destination_home, 0.0)
+                            except Exception as e:
+                                reach = repr(e)
+                        lines.append(f"    stuck pool {pid}: destination {req.destination_home}, hub -> destination travel time {reach}")
+                        for ctx in rec.contexts[-3:-1]:
+                            evs = Counter(e.get("event") for e in ctx.trace)
+                            why = Counter(ctx.refusals.values())
+                            lines.append(f"      attempt {ctx.attempt}: outcome {ctx.outcome}, called {len(ctx.recipients)} drivers, "
+                                         f"{len(ctx.bids)} bid(s), refusals {dict(why)}, events {dict(evs)}")
+            if d is not None:
+                asg = getattr(d, "assignment", None)
+                lines.append(f"    its driver {d.jid.user}: state {getattr(d.state, 'value', d.state)}, activity {d.activity}, lock "
+                             f"{d.lock.state.value}, assignment "
+                             f"{(asg.match.pool_id if asg is not None and asg.match is not None else None)!r} (rider's pool "
+                             f"{r.trip.pool_id!r}), at {d.location}; hub pool state {getattr(pool, 'state', None)}")
+        except Exception as e:                                       # a diagnostic must never lose the report
+            lines.append(f"    (could not inspect {r.jid.user}: {e!r})")
     run = getattr(h, "runner", None)
     if run is not None and (run.summary.issued or run.summary.skipped):
         lines.append(f"demand: {run.summary.issued} requests issued, {run.summary.skipped} skipped (no idle rider)")
@@ -265,6 +308,28 @@ def report(h) -> str:
                      + (f", {shared_riders / len(pools):.1f} riders each" if pools else "") + ")")
         lines.append(f"vehicle distance, loaded leg: {shared:.1f} km shared vs {alone:.1f} km if everyone rode alone: "
                      f"{alone - shared:.1f} km saved, {(alone - shared) * g / 1000:.2f} kg CO2 ({g:.0f} g/km)")
+    mc = getattr(h, "metrics", None)
+    if mc is not None:
+        c = mc.snapshot()["cum"]
+        if c.get("co2_saved_all_kg") is not None:
+            lines.append(f"CO2 saved: {c['co2_saved_loaded_kg']:.2f} kg on the loaded leg (what the incentive pays on), "
+                         f"{c['co2_saved_all_kg']:.2f} kg counting pickup legs too ({100 * (c['co2_saved_all_pct'] or 0):.1f}% "
+                         f"of what the same trips would drive alone)")
+        if c.get("profit_per_trip") is not None:
+            lines.append(f"drivers: revenue {c['revenue_per_trip']:.2f} EUR and profit {c['profit_per_trip']:.2f} EUR per trip; "
+                         f"deadhead {100 * (c['deadhead_share'] or 0):.0f}% of km; earnings Gini "
+                         f"{(c['gini'] if c['gini'] is not None else float('nan')):.2f}")
+        if c.get("km_return") is not None:
+            lines.append(f"vehicle-km: loaded {c['km_loaded']:.1f}, to pickup {c['km_pickup']:.1f}, empty without a rider: "
+                         f"back to nearest hub {c['km_return']:.1f}, to a better hub {c['km_move']:.1f}, ordered by a hub "
+                         f"{c['km_reposition']:.1f} ({sum(len(getattr(a, 'cruises', [])) for a in h.agents.values() if a.role == 'driver')} "
+                         f"brain-ordered moves); revenue per hour driven "
+                         f"{(c['earnings_per_driven_hour'] or 0):.2f} EUR")
+    ms = mover_stats([a.command_times for a in h.agents.values() if a.role == "driver_brain" and hasattr(a, "command_times")])
+    if ms:
+        lines.append(f"brain moves per minute with a move: {ms['mean']:.2f} on average over {ms['ticks']} minutes; dispersion "
+                     f"{ms['dispersion']:.2f} (1 = chance, <1 evener, >1 herding); {100 * ms['share_in_group']:.0f}% of the "
+                     f"{ms['movers']} moves had another driver move in the same minute")
     joined = sum(len(a.late_joined) for a in h.agents.values() if a.role == "microhub")
     if joined:
         lines.append(f"late joins: {joined} rider(s) joined a pool whose driver was still on the way to the hub")
@@ -280,6 +345,29 @@ def report(h) -> str:
     if waits:
         lines.append(f"wait request -> boarding (completed trips): mean {sum(waits) / len(waits):.0f}s, "
                      f"max {max(waits):.0f}s")
+        ok = [t for r in riders for t in r.trips if t.outcome == "completed" and t.matched_at]
+        if ok:
+            lines.append(f"wait split: request -> matched {sum(t.matched_at - t.requested_at for t in ok) / len(ok):.0f}s "
+                         f"(pooling window + auctions), matched -> boarding "
+                         f"{sum(t.boarded_at - t.matched_at for t in ok) / len(ok):.0f}s (driver to the pickup)")
+            for t in sorted(ok, key=lambda x: x.requested_at - x.boarded_at)[:3]:
+                lines.append(f"  longest: requested at +{t.requested_at - min(x.requested_at for x in ok):.0f}s, matched after "
+                             f"{t.matched_at - t.requested_at:.0f}s, boarded {t.boarded_at - t.matched_at:.0f}s after the match, "
+                             f"hubs tried {len(t.tried_hubs)}")
+                ctxs = [c for a in h.agents.values() if a.role == "microhub" for c in getattr(a, "finished", [])
+                        if c.pool.pool_id == t.pool_id]
+                why = Counter(r for c in ctxs for r in c.refusals.values())
+                lines.append(f"    its auctions: {len(ctxs)}, outcomes {dict(Counter(c.outcome for c in ctxs))}, "
+                             f"drivers' refusals {dict(why)}")
+        done = sorted((t.requested_at, t.boarded_at - t.requested_at) for r in riders for t in r.trips
+                      if t.outcome == "completed")
+        q = max(1, len(done) // 4)
+        quarters = [done[i:i + q] for i in range(0, len(done), q)][:4]
+        lines.append("wait by order of request (quarters of the riders, earliest first): "
+                     + ", ".join(f"{sum(w for _, w in part) / len(part):.0f}s" for part in quarters if part))
+        t0 = done[0][0]
+        worst = sorted(done, key=lambda x: -x[1])[:3]
+        lines.append("longest waits: " + ", ".join(f"{w:.0f}s (requested at +{t - t0:.0f}s)" for t, w in worst))
     hubs = [a for a in h.agents.values() if a.role == "microhub"]
     repo = Counter(c.outcome for a in hubs for c in a.reposition_log)
     if repo:

@@ -1,0 +1,34 @@
+{
+ "arms": [
+  {
+   "name": "no_brain",
+   "scenario": "config/scenarios/07_migrating_demand.json",
+   "set": {}
+  },
+  {
+   "name": "signal",
+   "scenario": "config/scenarios/brains_07_migrating_demand.json",
+   "set": {}
+  },
+  {
+   "name": "proportional",
+   "scenario": "config/scenarios/brains_07_migrating_demand.json",
+   "set": {
+    "drivers.brain_policy": "proportional"
+   }
+  },
+  {
+   "name": "signal_bids",
+   "scenario": "config/scenarios/brains_07_migrating_demand_bids.json",
+   "set": {}
+  }
+ ],
+ "seeds": [
+  1,
+  2,
+  3
+ ],
+ "repeats": 1,
+ "speed": 15.0,
+ "timeout": 0.0
+}

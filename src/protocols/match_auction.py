@@ -124,6 +124,20 @@ class _AuctionState(State):
             jid, AuctionOutcome(self.ctx.pool_id, awarded, winner, reason)))
 
 
+def cfp_windows(reqs, now: float, relax_expired: bool, grace: float = 3600.0) -> dict:
+    """The time windows the drivers see in a call for proposals. A driver refuses (too_late) if it cannot reach the pickup
+    before a rider's window ends. In a patient run nobody gives up, so once a rider has waited past the window it would
+    be refused by every driver forever (a hub retried one such pool 400 times): the window then restarts from now, and the
+    rider is simply served as soon as possible (the late pickup still shows in the rider's own record)."""
+    out = {}
+    for r in reqs:
+        end = r.time_window_end
+        if relax_expired and now > end:
+            end = now + grace
+        out[r.request_id] = [r.time_window_start, end]
+    return out
+
+
 class _Start(_AuctionState):
     name = START
 
@@ -145,7 +159,7 @@ class _Start(_AuctionState):
         ctx.cfp = CFP(
             pool_id=ctx.pool_id, hub_id=hub.hub_id, pickup_node=hub.hub_id,
             rider_destinations=[r.destination_home for r in reqs],
-            rider_time_windows={r.request_id: [r.time_window_start, r.time_window_end] for r in reqs},
+            rider_time_windows=cfp_windows(reqs, now, hub.relax_expired_windows),
             passenger_count=len(reqs), auction_deadline=now + hub.t_auction, max_total_fare=reserve,
             max_detour=(min(r.detour_tolerance for r in reqs) if ctx.plan_detour is None
                         else ctx.plan_detour + 1.0) + ctx.attempt * hub.widen_detour,

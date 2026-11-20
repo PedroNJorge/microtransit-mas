@@ -1,0 +1,11 @@
+{
+  "speed": 15,
+  "seeds": [1, 2, 3, 4, 5],
+  "repeats": 1,
+  "arms": {
+    "no_brain":     {"scenario": "config/scenarios/07_migrating_demand.json"},
+    "signal":       {"scenario": "config/scenarios/brains_07_migrating_demand.json"},
+    "proportional": {"scenario": "config/scenarios/brains_07_migrating_demand.json", "set": {"drivers.brain_policy": "proportional"}},
+    "signal_bids":  {"scenario": "config/scenarios/brains_07_migrating_demand_bids.json"}
+  }
+}

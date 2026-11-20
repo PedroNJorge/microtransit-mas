@@ -7,6 +7,8 @@ InterHubCoordinationProtocol (all messages between hubs, plus one notice to a ri
                                                             and these are the requests I have not matched yet"
     Hub --request(OverflowRequest)--> one neighbour         "I cannot find a driver for this pool, please take it"
         <--agree | refuse(reason)---                        (same thread = pool id)
+    Hub --accept-proposal-----------> that neighbour        only if the agree came in time: "yes, it is yours"; the
+                                                            neighbour adopts the requests only on this message
     Hub --inform(Handover)----------> Rider                 "your request is now handled by me, talk to me"
 
 Neighbours
@@ -25,9 +27,11 @@ Failure recovery (done when: a killed hub's requests are absorbed by its neighbo
 Overflow (capacity)
     When a pool has failed `overflow_after` auctions (no driver wanted it), the hub offers it to the neighbour
     that covers all its destinations and reports the most idle drivers. The neighbour agrees if it has an idle
-    driver and can serve the requests, adopts them and informs the riders; the first hub gives the pool up and has
-    the riders' escrows returned (the riders escrow again with the new hub). On refuse or silence the hub resumes its
-    own auction.
+    driver and can serve the requests; the first hub, if the agree arrives within `t_overflow_reply`, gives the pool
+    up, has the riders' escrows returned and sends accept-proposal; ONLY THEN does the neighbour adopt the requests and
+    inform the riders (the riders escrow again with the new hub). On refuse or silence the hub resumes its own
+    auction. (An earlier version adopted on agreeing; a reply that came after the first hub had stopped waiting
+    left the rider served by both hubs.)
 
 Known limits
     * A hub that is only silent (not dead) is treated as failed; if it comes back its requests may be served twice.
@@ -101,6 +105,9 @@ class PeerView:
     failed: bool = False
 
 
+OFFER_KEEP = 600.0               # sim seconds a neighbour remembers an offer it agreed to, waiting for the accept
+
+
 @dataclass
 class OverflowWait:
     rec: object                      # the PoolRecord offered to a neighbour
@@ -165,6 +172,9 @@ class InterHubWatcher(CyclicBehaviour):
                     p.failed = True
                     hub.log(f"{p.hub_id} silent for {now - p.last_seen:.0f}s: declared failed")
                     self.take_over(p, now)
+            for pid, offer in list(hub.overflow_offers.items()):
+                if now >= offer[4]:
+                    hub.overflow_offers.pop(pid, None)
             for pool_id, w in list(hub.overflow_waits.items()):
                 if now >= w.deadline:
                     hub.overflow_waits.pop(pool_id, None)
@@ -242,9 +252,9 @@ class OverflowReceiver(CyclicBehaviour):
             hub.log(f"overflow {msg.thread} from {ov.from_hub} refused: {reason}")
             await self.send(make_message(sender, Perf.REFUSE, Protocol.INTER_HUB, reason, msg.thread))
             return
-        await self.send(make_message(sender, Perf.AGREE, Protocol.INTER_HUB, "accepted", msg.thread))
-        for r in ov.pending_requests:
-            hub.add_behaviour(_Adopt(r, ov.from_hub, ov.reason))
+        hub.overflow_offers[msg.thread or ""] = (list(ov.pending_requests), ov.from_hub, ov.reason, sender,
+                                                 clock.now() + OFFER_KEEP)
+        await self.send(make_message(sender, Perf.AGREE, Protocol.INTER_HUB, "accepted", msg.thread))      # adopt only on accept
 
 
 class OverflowReplies(CyclicBehaviour):
@@ -264,9 +274,26 @@ class OverflowReplies(CyclicBehaviour):
         hub.overflow_waits.pop(msg.thread, None)
         if msg.get_metadata("performative") == Perf.AGREE:
             hub.finish_overflow(w)
+            await self.send(make_message(bare(msg.sender), Perf.ACCEPT, Protocol.INTER_HUB, "yours", msg.thread))
         else:
             hub.log(f"overflow of {msg.thread} refused by {peer.hub_id} ({msg.body}); carrying on alone")
             hub.resume_auction(w)
+
+
+class OverflowAccepted(CyclicBehaviour):
+    """accept-proposal from the hub that offered a pool: it has given the pool up, the requests are ours now."""
+
+    async def run(self):
+        msg = await self.receive(timeout=1)
+        if msg is None:
+            return
+        hub = self.agent
+        offer = hub.overflow_offers.pop(msg.thread or "", None)
+        if offer is None or bare(msg.sender) != offer[3]:
+            return
+        requests, from_hub, reason, _, _ = offer
+        for r in requests:
+            hub.add_behaviour(_Adopt(r, from_hub, reason))
 
 
 def refund_request(hub, rec) -> Optional[object]:

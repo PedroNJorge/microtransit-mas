@@ -26,6 +26,8 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import replace
+
+from common.costs import rate_per_second
 from pathlib import Path
 
 import pytest
@@ -289,7 +291,7 @@ def test_hub_plans_from_its_own_view_of_the_world():
     (p,) = hub.plan_repositions(now)                                  # wants 2, owns 1 idle driver
     assert (p.driver_jid, p.staging_point_id, p.to_node) == (D1, "sp-n4_1", "n4_1")
     assert p.travel_time == pytest.approx(180.0)
-    assert p.incentive >= 0.004 * 180.0
+    assert p.incentive >= rate_per_second() * 180.0
 
 
 def test_hub_without_rules_or_network_never_plans():
@@ -481,7 +483,7 @@ def test_xmpp_idle_driver_is_repositioned_and_every_hub_hears_about_it(xmpp_port
             assert ctx.outcome == ARRIVED, ctx.trace
             assert (ctx.plan.driver_jid, ctx.plan.staging_point_id) == (jd, "sp-n4_1")
             assert ctx.request.hub_id == "n1_1" and ctx.request.driver_id == jd
-            assert ctx.request.incentive >= 0.004 * 180.0            # covers the driver's cost
+            assert ctx.request.incentive >= rate_per_second() * 180.0            # covers the driver's cost
             assert [s for s, _ in trace_events(ctx)][0] == REQUEST and trace_events(ctx)[-1][0] == END
             assert ("AWAIT_REPLY", "agree") in trace_events(ctx)
 

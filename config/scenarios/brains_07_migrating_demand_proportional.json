@@ -1,0 +1,85 @@
+{
+  "name": "07-migrating-demand-brains-signal",
+  "xmpp": {
+    "host": "localhost",
+    "port": 5222,
+    "server_port": 5269,
+    "password": "dev-password"
+  },
+  "clock": {
+    "speed": 15
+  },
+  "graph": "config/porto_graph.json",
+  "hubs": "all",
+  "duration": 14400,
+  "drivers": {
+    "placement": [
+      {
+        "hubs": [
+          "hub_senhora_da_hora",
+          "hub_casa_da_musica"
+        ],
+        "count": 24
+      }
+    ],
+    "brains": true,
+    "brain_policy": "proportional"
+  },
+  "riders": {
+    "count": 90
+  },
+  "demand": [
+    {
+      "id": "west",
+      "hubs": [
+        "hub_senhora_da_hora",
+        "hub_casa_da_musica"
+      ],
+      "start": 0,
+      "end": 1200,
+      "count": 30,
+      "pattern": "random",
+      "max_fare": 25,
+      "pooling": 1.0
+    },
+    {
+      "id": "centre",
+      "hubs": [
+        "hub_trindade",
+        "hub_aliados",
+        "hub_bolhao",
+        "hub_sao_bento"
+      ],
+      "start": 1200,
+      "end": 2400,
+      "count": 30,
+      "pattern": "random",
+      "max_fare": 25,
+      "pooling": 1.0
+    },
+    {
+      "id": "east",
+      "hubs": [
+        "hub_campo_24_de_agosto",
+        "hub_campanha"
+      ],
+      "start": 2400,
+      "end": 3600,
+      "count": 30,
+      "pattern": "random",
+      "max_fare": 25,
+      "pooling": 1.0
+    }
+  ],
+  "environment": {
+    "t_traffic": 60,
+    "full_every": 10
+  },
+  "seed": 42,
+  "payment": {
+    "rider_balance": 100.0,
+    "subsidy_discount": 0.5,
+    "subsidy_budget": null,
+    "hold_max": 7200
+  }
+}

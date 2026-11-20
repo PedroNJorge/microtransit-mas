@@ -33,6 +33,7 @@ from common.graph import TransitNetwork
 from common.ws_server import start_ws_server
 from harness.active import clear_active, write_active
 from harness.ping import PingResult, format_results, ping_agents
+from harness.live_metrics import MetricsCollector
 from harness.runner import ScenarioRunner, report
 from protocols.reposition import RepositionRules
 from harness.scenario import DEFAULT_SCENARIO, AgentSpec, Scenario, ScenarioError
@@ -49,20 +50,25 @@ def port_open(host: str, port: int, timeout: float = 0.3) -> bool:
 
 
 class Harness:
-    def __init__(self, scenario: Scenario, start_server: bool = True):
+    def __init__(self, scenario: Scenario, start_server: bool = True, viewer: bool = True):
         self.scenario = scenario
         self.start_server = start_server
+        self.viewer = viewer                            # False (experiments): no WebSocket server for the map
         self.agents: Dict[str, BaseAgent] = {}          # jid -> agent, in start order
         self.network: Optional[TransitNetwork] = None
         self._server: Optional[asyncio.subprocess.Process] = None
         self._server_dir: Optional[str] = None
         self._ws_server = None
+        self.metrics: Optional[MetricsCollector] = None  # live metrics for the viewer (harness/live_metrics.py)
         self.runner: Optional[ScenarioRunner] = None    # plays the scenario's demand / events / forecasts
 
     # ---- XMPP server -----------------------------------------------------------------
     async def ensure_server(self, wait: float = 20.0) -> None:
         x = self.scenario.xmpp
         if port_open(x.host, x.port):
+            logger.warning("An XMPP server is already listening on %s:%d: reusing it (this run did not start it). If an "
+                           "earlier run was killed, its server may still be alive and stuck: stop it with "
+                           "`pkill -f 'spade.cli run'` and start again.", x.host, x.port)
             return
         if not self.start_server:
             raise RuntimeError(f"No XMPP server on {x.host}:{x.port} (and --no-server is set)")
@@ -71,11 +77,13 @@ class Harness:
         # database can end up empty on another connection ("no such table: credentials") and
         # then every new agent hangs while connecting.
         self._server_dir = tempfile.mkdtemp(prefix="mas-xmpp-")
+        self._server_log = f"{self._server_dir}/server.log"
+        logger.info("XMPP server output goes to %s", self._server_log)
         self._server = await asyncio.create_subprocess_exec(
             sys.executable, "-m", "spade.cli", "run", "--host", x.host,
             "--db", f"{self._server_dir}/server.db", "--purge",
             "--client_port", str(x.port), "--server_port", str(x.server_port),
-            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+            stdout=open(self._server_log, "ab"), stderr=asyncio.subprocess.STDOUT,
             start_new_session=True)
         loop = asyncio.get_running_loop()
         deadline = loop.time() + wait
@@ -152,7 +160,8 @@ class Harness:
         sc = self.scenario
         await self.ensure_server()
         self.network = TransitNetwork.from_file(str(sc.graph_path))
-        self._ws_server = await start_ws_server()       # <-- Liga o WebSocket na porta 8765
+        if self.viewer:
+            self._ws_server = await start_ws_server()   # <-- Liga o WebSocket na porta 8765
         clock.start(sc.speed)
         try:
             for spec in sc.roster():
@@ -165,9 +174,41 @@ class Harness:
         if sc.demand or sc.events or sc.forecasts:
             self.runner = ScenarioRunner(self)
             self.runner.start()
+        self.metrics = MetricsCollector(self, broadcast=self.viewer)
+        self.metrics.start()
+        self._health = asyncio.create_task(self._watch_health())
         logger.info("Scenario %r up: %d agents", sc.name, len(self.agents))
 
+    async def _watch_health(self, period: float = 5.0, every: float = 30.0) -> None:
+        """Tells a frozen run apart from a quiet one: warns when the event loop was blocked (a CPU-bound step starved every
+        agent) and logs a heartbeat with the simulation time every `every` real seconds. If the heartbeat stops, the whole
+        process is blocked; if it continues with the sim time moving but nothing happens, the problem is in the agents or in
+        the XMPP server (see its log)."""
+        loop = asyncio.get_running_loop()
+        last_beat = loop.time()
+        while True:
+            t0 = loop.time()
+            await asyncio.sleep(period)
+            lag = loop.time() - t0 - period
+            if lag > 1.0:
+                logger.warning("event loop was blocked for %.1f s (sim time %.0f s): the process is too loaded or a step "
+                               "is CPU-bound", lag, clock.now())
+            if loop.time() - last_beat >= every:
+                last_beat = loop.time()
+                riders = Counter(str(getattr(a, "state", "?")).split(".")[-1] for a in self.agents.values()
+                                 if a.role == "rider" and getattr(a, "trip", None) is not None)
+                drivers = Counter(str(getattr(a, "state", "?")).split(".")[-1] for a in self.agents.values() if a.role == "driver")
+                logger.info("heartbeat: sim time %.0f s, %d agents, loop lag %.2f s | riders with a trip: %s | drivers: %s",
+                            clock.now(), len(self.agents), max(lag, 0.0),
+                            dict(riders) or "none", dict(drivers))
+
     async def stop(self) -> None:
+        health = getattr(self, "_health", None)
+        if health is not None:
+            health.cancel()
+            self._health = None
+        if self.metrics is not None:
+            await self.metrics.stop()
         if self.runner is not None:
             await self.runner.stop()
         for jid in reversed(list(self.agents)):
@@ -210,7 +251,7 @@ def market_settings(sc: Scenario) -> dict:
     if sc.legacy_market:
         return {}
     return dict(reserve_margin=RESERVE_MARGIN, max_pickup_eta=MAX_PICKUP_ETA, retry_delay=RETRY_DELAY,
-                window_slack=WINDOW_SLACK, max_attempts=1000 if sc.patient else 4,
+                window_slack=WINDOW_SLACK, relax_expired_windows=sc.patient, max_attempts=1000 if sc.patient else 4,
                 t_auction=60.0, t_award=40.0, t_escrow=300.0, t_pool_response=300.0)
 
 
@@ -294,8 +335,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--timeout", type=float, default=10.0, help="ping timeout, real seconds")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args(argv)
+    try:
+        sys.stdout.reconfigure(line_buffering=True)     # `| tee scenario.log` makes stdout block-buffered: the terminal
+    except (AttributeError, ValueError):                # and the log would show an old state of a running scenario
+        pass
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.WARNING,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    logger.setLevel(logging.INFO)                       # the launcher's own lines: server log path, heartbeat, "scenario up"
     try:
         scenario = Scenario.load(args.scenario)
     except ScenarioError as e:

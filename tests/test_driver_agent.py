@@ -7,6 +7,8 @@ import asyncio
 import uuid
 
 import pytest
+
+from common.settings import DRIVER_COST_PER_HOUR, DRIVER_COST_PER_KM
 from spade.agent import Agent
 from spade.behaviour import CyclicBehaviour, OneShotBehaviour
 
@@ -127,8 +129,8 @@ async def test_idle_driver_bids_its_true_cost_and_takes_the_lock(xmpp_server, si
         reply = await r.cfp_and_wait(r.h1)
         assert reply.get_metadata("performative") == Perf.PROPOSE
         bid = parse_payload(reply)
-        # eta 0 (at the hub), route n1_1 -> n2_2 = 120 s: cost = 2.00 + 0.004 * 120
-        assert bid.price == pytest.approx(2.48) and bid.eta == 0 and bid.max_detour == 0
+        # eta 0 (at the hub), route n1_1 -> n2_2 = 120 s, 2 m: cost = per-km + per-hour cost x (120 s + boarding 15 s + 1 alighting 10 s)
+        assert bid.price == pytest.approx(DRIVER_COST_PER_KM * 0.002 + DRIVER_COST_PER_HOUR / 3600 * 145, abs=0.011) and bid.eta == 0 and bid.max_detour == 0
         assert bid.driver_id == str(r.drv.jid.bare) and bid.attempt == 0
         assert r.drv.lock.state == LockState.PROVISIONAL and r.drv.state == DriverState.BIDDING
 
@@ -210,7 +212,7 @@ async def test_unknown_hub_is_refused(xmpp_server, sim_clock, net):
 @pytest.mark.parametrize("kw,cfp_kw,reason", [
     ({"capacity": 1}, {"riders": ("a@localhost", "b@localhost")}, "no_capacity"),
     ({"shift_end": 100.0}, {}, "shift_ending"),
-    ({}, {"fare": 1.0}, "over_reserve"),
+    ({}, {"fare": 0.1}, "over_reserve"),
     ({"start_hub": "n5_5"}, {"window_end": 100.0}, "too_late"),
     ({}, {"dest": "nowhere"}, "unreachable"),
 ])
@@ -301,3 +303,25 @@ async def test_cfp_during_repositioning_is_refused(xmpp_server, sim_clock, net):
         reply = await r.cfp_and_wait(r.h2, pool="pool-B")
         assert reply.get_metadata("performative") == Perf.REFUSE and reply.body == "repositioning"
 
+
+
+async def test_empty_driving_is_attributed_to_its_cause(net):
+    from agents.driver import DriverAgent
+    d = DriverAgent("d@localhost", "pw", start_hub="n1_1", network=net, hub_jids=[])
+    d.location = "n1_2"
+    assert d.nearest_hub(0.0) == "n1_1"                      # going there is a "return"
+    d.activity, d.cruise_reason = "cruising", "move"
+    d.record_hop("n1_2", "n1_3", 10.0, None)
+    d.activity = "repositioning"
+    d.record_hop("n1_3", "n1_4", 10.0, None)
+    assert d.odo_sub_s == {"return": 0.0, "move": 10.0, "reposition": 10.0}
+    assert sum(d.odo_sub_m.values()) == pytest.approx(d.odo_m["other"])
+
+
+async def test_a_stop_is_driven_to_only_if_somebody_on_board_gets_off_there():
+    from agents.driver import stop_needed
+    boarding = [("r1@l", "q1", "n2_2", "p"), ("r2@l", "q2", "n3_3", "p")]        # r3 (to n4_4) did not show up
+    assert stop_needed("n2_2", boarding, dropped=[])
+    assert not stop_needed("n4_4", boarding, dropped=[])                           # the no-show's stop
+    assert not stop_needed("n2_2", boarding, dropped=["r1@l"])                     # already dropped
+    assert stop_needed("n3_3", boarding, dropped=["r1@l"])

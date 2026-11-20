@@ -1,0 +1,25 @@
+{
+  "speed": 15,
+  "seeds": [
+    1,
+    2,
+    3,
+    4,
+    5
+  ],
+  "repeats": 1,
+  "arms": {
+    "no_brain": {
+      "scenario": "config/scenarios/01_random_disturbance.json"
+    },
+    "signal": {
+      "scenario": "config/scenarios/brains_01_random_disturbance.json"
+    },
+    "proportional": {
+      "scenario": "config/scenarios/brains_01_random_disturbance.json",
+      "set": {
+        "drivers.brain_policy": "proportional"
+      }
+    }
+  }
+}

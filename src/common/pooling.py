@@ -31,6 +31,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from common.auction import round_cents
+from common.settings import DWELL_DROPOFF
 
 MAX_BATCH = 8                       # exact DP is 3^n; 8 riders -> 6561 sub-problems, instant
 
@@ -302,7 +303,8 @@ def fare_ceiling(max_fares: Dict[str, float], weights: Dict[str, float]) -> floa
 
 
 def reference_solo_fare(direct_seconds: float, base: float, per_second: float, max_fare: float) -> float:
-    """Posted solo tariff used to show the pooling discount: base + rate x direct ride time,
+    """Posted solo tariff used to show the pooling discount: base + rate x direct ride time (rate = distance and time folded
+    into one EUR/s figure, common.costs.rate_per_second),
     never above the rider's own maximum."""
     return min(max_fare, round_cents(base + per_second * direct_seconds) / 100)
 
@@ -336,7 +338,7 @@ def late_join_terms(network, hub: str, existing: Sequence, new_req, old_fares: D
     if before is None or plan is None:
         return None
     extra_seconds = max(0.0, plan.route_time - before.route_time)
-    extra_pay = round(extra_seconds * cost_per_second * (1.0 + markup), 2)
+    extra_pay = round((extra_seconds + DWELL_DROPOFF) * cost_per_second * (1.0 + markup), 2)   # + the joiner's drop-off stop
     old_total = round(sum(old_fares.values()), 2)
     total = round(old_total + extra_pay, 2)
     shares = split_fare_weighted(total, {rid: max(1.0, d) for rid, d in plan.direct.items()})

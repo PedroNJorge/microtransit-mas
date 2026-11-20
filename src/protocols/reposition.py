@@ -54,10 +54,11 @@ from spade.message import Message
 
 from common import clock
 from common.auction import ceil_cents
+from common.costs import rate_per_second
 from common.messages import make_request
 from common.ontology import Perf, Protocol, RepositionRequest, StagingPoint
 from common.settings import (
-    DRIVER_COST_PER_SECOND, REPOSITION_COOLDOWN, REPOSITION_DEMAND_THRESHOLD,
+    REPOSITION_COOLDOWN, REPOSITION_DEMAND_THRESHOLD,
     REPOSITION_INCENTIVE_MARGIN, REPOSITION_MAX_MOVES, REPOSITION_MAX_TRAVEL,
     REPOSITION_MIN_SHIFT_LEFT, REPOSITION_REQUESTS_PER_DRIVER,
 )
@@ -85,7 +86,7 @@ class RepositionRules:
     demand_threshold: float = REPOSITION_DEMAND_THRESHOLD
     requests_per_driver: float = REPOSITION_REQUESTS_PER_DRIVER
     max_travel: float = REPOSITION_MAX_TRAVEL
-    incentive_per_second: float = DRIVER_COST_PER_SECOND       # EUR per second of driving
+    incentive_per_second: float = rate_per_second()            # EUR per second of driving (km + wage)
     incentive_margin: float = REPOSITION_INCENTIVE_MARGIN
     cooldown: float = REPOSITION_COOLDOWN
     min_shift_left: float = REPOSITION_MIN_SHIFT_LEFT

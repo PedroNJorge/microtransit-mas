@@ -18,7 +18,7 @@ touches the lock runs inside ONE behaviour (the contractor), or in the trip runn
 is firm, so there are no interleavings to reason about.
 
 Pricing (truthful, see docs/auction_mechanism.md): the bid price IS the driver's cost
-    c = base_cost + cost_per_second * (seconds to the pickup + seconds of the route)
+    c = base_cost + cost_per_km * km + cost_per_second * (driving seconds + boarding/alighting seconds)
 rounded up to the cent, never a guess at what others bid. Under the second-score rule that is
 a dominant strategy. A driver whose cost exceeds the CFP's reserve refuses (it could not be paid
 at least its cost, individual rationality).
@@ -35,7 +35,7 @@ import math
 import uuid
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Sequence
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from spade.behaviour import CyclicBehaviour, OneShotBehaviour
 
@@ -43,18 +43,20 @@ from agents.base_agent import BaseAgent
 from common import clock
 from common.ws_server import broadcast_event
 from common.auction import ceil_cents
+from common.cells import deficit
+from common.costs import rate_per_second
 from common.policy import PolicyBook
 from common.lock import DriverLock, LockReason, LockState
 from common.messages import make_inform, make_message, make_propose, make_refuse, make_template
 from common.ontology import (
-    BrainPercept, BidPolicy, CruiseCommand, DemandSignal,
+    BrainPercept, BidPolicy, CruiseCommand, DemandSignal, HubLoad,
     AuctionOutcome, Bid, CFP, Policy, Rating, DriverArriving, DriverState, DriverStatus, FailureReason, MatchResult,
     LateJoinDecision, LateJoinRequest, Perf, Protocol, RepositionRequest, ReputationScore, RiderBoarded, RiderDroppedOff, RiderReady, Settlement,
     TripCompleted, TripFailed, parse_payload,
 )
 from common.settings import (
-    DRIVER_BASE_COST, DRIVER_CAPACITY, DRIVER_COST_PER_SECOND, DWELL_DROPOFF, DWELL_PICKUP,
-    T_JOIN_HOLD, T_NO_SHOW, T_PROVISIONAL, T_STATUS,
+    DRIVER_BASE_COST, DRIVER_CAPACITY, DRIVER_COST_PER_KM, DRIVER_COST_PER_SECOND, DWELL_DROPOFF, DWELL_PICKUP,
+    T_JOIN_HOLD, T_LOAD, T_NO_SHOW, T_PROVISIONAL, T_STATUS,
 )
 from protocols.payment_common import bare
 
@@ -202,6 +204,8 @@ class DemandListener(CyclicBehaviour):
             return
         if isinstance(sig, DemandSignal) and bare(msg.sender) in d.hub_jids:
             d.observe_signal(sig, clock.now())
+        elif isinstance(sig, HubLoad) and bare(msg.sender) in d.hub_jids:
+            d.loads[sig.hub_id] = (sig, clock.now())
 
 
 class _Cruise(OneShotBehaviour):
@@ -249,6 +253,7 @@ class SettlementReceiver(CyclicBehaviour):
             return
         if isinstance(s, Settlement) and self.agent.payment_jid and bare(msg.sender) == self.agent.payment_jid:
             self.agent.payouts.append(s)
+            self.agent.payout_times.append(clock.now())
 
 
 class ReputationReceiver(CyclicBehaviour):
@@ -345,6 +350,12 @@ class TripRunner(OneShotBehaviour):
 
 
 # ---------------------------------------------------------------------------------------------
+def stop_needed(stop: str, boarding, dropped) -> bool:
+    """Does anybody still on board get off at `stop`? The planned route has a stop for every rider of the pool, including
+    one who did not show up: driving there would be empty, unpaid km, shown on the map as a trip with nobody inside."""
+    return any(dest == stop and jid not in dropped for jid, _, dest, _ in boarding)
+
+
 class DriverAgent(BaseAgent):
     role = "driver"
     subscribes_to_traffic = True
@@ -352,7 +363,8 @@ class DriverAgent(BaseAgent):
     def __init__(self, jid: str, password: str, start_hub: str = "", network=None,
                  hub_jids: Sequence[str] = (), capacity: int = DRIVER_CAPACITY,
                  shift_end: float = 1e12, base_cost: float = DRIVER_BASE_COST,
-                 cost_per_second: float = DRIVER_COST_PER_SECOND, t_provisional: float = T_PROVISIONAL,
+                 cost_per_second: float = DRIVER_COST_PER_SECOND, cost_per_km: float = DRIVER_COST_PER_KM,
+                 t_provisional: float = T_PROVISIONAL,
                  t_status: float = T_STATUS, t_no_show: float = T_NO_SHOW,
                  dwell_pickup: float = DWELL_PICKUP, dwell_dropoff: float = DWELL_DROPOFF,
                  payment_jid: Optional[str] = None, regulator_jid: Optional[str] = None,
@@ -368,7 +380,7 @@ class DriverAgent(BaseAgent):
         self.network = network
         self.hub_jids: List[str] = [bare(j) for j in hub_jids]
         self.capacity, self.shift_end = capacity, shift_end
-        self.base_cost, self.cost_per_second = base_cost, cost_per_second
+        self.base_cost, self.cost_per_second, self.cost_per_km = base_cost, cost_per_second, cost_per_km
         self.t_status, self.t_no_show = t_status, t_no_show
         self.dwell_pickup, self.dwell_dropoff = dwell_pickup, dwell_dropoff
         self.payment_jid = bare(payment_jid) if payment_jid else None
@@ -386,6 +398,16 @@ class DriverAgent(BaseAgent):
         self.offers: Dict[str, Offer] = {}
         self.assignment: Optional[Assignment] = None
         self.payouts: List[Settlement] = []
+        self.payout_times: List[float] = []           # sim time each payout arrived (aligned with payouts), for the metrics
+        self.odo_m = {"loaded": 0.0, "pickup": 0.0, "other": 0.0}      # metres driven, by what the vehicle was doing
+        self.odo_s = {"loaded": 0.0, "pickup": 0.0, "other": 0.0}      # seconds driven, same split
+        # empty driving without a rider, by cause: "return" = going to the NEAREST hub (back after a drop-off), "move" = going to
+        # another hub because the brain finds it better, "reposition" = a hub asked for it
+        self.odo_sub_m = {"return": 0.0, "move": 0.0, "reposition": 0.0}
+        self.odo_sub_s = {"return": 0.0, "move": 0.0, "reposition": 0.0}
+        self.cruise_reason = "return"
+        self.other_log: List[Tuple[float, float, float]] = []         # (time, metres, seconds) of empty driving
+        self.trip_log: Dict[str, dict] = {}           # pool id -> pickup/loaded metres and seconds, and when it ended
         self.completed: List[str] = []                # pool ids
         self.status_log: List[DriverStatus] = []
         self.last_status_at = -math.inf
@@ -397,6 +419,7 @@ class DriverAgent(BaseAgent):
         self._obs_pools: set = set()
         self.cruise: Optional[Assignment] = None       # the current self-directed move (only the `cancelled` flag is used)
         self.cruise_target: str = ""
+        self.loads: Dict[str, Tuple[HubLoad, float]] = {}              # hub id -> (latest HubLoad, received at)
         self._cruise_busy = False
         self._last_percept = (None, -math.inf)
         self.late_join = True                          # may accept riders into a pool it is already driving to
@@ -443,13 +466,15 @@ class DriverAgent(BaseAgent):
 
     def status(self) -> DriverStatus:
         return DriverStatus(self.me, self.location, self.state, self.capacity, self.passengers,
-                            self.shift_end, self.base_cost)
+                            self.shift_end, self.base_cost,
+                            self.cruise_target if self.activity == "cruising" else "")
 
     async def announce(self, beh, force: bool = False) -> None:
         """DriverStatusProtocol (CC-07): send the status to every hub when the state changed
         (or on the heartbeat)."""
         sig = (self.state, self.lock.holder.pool_id if self.lock.holder else None,
-               self.location if (self.state != DriverState.IDLE or self.activity == "cruising") else None)
+               self.location if (self.state != DriverState.IDLE or self.activity == "cruising") else None,
+               self.cruise_target if self.activity == "cruising" else "")
         if not force and sig == self._announced:
             return
         self._announced = sig
@@ -522,7 +547,13 @@ class DriverAgent(BaseAgent):
             detour = max(detour, extra)
         if detour > cfp.max_detour + 1e-9:                                     # GC-06
             return None, DETOUR_TOO_LARGE
-        cost = self.base_cost + self.cost_per_second * (eta + route_time)
+        eta_m = net.route_length([self.location, cfp.pickup_node], now) if self.location != cfp.pickup_node else 0.0
+        route_m = net.route_length(stops, now + eta) if len(stops) > 1 else 0.0
+        if eta_m is None or route_m is None:
+            return None, UNREACHABLE
+        dwell = DWELL_PICKUP + DWELL_DROPOFF * len({s for s in stops[1:] if s != cfp.pickup_node})
+        cost = (self.base_cost + self.cost_per_km * (eta_m + route_m) / 1000.0
+                + self.cost_per_second * (eta + route_time + dwell))
         price = ceil_cents(cost * (1.0 + self.bid_markup)) / 100.0               # cost + opportunity cost
         if price > cfp.max_total_fare + 1e-9:                                  # IR: not below cost
             return None, OVER_RESERVE
@@ -655,8 +686,14 @@ class DriverAgent(BaseAgent):
         else:
             state = "idle"                                       # a provisional lock is a bid in flight, not a job
         at_hub = self.location if self.location in hubs else ""
+        deficits = []
+        if any(now - at <= 3 * T_LOAD for _, at in self.loads.values()):
+            for h in hubs:
+                load = self.loads.get(h)
+                fresh = load is not None and now - load[1] <= 3 * T_LOAD
+                deficits.append(round(deficit(load[0].waiting, load[0].rate, load[0].supply), 2) if fresh else 0.0)
         return BrainPercept(self.me, state, self.location, at_hub, self.start_hub, hubs, etas,
-                            [round(pressures.get(h, 0.0), 3) for h in hubs], now)
+                            [round(pressures.get(h, 0.0), 3) for h in hubs], now, deficits)
 
     async def send_percept(self, beh, force: bool = False) -> None:
         now = clock.now()
@@ -700,6 +737,7 @@ class DriverAgent(BaseAgent):
             self.cruise.cancelled = True                                        # redirected: the old move stops at its next junction
         self.cruise = Assignment("", None, None)
         self.cruise_target = cmd.hub_id
+        self.cruise_reason = "return" if cmd.hub_id == self.nearest_hub(now) else "move"
         self.cruises.append(cmd.hub_id)
         self.log(f"brain: cruising to {cmd.hub_id}")
         await beh.send(make_message(msg.sender, Perf.AGREE, Protocol.DRIVER_BRAIN, cmd, msg.thread))
@@ -726,10 +764,49 @@ class DriverAgent(BaseAgent):
                 if dt is None:
                     break                                   # road closed: re-plan from here
                 await clock.sim_sleep(dt)
+                self.record_hop(self.location, nxt, dt, a)
                 self.location = nxt
                 self.broadcast_viz()
             if a.cancelled:
                 raise _TripCancelled()
+
+    def nearest_hub(self, now: float) -> str:
+        """The hub node closest in travel time ('' if unknown): going there is a 'return', anywhere else a 'move'."""
+        best, best_t = "", math.inf
+        hubs = set(self.network.hubs) if self.network is not None else set()          # hub NODE ids (hub_jids are JIDs)
+        for h in sorted(hubs | ({self.start_hub} if self.start_hub else set())):
+            try:
+                t = self.network.travel_time(self.location, h, now)
+            except (KeyError, AttributeError):
+                continue
+            if t < best_t:
+                best, best_t = h, t
+        return best
+
+    @property
+    def cost_rate(self) -> float:
+        """EUR per second of driving at the nominal urban speed (km and time folded together)."""
+        return rate_per_second(self.cost_per_km, self.cost_per_second)
+
+    def record_hop(self, frm: str, to: str, seconds: float, a: Assignment) -> None:
+        """Odometer for the metrics: what this hop was (loaded / on the way to a pickup / anything else) and how long."""
+        kind = {"on_trip": "loaded", "to_pickup": "pickup"}.get(self.activity, "other")
+        try:
+            metres = float(self.network.g[frm][to].get("length", 0.0))
+        except (KeyError, AttributeError):
+            metres = 0.0
+        self.odo_m[kind] += metres
+        self.odo_s[kind] += seconds
+        if kind == "other":
+            self.other_log.append((clock.now(), metres, seconds))
+            sub = "reposition" if self.activity == "repositioning" else self.cruise_reason
+            self.odo_sub_m[sub] += metres
+            self.odo_sub_s[sub] += seconds
+        if a is not None and a.match is not None and kind != "other":
+            row = self.trip_log.setdefault(a.match.pool_id, {"pickup_m": 0.0, "loaded_m": 0.0, "pickup_s": 0.0,
+                                                             "loaded_s": 0.0, "done": None})
+            row[kind + "_m"] += metres
+            row[kind + "_s"] += seconds
 
     async def run_trip(self, beh, a: Assignment) -> None:
         pool, cfp = a.match.pool_id, a.offer.cfp
@@ -792,6 +869,8 @@ class DriverAgent(BaseAgent):
         await self.announce(beh)
         # drive the planned order, dropping off as we go
         for stop in (a.route or a.offer.route)[1:]:
+            if not stop_needed(stop, boarding, a.dropped):
+                continue                                           # nobody on board goes there (a no-show's stop, or all dropped)
             await self.drive(stop, a)
             await clock.sim_sleep(self.dwell_dropoff)
             for jid, req, dest, rpool in boarding:
@@ -814,6 +893,7 @@ class DriverAgent(BaseAgent):
         self.lock.finish(pool, clock.now())
         self.offers.pop(pool, None)
         self.completed.append(pool)
+        self.trip_log.setdefault(pool, {"pickup_m": 0.0, "loaded_m": 0.0, "pickup_s": 0.0, "loaded_s": 0.0})["done"] = clock.now()
         self.finished_trips[pool] = a
         self.log(f"{pool} completed, idle at {self.location}")
         self.return_after_trip()
@@ -826,7 +906,8 @@ class DriverAgent(BaseAgent):
             return "too_late"
         if len(a.riders) + 1 > self.capacity:
             return "full"
-        if p.extra_pay + 1e-9 < p.extra_seconds * self.cost_per_second * (1.0 + self.bid_markup):
+        need = (p.extra_seconds + DWELL_DROPOFF) * self.cost_rate * (1.0 + self.bid_markup)
+        if p.extra_pay + 1e-9 < need:
             return "underpaid"
         return ""
 
@@ -866,6 +947,7 @@ class DriverAgent(BaseAgent):
             self.cruise.cancelled = True
         self.cruise = Assignment("", None, None)
         self.cruise_target = target
+        self.cruise_reason = "return"
         self.returns.append(target)
         self.log(f"returning to {target}")
         self.add_behaviour(_Cruise(self.cruise, target))
@@ -895,7 +977,7 @@ class DriverAgent(BaseAgent):
             secs = self.network.travel_time(self.location, target, now) if target else math.inf
             if not target or math.isinf(secs):
                 reason = UNREACHABLE
-            elif req.incentive + 1e-9 < self.cost_per_second * secs:
+            elif req.incentive + 1e-9 < self.cost_rate * secs:
                 reason = "incentive_too_low"
         if reason:
             await beh.send(make_message(hub, Perf.REFUSE, Protocol.REPOSITION, reason, thread))

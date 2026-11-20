@@ -6,7 +6,7 @@ from common.ontology import LateJoinRequest
 
 
 def driver(**kw):
-    d = NS(late_join=True, activity="to_pickup", capacity=4, cost_per_second=0.004, bid_markup=0.0,
+    d = NS(late_join=True, activity="to_pickup", capacity=4, cost_rate=0.004, bid_markup=0.0,
            log=lambda *_: None)
     d.__dict__.update(kw)
     d.late_join_problem = lambda a, s, p: DriverAgent.late_join_problem(d, a, s, p)

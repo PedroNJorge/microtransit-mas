@@ -19,7 +19,8 @@
 // shift in pressure and drove ~2 moves per ride for nothing.
 
 // ---- tunables (beliefs of the brain, so tests and experiments can change them) -------------------
-drive_cost(0.0015).      // pressure units given up per second of driving
+// drive_cost: pressure units given up per second of driving. It is a belief the agent sets from its constructor
+// (scenario: drivers.brain_drive_cost, default 0.0015) so experiments can change it.
 switch_margin(0.5).      // a new target must beat the current hub / intention by this much
 
 // ---- value of waiting at a hub ---------------------------------------------------------------------
