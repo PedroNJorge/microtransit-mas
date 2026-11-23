@@ -2,21 +2,27 @@
 name = "microtransit-mas"
 version = "0.1.0"
 requires-python = ">=3.12"
+
 dependencies = [
-    "branca>=0.8.2",
-    "folium>=0.20.0",
-    "mapclassify>=2.11.0",
-    "matplotlib>=3.11.2",
     "networkx>=3.7",
-    "numpy>=2.5.4",
-    "osmnx>=2.1.1",
-    "py-spy>=0.4.3",
-    "pytest>=9.2.0",
-    "pytest-asyncio>=1.4.1.post1",
     "spade>=4.1.4",
     "spade-bdi>=0.3.3",
     "sqlalchemy[asyncio]>=2.1.8",
     "websockets>=17.4",
+]
+
+[project.optional-dependencies]
+maps = [                     # only for tools/build_graph.py and tools/view.py
+    "osmnx>=2.1.1",
+    "folium>=0.20.0",
+    "mapclassify>=2.11.0",
+    "matplotlib>=3.11.2",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+    "pytest-asyncio>=1.4.1.post1",
 ]
 
 [tool.pytest.ini_options]
