@@ -7,6 +7,8 @@ import uuid
 
 import pytest
 
+from common.auction import AuctionRules
+
 from agents.driver import DriverAgent
 from agents.microhub import MicrohubAgent
 from agents.payment import PaymentAgent
@@ -179,8 +181,12 @@ async def test_audit_of_a_compliant_hub_passes(xmpp_server, sim_clock, net):
         assert w.hub.penalties == []
 
 
+# these two need a lone bidder paid the reserve (a fare far above the cap), i.e. the old rule: lone_margin=None
+OLD_LONE_RULE = {"rules": AuctionRules(lone_margin=None)}
+
+
 async def test_audit_catches_a_hub_that_never_applied_the_cap(xmpp_server, sim_clock, net):
-    async with World(net) as w:
+    async with World(net, hub_kw=OLD_LONE_RULE) as w:
         # the hub is NOT among the recipients: it never hears about the cap and charges the uncapped reserve
         w.reg.publish_policy(fare_caps={"max": 3.0}, recipients=[str(d.jid.bare) for d in w.drivers])
         assert await until(lambda: len(w.reg.acks.get(1, {})) == 1, 10)
@@ -196,7 +202,7 @@ async def test_audit_catches_a_hub_that_never_applied_the_cap(xmpp_server, sim_c
 
 async def test_the_regulator_judges_by_its_own_policy_record_not_the_hubs_claim(xmpp_server, sim_clock, net):
     """A fare above a cap that was NOT yet in force when it was awarded is not a violation."""
-    async with World(net) as w:
+    async with World(net, hub_kw=OLD_LONE_RULE) as w:
         trip = await w.ride()                                              # awarded with no policy at all
         assert trip.match.final_fare == 20.0
         w.reg.publish_policy(fare_caps={"max": 3.0})                      # published after the trip

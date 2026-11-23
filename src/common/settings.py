@@ -14,6 +14,7 @@ T_AUCTION = 30.0            # bidding window after the CFP (Organizational Rules
 T_AWARD = 10.0              # time the winner has to confirm an accept-proposal (CC-05)
 T_ESCROW = 15.0             # hub waits this long for escrow_confirmed (ID-09)
 AUCTION_PRICING = "second_score"   # or "first_price"
+LONE_BIDDER_MARGIN = 0.10           # a lone valid bidder is paid its bid x (1 + this), at most the reserve; None = the full reserve (old rule)
 MAX_AUCTION_ATTEMPTS = 2    # auctions per pool before it is declared unmatched (FE-01)
 WIDEN_DETOUR = 300.0        # seconds of extra detour allowed on each retry
 
@@ -27,6 +28,9 @@ VALUE_OF_REPUTATION = 0.25  # EUR per reputation point below the maximum (5)
 # ---- Driver (Milestone 6) --------------------------------------------------------------------
 T_PROVISIONAL = 60.0        # a bid's provisional lock expires after this (CC-02); must exceed
                             # T_AWARD + network delay (GC-17)
+T_LATE_POLL = 2.0           # while an auction holds its window open the hub looks for newly idle drivers this often (sim s)
+LATE_HOLD = 15.0            # ... and holds it open this long after the CFP when fewer than LATE_MIN_BIDS bids are in (sim s)
+LATE_MIN_BIDS = 2           # with fewer bids the winner is paid the reserve (thin market), so more bidders are worth waiting for
 T_STATUS = 30.0             # DriverStatus heartbeat (DriverStatusProtocol)
 T_NO_SHOW = 120.0           # driver waits this long for a rider at the pickup (FE-05)
 T_REPOSITION = 30.0         # hub waits this long for an answer to a reposition request
@@ -34,7 +38,8 @@ DWELL_PICKUP = 15.0         # seconds spent boarding riders
 DWELL_DROPOFF = 10.0        # seconds spent per drop-off
 # Driver cost model (the driver's true cost c_i, docs/auction_mechanism.md): distance + time, no fixed fee.
 DRIVER_COST_PER_KM = 0.15        # EUR per km driven (fuel + wear), empty or loaded (our own estimate)
-DRIVER_COST_PER_HOUR = 4.96      # EUR per hour (net minimum wage, Portugal 2027), charged for ALL driving and boarding time
+DRIVER_WAGE_TARGET_PER_HOUR = 4.96     # EUR per hour a driver should earn (net minimum wage, Portugal 2027): the yardstick of the income metrics
+DRIVER_COST_PER_HOUR = DRIVER_WAGE_TARGET_PER_HOUR      # EUR per hour (net minimum wage, Portugal 2027), charged for ALL driving and boarding time
 DRIVER_COST_PER_SECOND = DRIVER_COST_PER_HOUR / 3600.0
 DRIVER_BASE_COST = 0.0           # EUR fixed cost of taking a job: none (opportunity cost lives in bid_markup)
 NOMINAL_SPEED_KMH = 30.0         # urban speed, only to turn km into time-equivalents where the route length is not known

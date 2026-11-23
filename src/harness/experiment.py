@@ -49,8 +49,9 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 from common import clock
 from common.costs import driver_cost, dwell_seconds
+from common.settings import DRIVER_COST_PER_KM, DRIVER_WAGE_TARGET_PER_HOUR
 from harness.launcher import Harness
-from harness.live_metrics import gini, mover_stats, percentile
+from harness.live_metrics import driver_income_stats, gini, mover_stats, percentile
 from harness.scenario import PROJECT_ROOT, Scenario, ScenarioError
 
 # two-sided 95 % Student-t critical values by degrees of freedom (1..30); beyond that ~1.96
@@ -67,7 +68,9 @@ KEY_METRICS = (
     "util_idle", "util_loaded", "util_cruising",
     "auction_attempts", "refuse_locked", "refuse_too_late", "late_joins",
     "brain_moves", "mover_dispersion", "mover_share_in_group", "hub_wait_gini", "hub_wait_cv", "hub_wait_max_over_min",
-    "hub_wait_worst", "speed_achieved", "sim_seconds",
+    "hub_wait_worst", "fleet_income_hour", "driver_income_hour_median", "driver_wage_share", "driver_income_gini",
+    "driver_utilisation_mean", "fleet_initial", "fleet_end", "fleet_mean", "exits", "entries", "turnover_per_hour",
+    "single_bid_share", "speed_achieved", "sim_seconds",
 )
 COUNT_PREFIXES = ("fail_", "refuse_", "outcome_")      # a count that is absent in a run was zero
 
@@ -322,6 +325,23 @@ def brain_metrics(h) -> Dict[str, float]:
     return out
 
 
+def fleet_stats(market_log: Sequence[tuple], initial: int, now: float) -> Dict[str, float]:
+    """Fleet size over the run from the labour market's events (sim time, "exit"|"enter", driver, fleet after)."""
+    size, t_prev, area = float(initial), 0.0, 0.0
+    lo = hi = size
+    for t, kind, _, after in sorted(market_log, key=lambda e: e[0]):
+        area += size * (min(t, now) - t_prev)
+        size, t_prev = float(after), min(t, now)
+        lo, hi = min(lo, size), max(hi, size)
+    area += size * max(now - t_prev, 0.0)
+    exits = sum(1 for e in market_log if e[1] == "exit")
+    entries = sum(1 for e in market_log if e[1] == "enter")
+    hours = now / 3600.0
+    return {"fleet_initial": float(initial), "fleet_end": size, "fleet_min": lo, "fleet_max": hi,
+            "fleet_mean": area / now if now > 0 else float(initial), "exits": float(exits), "entries": float(entries),
+            "turnover_per_hour": (exits + entries) / hours if hours > 0 else 0.0}
+
+
 def money_metrics(h, collector) -> Dict[str, float]:
     """Totals in EUR: revenue, the cost model's cost of loaded and of empty driving, money conservation."""
     pools, empty = collector.pool_records(), collector.empty_records()
@@ -331,6 +351,7 @@ def money_metrics(h, collector) -> Dict[str, float]:
     empty_cost = sum(driver_cost(m / 1000.0, s) for _, m, s in empty)
     out = {"revenue_total": revenue, "cost_loaded_total": loaded_cost, "cost_empty_total": empty_cost,
            "net_profit_total": revenue - loaded_cost - empty_cost, "vehicle_trips": float(len(pools))}
+    out.update(driver_income_stats(collector.driver_records(clock.now()), DRIVER_WAGE_TARGET_PER_HOUR, DRIVER_COST_PER_KM))
     pay = next((a for a in h.agents.values() if a.role == "payment"), None)
     if pay is not None:
         try:
@@ -381,6 +402,7 @@ def collect(h, sc: Scenario, real_seconds: float, ended_by: str) -> Dict[str, fl
     row["issued"] = float(runner.summary.issued) if runner is not None else math.nan
     row["skipped"] = float(runner.summary.skipped) if runner is not None else math.nan
     row.update(auction_metrics(h))
+    row.update(fleet_stats(getattr(h, "market_log", []), sc.n_drivers, clock.now()))
     row.update(brain_metrics(h))
     row.update(money_metrics(h, collector))
     row.update(series_metrics(collector.history))
@@ -410,13 +432,36 @@ async def wait_until_done(h, sc: Scenario, limit_real: float) -> str:
     return "cap"
 
 
-async def run_once(sc: Scenario, limit_real: float) -> Tuple[Dict[str, float], List[dict], str]:
+CHECKPOINT_EVERY = 1800.0          # sim seconds between per-driver checkpoints (the calibration log)
+
+
+async def sample_drivers(h, out: List[dict], every: float = CHECKPOINT_EVERY) -> None:
+    """Every `every` sim seconds append one cumulative row per driver (t, revenue, metres, driving_s, trips, calls, bids,
+    wins). Rolling-window numbers are differences between checkpoints, computed offline (tools/calibrate.py)."""
+    k = 1
+    while True:
+        while clock.now() < k * every:
+            await asyncio.sleep(0.25)
+        for r in h.metrics.driver_records(k * every):
+            out.append(dict(r, t=k * every))
+        k += 1
+
+
+async def run_once(sc: Scenario, limit_real: float, checkpoints: Optional[List[dict]] = None,
+                   market: Optional[List[tuple]] = None) -> Tuple[Dict[str, float], List[dict], str]:
     clock.reset(sc.speed)
     t0 = time.monotonic()
     async with Harness(sc, start_server=True, viewer=False) as h:
-        ended = await wait_until_done(h, sc, limit_real)
+        sampler = asyncio.create_task(sample_drivers(h, checkpoints)) if checkpoints is not None else None
+        try:
+            ended = await wait_until_done(h, sc, limit_real)
+        finally:
+            if sampler:
+                sampler.cancel()
         row = collect(h, sc, time.monotonic() - t0, ended)
         series = list(h.metrics.history)
+        if market is not None:
+            market.extend(h.market_log)
     return row, series, ended
 
 
@@ -446,7 +491,9 @@ async def experiment(arms: List[Arm], seeds: List[int], repeats: int, speed: Opt
                     try:
                         sc = arm.scenario_for(seed, speed)
                         limit = run_limit(sc, timeout)
-                        row, series, ended = await asyncio.wait_for(run_once(sc, limit), limit + 120.0)
+                        cps: List[dict] = []
+                        mkt: List[tuple] = []
+                        row, series, ended = await asyncio.wait_for(run_once(sc, limit, cps, mkt), limit + 120.0)
                     except asyncio.TimeoutError:
                         progress(f"{tag}: TIMED OUT (run skipped)")
                         continue
@@ -456,6 +503,9 @@ async def experiment(arms: List[Arm], seeds: List[int], repeats: int, speed: Opt
                     row.update(arm=arm.name, seed=seed, repeat=rep, ended_by=ended)
                     out[arm.name].append(row)
                     (series_dir / f"{arm.name}_s{seed}_r{rep}.json").write_text(json.dumps(series))
+                    write_driver_checkpoints(out_dir / "drivers" / f"{arm.name}_s{seed}_r{rep}.csv", cps)
+                    if mkt:
+                        write_market_log(out_dir / "market" / f"{arm.name}_s{seed}_r{rep}.csv", mkt)
                     progress(f"{tag}: {ended}, wait {row['wait_mean']:.0f}s (max {row['wait_max']:.0f}s), "
                              f"profit/trip {row['profit_per_trip']:.2f}, unfinished {row['unfinished']:.0f}, "
                              f"{time.time() - t0:.0f}s real")
@@ -482,6 +532,24 @@ def normalise(runs: Dict[str, List[dict]]) -> Dict[str, List[dict]]:
 
 def metric_names(runs: Dict[str, List[dict]]) -> List[str]:
     return sorted({k for v in runs.values() for r in v for k in r} - set(META))
+
+
+def write_driver_checkpoints(path: Path, rows: List[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    cols = ["t", "driver", "revenue", "trips", "metres", "driving_s", "hours", "calls", "bids", "wins"]
+    with path.open("w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(cols)
+        for r in rows:
+            w.writerow([r.get(c, "") for c in cols])
+
+
+def write_market_log(path: Path, events: Sequence[tuple]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["t", "event", "driver", "fleet_after"])
+        w.writerows(events)
 
 
 def write_runs_csv(path: Path, runs: Dict[str, List[dict]]) -> None:

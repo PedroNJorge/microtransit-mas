@@ -1,0 +1,55 @@
+{
+ "_note": "S* sweep on long 07 with exit/entry (exit line = wage, entry 1.10 x wage, 12 reserve) under the NEW lone-bidder payment (bid x 1.10). no_rule = fixed 4.96 EUR/h time price; s_05h / s_1h / s_2h = rolling-surplus bid rule with S* = 0.5 / 1 / 2 hours of wage (2.5 / 5 / 10 EUR). Compare bids, win rate, income, fleet size, waits. About 6 real hours (12 runs); add --seeds 1,2 for 4.",
+ "speed": 15,
+ "seeds": [
+  1,
+  2,
+  3
+ ],
+ "repeats": 1,
+ "arms": {
+  "no_rule": {
+   "scenario": "config/scenarios/long_07_migrating_demand.json",
+   "set": {
+    "labour_market": {
+     "reserve": 12,
+     "exit_ratio": 1.0,
+     "entry_ratio": 1.1
+    }
+   }
+  },
+  "s_05h": {
+   "scenario": "config/scenarios/long_07_migrating_demand.json",
+   "set": {
+    "labour_market": {
+     "reserve": 12,
+     "exit_ratio": 1.0,
+     "entry_ratio": 1.1
+    },
+    "drivers.surplus_scale_hours": 0.5
+   }
+  },
+  "s_1h": {
+   "scenario": "config/scenarios/long_07_migrating_demand.json",
+   "set": {
+    "labour_market": {
+     "reserve": 12,
+     "exit_ratio": 1.0,
+     "entry_ratio": 1.1
+    },
+    "drivers.surplus_scale_hours": 1
+   }
+  },
+  "s_2h": {
+   "scenario": "config/scenarios/long_07_migrating_demand.json",
+   "set": {
+    "labour_market": {
+     "reserve": 12,
+     "exit_ratio": 1.0,
+     "entry_ratio": 1.1
+    },
+    "drivers.surplus_scale_hours": 2
+   }
+  }
+ }
+}

@@ -40,6 +40,8 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 from spade.behaviour import CyclicBehaviour, OneShotBehaviour
 
 from agents.base_agent import BaseAgent
+from agents.expected_wins import value_per_win
+from agents.bid_rule import time_value, window_net, window_surplus
 from common import clock
 from common.ws_server import broadcast_event
 from common.auction import ceil_cents
@@ -55,8 +57,9 @@ from common.ontology import (
     TripCompleted, TripFailed, parse_payload,
 )
 from common.settings import (
-    DRIVER_BASE_COST, DRIVER_CAPACITY, DRIVER_COST_PER_KM, DRIVER_COST_PER_SECOND, DWELL_DROPOFF, DWELL_PICKUP,
-    T_JOIN_HOLD, T_LOAD, T_NO_SHOW, T_PROVISIONAL, T_STATUS,
+    DRIVER_BASE_COST, DRIVER_CAPACITY, DRIVER_COST_PER_KM, DRIVER_COST_PER_SECOND, DRIVER_WAGE_TARGET_PER_HOUR,
+    DWELL_DROPOFF, DWELL_PICKUP,
+    HUB_LOAD_HORIZON, T_JOIN_HOLD, T_LOAD, T_NO_SHOW, T_PROVISIONAL, T_STATUS,
 )
 from protocols.payment_common import bare
 
@@ -371,7 +374,8 @@ class DriverAgent(BaseAgent):
                  reputation_jid: Optional[str] = None,
                  rate_riders_with: Optional[Callable[['Assignment'], int]] = None,
                  brain_jid: Optional[str] = None, t_percept: float = 30.0, t_obs_window: float = 600.0,
-                 return_policy: str = "none", **kwargs):
+                 return_policy: str = "none", surplus_scale: Optional[float] = None, surplus_window: float = 7200.0,
+                 wage_target: float = DRIVER_WAGE_TARGET_PER_HOUR, start_offline: bool = False, **kwargs):
         super().__init__(jid, password, **kwargs)
         self.start_hub = start_hub                    # hub id where this driver starts its shift
         # fixed baseline (no BDI): after a trip drive back to `start_hub` / the `nearest_hub`; `none` = wait where dropped off
@@ -381,6 +385,8 @@ class DriverAgent(BaseAgent):
         self.hub_jids: List[str] = [bare(j) for j in hub_jids]
         self.capacity, self.shift_end = capacity, shift_end
         self.base_cost, self.cost_per_second, self.cost_per_km = base_cost, cost_per_second, cost_per_km
+        # rolling-surplus bid rule (agents/bid_rule.py): None = off, the time price stays `cost_per_second`; else the scale S* in EUR
+        self.surplus_scale, self.surplus_window, self.wage_target = surplus_scale, surplus_window, wage_target
         self.t_status, self.t_no_show = t_status, t_no_show
         self.dwell_pickup, self.dwell_dropoff = dwell_pickup, dwell_dropoff
         self.payment_jid = bare(payment_jid) if payment_jid else None
@@ -392,7 +398,10 @@ class DriverAgent(BaseAgent):
         self.rated: set = set()
         self.reputation_score: Optional[ReputationScore] = None   # newest published score about this driver
         self.location: str = start_hub
-        self.activity = "idle"                        # idle | repositioning | to_pickup | on_trip | offline
+        self.activity = "offline" if start_offline else "idle"    # idle | repositioning | to_pickup | on_trip | offline
+        # on duty from `online_from` (None: a reserve driver that has not entered) until `online_until` (None: still on duty)
+        self.online_from: Optional[float] = None if start_offline else 0.0
+        self.online_until: Optional[float] = None
         self.passengers = 0
         self.lock = DriverLock(t_provisional)
         self.offers: Dict[str, Offer] = {}
@@ -409,6 +418,9 @@ class DriverAgent(BaseAgent):
         self.other_log: List[Tuple[float, float, float]] = []         # (time, metres, seconds) of empty driving
         self.trip_log: Dict[str, dict] = {}           # pool id -> pickup/loaded metres and seconds, and when it ended
         self.completed: List[str] = []                # pool ids
+        self.n_calls = 0                              # calls for proposals received (for the calibration log)
+        self.n_bids = 0                               # of which answered with a bid
+        self.n_wins = 0                               # bids accepted
         self.status_log: List[DriverStatus] = []
         self.last_status_at = -math.inf
         self._announced = None
@@ -515,6 +527,52 @@ class DriverAgent(BaseAgent):
         loop.create_task(broadcast_event("DRIVER_UPDATE", payload))
 
     # ---- bidding ---------------------------------------------------------------------------
+    def _window_events(self):
+        km_events = [(t, m) for t, m, _ in self.other_log]
+        km_events += [(x["done"], x["pickup_m"] + x["loaded_m"]) for x in self.trip_log.values() if x.get("done") is not None]
+        pays = [(t, p.driver_payout) for p, t in zip(self.payouts, self.payout_times)]
+        return pays, km_events
+
+    def win_value(self) -> float:
+        """EUR this driver nets per won trip: a running mean of (payment - km cost) with a prior (agents/expected_wins.py)."""
+        done = [x for x in self.trip_log.values() if x.get("done") is not None]
+        km = sum(x["pickup_m"] + x["loaded_m"] for x in done) / 1000.0
+        return round(value_per_win(sum(p.driver_payout for p in self.payouts) - self.cost_per_km * km, len(done)), 3)
+
+    def rolling_net(self, now: float) -> Tuple[float, float]:
+        """(revenue - km cost, duty hours) over the last `surplus_window` seconds (see agents/bid_rule.py)."""
+        pays, kms = self._window_events()
+        return window_net(now, self.surplus_window, self.cost_per_km, pays, kms, self.online_from or 0.0)
+
+    def rolling_surplus(self, now: float) -> float:
+        """Revenue minus km cost minus the wage yardstick over the last `surplus_window` seconds (see agents/bid_rule.py)."""
+        pays, kms = self._window_events()
+        return window_surplus(now, self.surplus_window, self.wage_target, self.cost_per_km, pays, kms, self.online_from or 0.0)
+
+    # ---- labour market (harness/labour_market.py): leave and enter the market -----------------------
+    def go_offline(self, now: float) -> bool:
+        """Leave the market for good. Only an idle driver with no lock may leave (a rider is never stranded)."""
+        if self.activity != "idle" or self.lock.state != LockState.FREE or self.assignment is not None:
+            return False
+        self.activity, self.online_until = "offline", now
+        self.log(f"leaves the market at t={now:.0f}")
+        return True
+
+    def go_online(self, now: float, hub: str) -> bool:
+        """A reserve driver enters the market at `hub`."""
+        if self.activity != "offline" or self.online_from is not None:
+            return False
+        self.start_hub, self.location = hub, hub
+        self.activity, self.online_from = "idle", now
+        self.log(f"enters the market at {hub}, t={now:.0f}")
+        return True
+
+    def time_price(self, now: float) -> float:
+        """EUR per second the driver puts on its time in a bid: fixed, or from its rolling surplus when the rule is on."""
+        if self.surplus_scale is None:
+            return self.cost_per_second
+        return time_value(self.rolling_surplus(now), self.wage_target, self.surplus_scale) / 3600.0
+
     def calculate_bid(self, cfp: CFP, now: float):
         """-> (Offer, None) or (None, refuse_reason). No side effects."""
         net = self.network
@@ -553,7 +611,7 @@ class DriverAgent(BaseAgent):
             return None, UNREACHABLE
         dwell = DWELL_PICKUP + DWELL_DROPOFF * len({s for s in stops[1:] if s != cfp.pickup_node})
         cost = (self.base_cost + self.cost_per_km * (eta_m + route_m) / 1000.0
-                + self.cost_per_second * (eta + route_time + dwell))
+                + self.time_price(now) * (eta + route_time + dwell))
         price = ceil_cents(cost * (1.0 + self.bid_markup)) / 100.0               # cost + opportunity cost
         if price > cfp.max_total_fare + 1e-9:                                  # IR: not below cost
             return None, OVER_RESERVE
@@ -594,6 +652,8 @@ class DriverAgent(BaseAgent):
     async def handle_cfp(self, beh, hub: str, cfp: CFP, now: float) -> None:
         pool = cfp.pool_id
         self.observe(cfp, now)
+        if not (self.lock.holds(pool, hub) and pool in self.offers):          # a repeated CFP is not a new call
+            self.n_calls += 1
         if self.activity == "offline":
             await beh.send(make_refuse(hub, pool, OFFLINE)); return
         if self.lock.blocks(pool, hub, cfp.attempt, now):                      # CC-09
@@ -611,6 +671,7 @@ class DriverAgent(BaseAgent):
         if not decision.ok:
             await beh.send(make_refuse(hub, pool, decision.reason)); return
         self.offers[pool] = offer
+        self.n_bids += 1
         self.log(f"cfp {pool}: bid {offer.bid.price:.2f} eta={offer.bid.eta:.0f}s (lock until "
                  f"t={self.lock.holder.expires_at:.0f})")
         await beh.send(make_propose(hub, offer.bid))
@@ -626,6 +687,7 @@ class DriverAgent(BaseAgent):
             await beh.send(make_refuse(hub, pool, decision.reason or LockReason.NO_LOCK)); return
         if decision.replay:
             await beh.send(make_message(hub, Perf.CONFIRM, Protocol.MATCH_AUCTION, match, pool)); return
+        self.n_wins += 1
         if self.cruise is not None:                                            # a job beats a cruise: stop at the next junction
             self.cruise.cancelled = True
             self.cruise, self.cruise_target = None, ""
@@ -692,8 +754,24 @@ class DriverAgent(BaseAgent):
                 load = self.loads.get(h)
                 fresh = load is not None and now - load[1] <= 3 * T_LOAD
                 deficits.append(round(deficit(load[0].waiting, load[0].rate, load[0].supply), 2) if fresh else 0.0)
+        demands, supplies, dists = [], [], []
+        if deficits:
+            for h in hubs:
+                load = self.loads.get(h)
+                fresh = load is not None and now - load[1] <= 3 * T_LOAD
+                # requests a driver arriving later could still win: new arrivals over the horizon, plus waiting ones the free
+                # drivers already there cannot cover (the others are served before it arrives)
+                demands.append(round(load[0].rate * HUB_LOAD_HORIZON / 60.0 + max(load[0].waiting - load[0].supply, 0.0), 2)
+                               if fresh else 0.0)
+                supplies.append(float(load[0].supply) if fresh else 0.0)
+                try:
+                    m = self.network.route_length([self.location, h], now) if self.location != h else 0.0
+                except KeyError:
+                    m = None
+                dists.append(-1.0 if m is None else round(m, 1))
         return BrainPercept(self.me, state, self.location, at_hub, self.start_hub, hubs, etas,
-                            [round(pressures.get(h, 0.0), 3) for h in hubs], now, deficits)
+                            [round(pressures.get(h, 0.0), 3) for h in hubs], now, deficits,
+                            demands, supplies, dists, self.win_value())
 
     async def send_percept(self, beh, force: bool = False) -> None:
         now = clock.now()

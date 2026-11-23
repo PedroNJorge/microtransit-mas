@@ -1,0 +1,20 @@
+{
+ "_note": "Calibration runs: default behaviour (no change), seeds 11-13 kept apart from the evaluation seeds 1-3. Feeds tools/calibrate.py via drivers/*.csv.",
+ "speed": 15,
+ "seeds": [
+  11,
+  12
+ ],
+ "repeats": 1,
+ "arms": {
+  "c07_no_brain": {
+   "scenario": "config/scenarios/long_07_migrating_demand.json"
+  },
+  "c07_signal": {
+   "scenario": "config/scenarios/long_brains_07_migrating_demand.json"
+  },
+  "c04_no_brain": {
+   "scenario": "config/scenarios/long_04_centre_drivers_suburb_requests.json"
+  }
+ }
+}

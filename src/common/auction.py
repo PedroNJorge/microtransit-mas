@@ -20,7 +20,9 @@ The winner is the bid with the lowest cost_i. Payment to the winner w:
   first_price    pay p_w.                           Simple; drivers can gain by shading.
   second_score   pay min(reserve, p_w + (cost_2 - cost_w)),   cost_2 = best losing cost_i.
                  i.e. the HIGHEST price at which w would still have won ("threshold price").
-                 With no competing valid bid, pay the reserve (the riders' max fare).
+                 With no competing valid bid there is no threshold: pay the bid x (1 + lone_margin), at most the
+                 reserve (lone_margin = None restores the old rule: pay the reserve, the riders' max fare, which
+                 over-pays in thin markets and breaks nothing in the proofs, since the proofs need >= 2 bids).
 
 second_score is the VCG mechanism for one item (a Vickrey / "second-score" auction, Che 1993):
   * Individual rationality: pay >= p_w, because cost_2 >= cost_w. A winner never earns less
@@ -49,7 +51,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 from common.ontology import CFP, Bid
 from common.settings import (
-    AUCTION_PRICING, VALUE_OF_DETOUR, VALUE_OF_REPUTATION, VALUE_OF_TIME)
+    AUCTION_PRICING, LONE_BIDDER_MARGIN, VALUE_OF_DETOUR, VALUE_OF_REPUTATION, VALUE_OF_TIME)
 
 FIRST_PRICE = "first_price"
 SECOND_SCORE = "second_score"
@@ -80,6 +82,7 @@ class AuctionRules:
     max_reputation: float = 5.0
     default_reputation: float = 3.0                 # used when a bid carries no reputation
     quantize: bool = True                           # payments in whole cents (False: exact maths)
+    lone_margin: Optional[float] = LONE_BIDDER_MARGIN   # second_score with ONE valid bid: pay bid x (1 + margin), at most the reserve (None: the reserve)
 
     def __post_init__(self):
         if self.pricing not in PRICING_RULES:
@@ -88,6 +91,9 @@ class AuctionRules:
             v = getattr(self, name)
             if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v < 0:
                 raise ValueError(f"{name} must be a finite number >= 0 (got {v!r})")
+        if self.lone_margin is not None and (isinstance(self.lone_margin, bool) or not math.isfinite(self.lone_margin)
+                                             or self.lone_margin < 0):
+            raise ValueError(f"lone_margin must be None or a finite number >= 0 (got {self.lone_margin!r})")
         if not 1.0 <= self.default_reputation <= self.max_reputation:
             raise ValueError("default_reputation must lie in [1, max_reputation]")
 
@@ -196,8 +202,10 @@ def _payment(rules: AuctionRules, reserve: float, ranking: Sequence[ScoredBid]) 
         raw = w.bid.price
     elif len(ranking) > 1:
         raw = w.bid.price + (ranking[1].cost - w.cost)       # threshold price
+    elif rules.lone_margin is None:
+        raw = reserve                                         # no competition: the posted reserve (old rule)
     else:
-        raw = reserve                                         # no competition: the posted reserve
+        raw = w.bid.price * (1.0 + rules.lone_margin)         # no competition: own bid plus a small margin
     raw = min(raw, reserve)
     if not rules.quantize:
         return max(raw, w.bid.price)

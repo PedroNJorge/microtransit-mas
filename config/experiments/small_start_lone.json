@@ -1,0 +1,47 @@
+{
+ "_note": "Does the entry rule and the income picture change under the new lone-bidder payment? small_start_new: 12 drivers + 12 reserve, default rules, lone_margin 0.10. small_start_old: the same with lone_margin null (the old reserve payment) as the comparison. About 3 real hours (6 runs).",
+ "speed": 15,
+ "seeds": [
+  1,
+  2,
+  3
+ ],
+ "repeats": 1,
+ "arms": {
+  "small_start_old": {
+   "scenario": "config/scenarios/long_07_migrating_demand.json",
+   "set": {
+    "drivers.placement": [
+     {
+      "hubs": [
+       "hub_senhora_da_hora",
+       "hub_casa_da_musica"
+      ],
+      "count": 12
+     }
+    ],
+    "labour_market": {
+     "reserve": 12
+    },
+    "lone_margin": null
+   }
+  },
+  "small_start_new": {
+   "scenario": "config/scenarios/long_07_migrating_demand.json",
+   "set": {
+    "drivers.placement": [
+     {
+      "hubs": [
+       "hub_senhora_da_hora",
+       "hub_casa_da_musica"
+      ],
+      "count": 12
+     }
+    ],
+    "labour_market": {
+     "reserve": 12
+    }
+   }
+  }
+ }
+}

@@ -1,0 +1,31 @@
+{
+ "_note": "Brains on long 07 (24 drivers, fixed fleet, new lone-bidder payment): no_brain, signal (v2, deficits), expected (v4, expected net euros, margin 0.30 EUR) and expected_m1 (margin 1.0 EUR). The first arm (signal) is the baseline of the paired differences. Watch brain_moves, km_move, profit_per_trip, driver_income_hour_median, wait_mean/p90. 12 runs ~6 h; run with --seeds 1,2 for ~4 h.",
+ "speed": 15,
+ "seeds": [
+  1,
+  2,
+  3
+ ],
+ "repeats": 1,
+ "arms": {
+  "signal": {
+   "scenario": "config/scenarios/long_brains_07_migrating_demand.json"
+  },
+  "no_brain": {
+   "scenario": "config/scenarios/long_07_migrating_demand.json"
+  },
+  "expected": {
+   "scenario": "config/scenarios/long_brains_07_migrating_demand.json",
+   "set": {
+    "drivers.brain_policy": "expected"
+   }
+  },
+  "expected_m1": {
+   "scenario": "config/scenarios/long_brains_07_migrating_demand.json",
+   "set": {
+    "drivers.brain_policy": "expected",
+    "drivers.brain_margin_eur": 1.0
+   }
+  }
+ }
+}

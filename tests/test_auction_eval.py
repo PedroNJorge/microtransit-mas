@@ -14,9 +14,11 @@ from common.auction import (
 )
 from common.ontology import CFP, Bid
 
+# the proofs (IR, dominant strategy) are about the reserve-paying lone-bidder rule: lone_margin=None. With a margin the payment of
+# a LONE valid bidder depends on its own bid, so truthfulness needs two valid bids (tested below).
 RULES = AuctionRules(pricing=SECOND_SCORE, value_of_time=0.004, value_of_detour=0.004,
-                     value_of_reputation=0.25)
-EXACT = AuctionRules(pricing=SECOND_SCORE, quantize=False)
+                     value_of_reputation=0.25, lone_margin=None)
+EXACT = AuctionRules(pricing=SECOND_SCORE, quantize=False, lone_margin=None)
 
 
 def cfp(**kw):
@@ -171,6 +173,28 @@ def test_single_bidder_is_paid_the_reserve_under_second_score_and_its_bid_under_
     only = [bid("a", 6.0)]
     assert evaluate_bids(cfp(max_total_fare=14.0), only, RULES).price == 14.0
     assert evaluate_bids(cfp(max_total_fare=14.0), only, AuctionRules(pricing=FIRST_PRICE)).price == 6.0
+
+
+def test_lone_bidder_is_paid_its_bid_plus_the_margin_capped_at_the_reserve_by_default():
+    default = AuctionRules(pricing=SECOND_SCORE, value_of_time=0.004, value_of_detour=0.004, value_of_reputation=0.25)
+    assert default.lone_margin == 0.10
+    assert evaluate_bids(cfp(max_total_fare=14.0), [bid("a", 6.0)], default).price == 6.6
+    assert evaluate_bids(cfp(max_total_fare=14.0), [bid("a", 13.5)], default).price == 14.0       # capped at the reserve
+    zero = AuctionRules(pricing=SECOND_SCORE, lone_margin=0.0)
+    assert evaluate_bids(cfp(max_total_fare=14.0), [bid("a", 6.0)], zero).price == 6.0
+    with pytest.raises(ValueError):
+        AuctionRules(lone_margin=-0.1)
+
+
+def test_with_two_valid_bids_the_margin_changes_nothing_and_truthful_bidding_still_wins():
+    default = AuctionRules(pricing=SECOND_SCORE, quantize=False)                  # default margin
+    old = AuctionRules(pricing=SECOND_SCORE, quantize=False, lone_margin=None)
+    two = [bid("a", 5.0), bid("b", 8.0)]
+    assert evaluate_bids(cfp(), two, default).price == evaluate_bids(cfp(), two, old).price
+    # a rival whose bid is over the reserve is invalid: the other is then lone and is paid bid x 1.1, not the reserve
+    one_valid = [bid("a", 5.0), bid("b", 25.0)]
+    assert evaluate_bids(cfp(max_total_fare=20.0), one_valid, default).price == pytest.approx(5.5)
+    assert evaluate_bids(cfp(max_total_fare=20.0), one_valid, old).price == 20.0
 
 
 def test_payment_never_exceeds_the_reserve():

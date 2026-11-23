@@ -1,0 +1,34 @@
+{
+  "_note": "The 8-hub scenario, 6 cycles (about 6 sim hours). no_brain = the same drivers without brains.",
+  "speed": 15,
+  "seeds": [
+    1,
+    2,
+    3
+  ],
+  "repeats": 1,
+  "arms": {
+    "no_brain": {
+      "scenario": "config/scenarios/long_brains_full_8hubs.json",
+      "set": {
+        "drivers.brains": false
+      }
+    },
+    "no_brain_tv0": {
+      "scenario": "config/scenarios/long_brains_full_8hubs.json",
+      "set": {
+        "drivers.brains": false,
+        "drivers.time_value_per_hour": 0
+      }
+    },
+    "signal": {
+      "scenario": "config/scenarios/long_brains_full_8hubs.json"
+    },
+    "signal_tv0": {
+      "scenario": "config/scenarios/long_brains_full_8hubs.json",
+      "set": {
+        "drivers.time_value_per_hour": 0
+      }
+    }
+  }
+}

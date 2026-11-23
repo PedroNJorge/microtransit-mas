@@ -1,0 +1,58 @@
+{
+ "arms": [
+  {
+   "name": "no_rule",
+   "scenario": "config/scenarios/long_07_migrating_demand.json",
+   "set": {
+    "labour_market": {
+     "reserve": 12,
+     "exit_ratio": 1.0,
+     "entry_ratio": 1.1
+    }
+   }
+  },
+  {
+   "name": "s_05h",
+   "scenario": "config/scenarios/long_07_migrating_demand.json",
+   "set": {
+    "labour_market": {
+     "reserve": 12,
+     "exit_ratio": 1.0,
+     "entry_ratio": 1.1
+    },
+    "drivers.surplus_scale_hours": 0.5
+   }
+  },
+  {
+   "name": "s_1h",
+   "scenario": "config/scenarios/long_07_migrating_demand.json",
+   "set": {
+    "labour_market": {
+     "reserve": 12,
+     "exit_ratio": 1.0,
+     "entry_ratio": 1.1
+    },
+    "drivers.surplus_scale_hours": 1
+   }
+  },
+  {
+   "name": "s_2h",
+   "scenario": "config/scenarios/long_07_migrating_demand.json",
+   "set": {
+    "labour_market": {
+     "reserve": 12,
+     "exit_ratio": 1.0,
+     "entry_ratio": 1.1
+    },
+    "drivers.surplus_scale_hours": 2
+   }
+  }
+ ],
+ "seeds": [
+  1,
+  2
+ ],
+ "repeats": 1,
+ "speed": 15.0,
+ "timeout": 0.0
+}

@@ -49,7 +49,7 @@ from common.messages import (
     make_request,
 )
 from common.ontology import (
-    AuctionOutcome, Bid, CFP, DemandSignal, FailureReason, MatchResult, Perf, Pool, Protocol, TripFailed,
+    AuctionOutcome, Bid, CFP, DemandSignal, DriverState, FailureReason, MatchResult, Perf, Pool, Protocol, TripFailed,
 )
 from protocols.payment_common import bare, expect
 
@@ -193,14 +193,49 @@ class _CfpSent(_AuctionState):
 class _Collecting(_AuctionState):
     name = COLLECTING_BIDS
 
+    def _holding(self, started: float) -> bool:
+        """Late invitations (hub.late_invite): while fewer than `late_min_bids` bids are in, the window stays open for
+        `late_hold` seconds after the CFP even if every driver called has answered, so that a driver who becomes idle in
+        the meantime can still be called. With enough bids the auction closes as soon as everyone has answered."""
+        ctx, hub = self.ctx, self.agent
+        return (hub.late_invite and len(ctx.bids) < hub.late_min_bids
+                and clock.now() < min(started + hub.late_hold, ctx.cfp.auction_deadline))
+
+    async def _invite_late(self) -> None:
+        """Call every driver whose (fresh) status says IDLE now and who was not called before."""
+        ctx, hub = self.ctx, self.agent
+        now = clock.now()
+        for jid in hub.driver_jids:
+            if jid in ctx.recipients or jid in ctx.excluded:
+                continue
+            entry = hub.registry.get(jid)
+            if not entry or now - entry[1] > 3 * hub.t_status or entry[0].state != DriverState.IDLE:
+                continue
+            if hub.max_pickup_eta is not None:
+                eta = hub.hub_eta(jid, hub.hub_id, now)
+                if eta is not None and eta > hub.max_pickup_eta + ctx.attempt * 300.0:
+                    continue
+            ctx.recipients.append(jid)
+            await self.send(make_cfp(jid, ctx.cfp))
+            note(ctx, COLLECTING_BIDS, "late cfp: driver became idle", driver=jid)
+
     async def step(self):
         ctx, hub = self.ctx, self.agent
-        while len(ctx.responded) < len(ctx.recipients):
+        started = clock.now()
+        poll = max(clock.to_real(hub.t_late_poll), 0.001)
+        while True:
             remaining = ctx.cfp.auction_deadline - clock.now()
             if remaining <= 0:
                 break
-            msg = await self.receive(timeout=max(clock.to_real(remaining), 0.001))
+            if len(ctx.responded) >= len(ctx.recipients) and not self._holding(started):
+                break
+            wait = clock.to_real(remaining)
+            msg = await self.receive(timeout=max(min(wait, poll) if hub.late_invite else wait, 0.001))
+            if hub.late_invite:
+                await self._invite_late()
             if msg is None:
+                if hub.late_invite:
+                    continue                      # only a poll tick: the loop checks the deadline itself
                 break
             sender, perf = bare(msg.sender), msg.get_metadata("performative")
             if sender not in ctx.recipients:

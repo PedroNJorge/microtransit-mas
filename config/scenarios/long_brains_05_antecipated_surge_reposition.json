@@ -1,0 +1,191 @@
+{
+  "name": "long-05-anticipated-surge-reposition-brains",
+  "xmpp": {
+    "host": "localhost",
+    "port": 5222,
+    "server_port": 5269,
+    "password": "dev-password"
+  },
+  "clock": {
+    "speed": 60
+  },
+  "graph": "config/porto_graph.json",
+  "hubs": "all",
+  "duration": 26700.0,
+  "drivers": {
+    "placement": [
+      {
+        "hubs": {
+          "centre": 2
+        },
+        "count": 24
+      }
+    ],
+    "brains": true
+  },
+  "riders": {
+    "count": 48
+  },
+  "demand": [
+    {
+      "id": "surge_c1",
+      "hubs": {
+        "periphery": 1
+      },
+      "start": 900.0,
+      "end": 1500.0,
+      "count": 48,
+      "pattern": "random",
+      "max_fare": 25,
+      "pooling": 1.0
+    },
+    {
+      "id": "surge_c2",
+      "hubs": {
+        "periphery": 1
+      },
+      "start": 4500.0,
+      "end": 5100.0,
+      "count": 48,
+      "pattern": "random",
+      "max_fare": 25,
+      "pooling": 1.0
+    },
+    {
+      "id": "surge_c3",
+      "hubs": {
+        "periphery": 1
+      },
+      "start": 8100.0,
+      "end": 8700.0,
+      "count": 48,
+      "pattern": "random",
+      "max_fare": 25,
+      "pooling": 1.0
+    },
+    {
+      "id": "surge_c4",
+      "hubs": {
+        "periphery": 1
+      },
+      "start": 11700.0,
+      "end": 12300.0,
+      "count": 48,
+      "pattern": "random",
+      "max_fare": 25,
+      "pooling": 1.0
+    },
+    {
+      "id": "surge_c5",
+      "hubs": {
+        "periphery": 1
+      },
+      "start": 15300.0,
+      "end": 15900.0,
+      "count": 48,
+      "pattern": "random",
+      "max_fare": 25,
+      "pooling": 1.0
+    },
+    {
+      "id": "surge_c6",
+      "hubs": {
+        "periphery": 1
+      },
+      "start": 18900.0,
+      "end": 19500.0,
+      "count": 48,
+      "pattern": "random",
+      "max_fare": 25,
+      "pooling": 1.0
+    }
+  ],
+  "forecasts": [
+    {
+      "at": 240.0,
+      "hub": {
+        "periphery": 1
+      },
+      "expected": 48,
+      "horizon": 1500,
+      "to": {
+        "periphery": 1
+      }
+    },
+    {
+      "at": 3840.0,
+      "hub": {
+        "periphery": 1
+      },
+      "expected": 48,
+      "horizon": 1500,
+      "to": {
+        "periphery": 1
+      }
+    },
+    {
+      "at": 7440.0,
+      "hub": {
+        "periphery": 1
+      },
+      "expected": 48,
+      "horizon": 1500,
+      "to": {
+        "periphery": 1
+      }
+    },
+    {
+      "at": 11040.0,
+      "hub": {
+        "periphery": 1
+      },
+      "expected": 48,
+      "horizon": 1500,
+      "to": {
+        "periphery": 1
+      }
+    },
+    {
+      "at": 14640.0,
+      "hub": {
+        "periphery": 1
+      },
+      "expected": 48,
+      "horizon": 1500,
+      "to": {
+        "periphery": 1
+      }
+    },
+    {
+      "at": 18240.0,
+      "hub": {
+        "periphery": 1
+      },
+      "expected": 48,
+      "horizon": 1500,
+      "to": {
+        "periphery": 1
+      }
+    }
+  ],
+  "reposition": {
+    "demand_threshold": 3,
+    "requests_per_driver": 4,
+    "max_travel": 900,
+    "cooldown": 120,
+    "max_moves": 3,
+    "t_rebalance": 60,
+    "t_reposition": 30
+  },
+  "environment": {
+    "t_traffic": 60,
+    "full_every": 10
+  },
+  "seed": 42,
+  "payment": {
+    "rider_balance": 100.0,
+    "subsidy_discount": 0.5,
+    "subsidy_budget": null,
+    "hold_max": 7200
+  }
+}

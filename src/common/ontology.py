@@ -427,12 +427,18 @@ class BrainPercept:
     pressures: List[float]              # requests per available driver observed around each hub
     sent_at: float = 0.0
     deficits: List[float] = field(default_factory=list)   # per hub: drivers it is short of (empty = no hub-load signal heard)
+    demands: List[float] = field(default_factory=list)    # per hub: arrivals over the horizon + waiting requests its free drivers cannot cover (empty = no signal)
+    supplies: List[float] = field(default_factory=list)   # per hub: free drivers counted for its cell
+    dists_m: List[float] = field(default_factory=list)    # per hub: route metres from `location` (-1 = unknown)
+    win_value: float = 0.0                                # EUR the driver expects to net per won trip (0 = not sent)
 
     def __post_init__(self):
         if not (len(self.hub_ids) == len(self.etas) == len(self.pressures)):
             raise ValueError("hub_ids, etas and pressures must have the same length")
-        if self.deficits and len(self.deficits) != len(self.hub_ids):
-            raise ValueError("deficits must be empty or have one entry per hub")
+        for name in ("deficits", "demands", "supplies", "dists_m"):
+            v = getattr(self, name)
+            if v and len(v) != len(self.hub_ids):
+                raise ValueError(f"{name} must be empty or have one entry per hub")
 
 
 @concept

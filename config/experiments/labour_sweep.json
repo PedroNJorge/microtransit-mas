@@ -1,0 +1,48 @@
+{
+ "_note": "Exit/entry step 2 on long 07 (compare with the market arm of labour_long.json, same seeds). exit_085 / exit_100: exit line at 0.85 / 1.0 x wage (default 0.65). small_start: 12 drivers + 12 reserve with the default rules, to see whether the ENTRY rule ever fires. About 3 real hours.",
+ "speed": 15,
+ "seeds": [
+  1,
+  2,
+  3
+ ],
+ "repeats": 1,
+ "arms": {
+  "exit_085": {
+   "scenario": "config/scenarios/long_07_migrating_demand.json",
+   "set": {
+    "labour_market": {
+     "reserve": 12,
+     "exit_ratio": 0.85
+    }
+   }
+  },
+  "exit_100": {
+   "scenario": "config/scenarios/long_07_migrating_demand.json",
+   "set": {
+    "labour_market": {
+     "reserve": 12,
+     "exit_ratio": 1.0,
+     "entry_ratio": 1.1
+    }
+   }
+  },
+  "small_start": {
+   "scenario": "config/scenarios/long_07_migrating_demand.json",
+   "set": {
+    "drivers.placement": [
+     {
+      "hubs": [
+       "hub_senhora_da_hora",
+       "hub_casa_da_musica"
+      ],
+      "count": 12
+     }
+    ],
+    "labour_market": {
+     "reserve": 12
+    }
+   }
+  }
+ }
+}
