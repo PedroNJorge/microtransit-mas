@@ -1,7 +1,0 @@
-t,event,driver,fleet_after
-5400.0,exit,driver_04,22
-5400.0,exit,driver_07,22
-7200.0,exit,driver_21,20
-7200.0,exit,driver_24,20
-10800.0,exit,driver_23,19
-12600.0,exit,driver_03,18
