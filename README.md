@@ -74,6 +74,11 @@ docker run --rm -p 8765:8765 microtransit-mas --scenario config/scenarios/07_mig
 
 Then open `porto_graph_map.html` in your browser on the host: it connects to the simulation on `ws://127.0.0.1:8765`.
 The image installs only the core dependencies (no test or map tools).
+The demo with the extra map overlays also runs in the image (`-it` lets Ctrl-C stop it):
+
+```bash
+docker run --rm -it -p 8765:8765 --entrypoint python microtransit-mas viz_demo.py config/scenarios/06_hub_failure.json
+```
 Anything after the image name goes to the launcher (`--check`, `--run-for 60`, ...). Results of experiments, which are
 sensitive to load, are best produced natively (see below), not in a container.
 
