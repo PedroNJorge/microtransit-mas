@@ -164,3 +164,111 @@ microtransit_mas/
 |`execute_trip` (Driver)|`TripExecutionFSM`|`FSMBehaviour`|
 |`update_traffic` (Env)|`TrafficUpdateBehaviour`|`PeriodicBehaviour` (every `T_traffic`)|
 |`publish_policy` (Reg)|`PolicyBehaviour`|`OneShotBehaviour` (on startup)|
+
+---
+
+## 6. Implementation Notes and Deviations (final system, November 2026)
+
+Sections 1 to 5 are the **design** as it was planned. This section records where the implementation differs from it or goes
+beyond it, so the two can be read together. The per-mechanism details are in `docs/`.
+
+### 6.1. Discovery: no Directory Facilitator
+
+SPADE 4 has no Directory Facilitator, so section 2 was not implemented as written.
+
+- **Scenario-driven addresses.** The scenario file fixes the JID of every fixed agent (hubs, payment, regulator, reputation,
+  environment). Agents do not search for each other. The launcher derives who needs whom from that roster.
+- **Drivers announce themselves.** A driver sends a `DriverStatus` message to the hubs at every state change (idle, cruising,
+  busy, offline, with position and ETAs). This is how a hub knows which drivers it can call, including for late invitations.
+- **`agents/registry.py` is not a yellow-page service.** It only maps a role name to its agent class, for the launcher.
+- **Liveness.** `HeartbeatProtocol` (ping, pong) lets the launcher check that every agent is up and is the right kind of agent.
+
+### 6.2. The driver is two agents
+
+The BDI driver of section 4 is split in two:
+
+- `DriverAgent` (reactive): bids, holds the lock, drives, and reports. It observes every call and demand signal.
+- `DriverBrain` (SPADE-BDI, AgentSpeak programs in `agents/brains/`): receives a `BrainPercept` and answers with a
+  `CruiseCommand`. Its intention is `cruising_to(hub)`. Four policies exist: pressure, signal, proportional, expected-wins.
+
+Hubs do **not** tell BDI drivers where to go. They publish `HubLoad` (every 60 s, to all drivers) and `DemandSignal` (to
+drivers that were not called for a waiting request), and each driver decides whether moving pays. A cruising driver stays
+available and refuses to cruise while it holds a lock. The hub-driven `RepositionProtocol` (request with an incentive,
+agree or refuse) still exists but is opt-in.
+
+### 6.3. The driver lock
+
+Each driver holds **one** provisional lock at a time (`common/lock.py`, rules CC-01 to CC-09): `PROVISIONAL` (a bid in
+flight, expires after `T_PROVISIONAL`) then `FIRM` (after `accept-proposal`). A call that arrives while the lock is held is
+answered `refuse (locked)`. A driver therefore cannot win two auctions at once. Bidding on several pools at once is out of
+scope.
+
+### 6.4. Auction
+
+- Reverse auction (FIPA Contract Net) with second-score pricing: the winner is paid
+  `min(reserve, own bid + gap to the second score)`. Truthful bidding on price is dominant **with two or more valid bids**.
+- **Lone bidder.** With one valid bid there is no runner-up. The first version paid the reserve, which over-paid. The final
+  rule pays `bid x (1 + lone_margin)`, capped at the reserve (`lone_margin = 0.10`). Incentive compatibility does not hold
+  in that case. `single_bid_share` is reported to show how often it happens.
+- **Late invitations.** If fewer than two bids are in, the auction stays open for `late_hold` (15 s) and, every
+  `t_late_poll` (2 s), the hub sends the same call to drivers that have become idle and are within range.
+- The reserve is `n x min(max_fare)` of the riders in the pool, lowered by the tariff reserve and the regulator cap.
+
+### 6.5. Driver pricing
+
+A driver's bid is its km cost (0.15 EUR/km) plus a time price. The default time price is the wage target (4.96 EUR/h). An
+optional **rolling-surplus bid rule** lowers the time price when the driver's recent surplus is below a reference. It is a
+behavioural assumption about drivers, not an optimisation, and is off by default.
+
+### 6.6. Labour market (not in the design)
+
+An optional process in `harness/labour_market.py` runs every 1800 simulated seconds. It is part of the **harness, not an
+agent**: drivers do not negotiate entry or exit.
+
+- **Exit:** an idle driver with no lock leaves if its rolling net income stays below `exit_ratio x wage` for
+  `consecutive` checks (with probability `p_exit`), and never below `min_fleet`.
+- **Entry:** a reserve (offline) driver enters at the hub with the largest supply deficit when the mean net income is above
+  `entry_ratio x wage`, or when riders have been waiting too long (`entry_wait`).
+- The fleet size therefore emerges from income and waiting times.
+
+### 6.7. Payment and subsidies
+
+- Escrow, settlement and refund follow the design. The driver is paid exactly the auction price.
+- **Subsidy.** An eligible rider is rebated `subsidy_discount x fare` (0.5 in the scenarios) from a subsidy fund, **on top
+  of** the driver's fare. It never reduces driver pay. Eligibility is a per-request probability in the demand settings (default 0).
+- An optional pooling incentive pays riders of a shared trip per kg of CO2 saved (default off).
+- The subsidy is a rider-side measure and does not raise driver income.
+
+### 6.8. Reputation and rating
+
+- A rider rates 1 to 5 after drop-off. The default rule is 5, minus one for a pickup more than 120 s late, minus one for
+  boarding after the end of the rider's time window.
+- A valid rating is stored at once but published only when payment confirms settlement, or after `T_settlement_max`
+  (flagged `pending_settlement`). The hub uses the published score, never the driver's claim, as a penalty term when ranking bids.
+
+### 6.9. Regulator
+
+The regulator audits each hub every `T_AUDIT` (3600 s) for fares above the cap in force and reports the service share per
+destination zone. Penalties: 10 EUR per fare above the cap and 50 EUR for not cooperating. `DRIVER_FLOOR` (1.0 EUR) is only
+a safety check: a fare cap below it is refused. It is **not** a minimum fare or an income guarantee for drivers.
+
+### 6.10. Actual project layout
+
+```text
+microtransit-mas/
+├── src/
+│   ├── agents/       # rider, driver, brain, microhub, payment, regulator, reputation, environment, base_agent, registry
+│   ├── protocols/    # match_auction, pool_formation, escrow, settlement, refund, reposition, inter_hub
+│   ├── common/       # ontology, settings, auction, lock, ledger, pooling, policy, graph, cells, clock, ws_server
+│   └── harness/      # launcher, scenario, runner, experiment, labour_market, live_metrics
+├── config/           # scenarios, experiment plans, the Porto road graph
+├── tools/            # graph building, calibration, long-scenario generator
+└── docs/             # one document per mechanism
+```
+
+### 6.11. Known limits
+
+- Incentive compatibility fails with a single bidder (6.4).
+- A driver finishing a trip cannot bid for a job after the trip (not built).
+- The labour market, bid rule and brains were evaluated mainly on the migrating-demand scenario.
+- Results depend on the simulation speed (validated at 15); different code versions are not strictly comparable.
