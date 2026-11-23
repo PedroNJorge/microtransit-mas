@@ -1,0 +1,51 @@
+{
+ "arms": [
+  {
+   "name": "exit_085",
+   "scenario": "config/scenarios/long_07_migrating_demand.json",
+   "set": {
+    "labour_market": {
+     "reserve": 12,
+     "exit_ratio": 0.85
+    }
+   }
+  },
+  {
+   "name": "exit_100",
+   "scenario": "config/scenarios/long_07_migrating_demand.json",
+   "set": {
+    "labour_market": {
+     "reserve": 12,
+     "exit_ratio": 1.0,
+     "entry_ratio": 1.1
+    }
+   }
+  },
+  {
+   "name": "small_start",
+   "scenario": "config/scenarios/long_07_migrating_demand.json",
+   "set": {
+    "drivers.placement": [
+     {
+      "hubs": [
+       "hub_senhora_da_hora",
+       "hub_casa_da_musica"
+      ],
+      "count": 12
+     }
+    ],
+    "labour_market": {
+     "reserve": 12
+    }
+   }
+  }
+ ],
+ "seeds": [
+  1,
+  2,
+  3
+ ],
+ "repeats": 1,
+ "speed": 15.0,
+ "timeout": 0.0
+}

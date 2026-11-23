@@ -1,0 +1,45 @@
+{
+ "arms": [
+  {
+   "name": "speed_15",
+   "scenario": "config/scenarios/07_migrating_demand.json",
+   "set": {
+    "clock.speed": 15
+   }
+  },
+  {
+   "name": "speed_25",
+   "scenario": "config/scenarios/07_migrating_demand.json",
+   "set": {
+    "clock.speed": 25
+   }
+  },
+  {
+   "name": "speed_35",
+   "scenario": "config/scenarios/07_migrating_demand.json",
+   "set": {
+    "clock.speed": 35
+   }
+  },
+  {
+   "name": "speed_50",
+   "scenario": "config/scenarios/07_migrating_demand.json",
+   "set": {
+    "clock.speed": 50
+   }
+  },
+  {
+   "name": "speed_60",
+   "scenario": "config/scenarios/07_migrating_demand.json",
+   "set": {
+    "clock.speed": 60
+   }
+  }
+ ],
+ "seeds": [
+  1
+ ],
+ "repeats": 1,
+ "speed": 15.0,
+ "timeout": 0.0
+}

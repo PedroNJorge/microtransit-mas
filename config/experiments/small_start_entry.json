@@ -1,0 +1,53 @@
+{
+ "_note": "Entry on waiting riders (>= 3 riders waiting more than 600 s bring 2 reserve drivers on duty), small start of 12 drivers + 12 reserve, new lone-bidder payment. Compare with small_start_new of small_start_lone.json (income-only entry, same seeds). entry_wait_900 also checks every 15 sim min. About 3 real hours.",
+ "speed": 15,
+ "seeds": [
+  1,
+  2,
+  3
+ ],
+ "repeats": 1,
+ "arms": {
+  "entry_wait_1800": {
+   "scenario": "config/scenarios/long_07_migrating_demand.json",
+   "set": {
+    "drivers.placement": [
+     {
+      "hubs": [
+       "hub_senhora_da_hora",
+       "hub_casa_da_musica"
+      ],
+      "count": 12
+     }
+    ],
+    "labour_market": {
+     "reserve": 12,
+     "entry_wait": 600,
+     "entry_min_waiting": 3,
+     "max_enter": 2
+    }
+   }
+  },
+  "entry_wait_900": {
+   "scenario": "config/scenarios/long_07_migrating_demand.json",
+   "set": {
+    "drivers.placement": [
+     {
+      "hubs": [
+       "hub_senhora_da_hora",
+       "hub_casa_da_musica"
+      ],
+      "count": 12
+     }
+    ],
+    "labour_market": {
+     "reserve": 12,
+     "entry_wait": 600,
+     "entry_min_waiting": 3,
+     "max_enter": 2,
+     "check_every": 900
+    }
+   }
+  }
+ }
+}

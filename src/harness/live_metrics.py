@@ -81,6 +81,35 @@ def percentile(xs, p: float) -> Optional[float]:
     return xs[min(len(xs) - 1, max(0, math.ceil(p * len(xs)) - 1))]
 
 
+def driver_income_stats(recs: List[dict], wage: float, per_km: float) -> Dict[str, float]:
+    """What the drivers earned, against the hourly wage they should reach. `recs`: one dict per driver with revenue (EUR),
+    metres driven (loaded, to pickups and empty), driving_s and hours on duty. Income = revenue - per_km x km: the time is
+    NOT charged here, because the wage is what the income should reach per hour on duty (idle hours included).
+    Gini and shares use incomes floored at 0 (a Gini needs non-negative values)."""
+    nan = math.nan
+    if not recs:
+        return {}
+    income = [r["revenue"] - per_km * r["metres"] / 1000.0 for r in recs]
+    rate = [i / r["hours"] if r["hours"] > 0 else nan for i, r in zip(income, recs)]
+    ok = [x for x in rate if not math.isnan(x)]
+    hours = sum(r["hours"] for r in recs)
+    g = gini([max(i, 0.0) for i in income])
+    return {
+        "driver_income_hour_mean": mean(ok) if ok else nan,
+        "driver_income_hour_median": percentile(ok, 0.5) if ok else nan,
+        "driver_income_hour_p10": percentile(ok, 0.1) if ok else nan,
+        "driver_income_hour_min": min(ok) if ok else nan,
+        "driver_income_hour_max": max(ok) if ok else nan,
+        "fleet_income_hour": sum(income) / hours if hours > 0 else nan,
+        "driver_wage_share": sum(1 for x in ok if x >= wage) / len(ok) if ok else nan,
+        "driver_income_gini": g if g is not None else nan,
+        "driver_revenue_total": sum(r["revenue"] for r in recs),
+        "driver_km_mean": mean(r["metres"] / 1000.0 for r in recs),
+        "driver_utilisation_mean": mean(r["driving_s"] / (r["hours"] * 3600.0) for r in recs if r["hours"] > 0) or nan,
+        "driver_trips_zero_share": sum(1 for r in recs if r.get("trips", 0) == 0) / len(recs),
+    }
+
+
 def _activity_state(d) -> str:
     return {"on_trip": "loaded", "to_pickup": "pickup", "cruising": "cruising",
             "repositioning": "repositioning"}.get(getattr(d, "activity", "idle"), "idle")
@@ -153,6 +182,24 @@ class MetricsCollector:
         """(time, metres, seconds) of every empty hop (cruising, repositioning, returning)."""
         return [x for d in self._by_role("driver") for x in getattr(d, "other_log", [])]
 
+    def driver_records(self, now: float) -> List[dict]:
+        """One record per driver: revenue, metres and seconds driven (loaded, to pickups, empty), hours on duty so far."""
+        recs = []
+        for d in self._by_role("driver"):
+            start = getattr(d, "online_from", 0.0)
+            if start is None:                                  # a reserve driver that never entered
+                continue
+            end = getattr(d, "online_until", None)
+            loaded = list(d.trip_log.values())
+            other = list(getattr(d, "other_log", []))
+            recs.append(dict(
+                driver=str(d.jid.bare), revenue=sum(s.driver_payout for s in d.payouts), trips=len(d.completed),
+                metres=sum(x["pickup_m"] + x["loaded_m"] for x in loaded) + sum(m for _, m, _ in other),
+                driving_s=sum(x["pickup_s"] + x["loaded_s"] for x in loaded) + sum(sec for _, _, sec in other),
+                hours=max(min(getattr(d, "shift_end", math.inf), now if end is None else end) - start, 0.0) / 3600.0,
+                calls=getattr(d, "n_calls", 0), bids=getattr(d, "n_bids", 0), wins=getattr(d, "n_wins", 0)))
+        return recs
+
     def payout_records(self) -> List[tuple]:
         return [(t, str(d.jid.bare), s.driver_payout) for d in self._by_role("driver")
                 for s, t in zip(d.payouts, d.payout_times)]
@@ -198,10 +245,11 @@ class MetricsCollector:
         cost += sum(driver_cost(m / 1000.0, s) for t, m, s in empty if lo < t <= now)        # empty driving is a cost too
         out["revenue_per_trip"] = revenue / len(P) if P else None
         out["profit_per_trip"] = (revenue - cost) / len(P) if P else None
-        n_drivers = max(1, len(self._by_role("driver")))
+        started = [x for x in self._by_role("driver") if getattr(x, "online_from", 0.0) is not None]   # reserve drivers that entered
+        n_drivers = max(1, len(started))
         span = now - max(lo, 0.0)
         out["earnings_per_hour"] = revenue / n_drivers / (span / 3600.0) if span > 0 else None
-        by_driver = {str(x.jid.bare): 0.0 for x in self._by_role("driver")}
+        by_driver = {str(x.jid.bare): 0.0 for x in started}
         for _, d, amount in Y:
             by_driver[d] = by_driver.get(d, 0.0) + amount
         out["gini"] = gini(list(by_driver.values()))
@@ -218,7 +266,7 @@ class MetricsCollector:
 
     def snapshot(self, now: Optional[float] = None) -> dict:
         now = clock.now() if now is None else now
-        drivers = self._by_role("driver")
+        drivers = [x for x in self._by_role("driver") if getattr(x, "online_from", 0.0) is not None]
         dt = 0.0 if self._last_t is None else max(0.0, now - self._last_t)
         util = {s: 0.0 for s in STATES}
         for d in drivers:

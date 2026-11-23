@@ -1,0 +1,12 @@
+t,event,driver,fleet_after
+2700.0,enter,driver_13,13
+2700.0,enter,driver_14,14
+3600.0,enter,driver_15,15
+3600.0,enter,driver_16,16
+4500.0,enter,driver_17,17
+4500.0,enter,driver_18,18
+7200.0,exit,driver_14,17
+8100.0,enter,driver_19,18
+9000.0,enter,driver_20,19
+21600.0,exit,driver_05,17
+21600.0,exit,driver_06,17

@@ -26,6 +26,8 @@ from spade_bdi.bdi import BDIAgent
 
 from agents.base_agent import PingBehaviour
 from common.messages import make_message, make_template
+from agents.expected_wins import move_gains
+from common.settings import DRIVER_COST_PER_KM
 from common.ontology import BidPolicy, BrainPercept, CruiseCommand, Perf, Protocol, parse_payload
 from protocols.payment_common import bare
 
@@ -34,7 +36,8 @@ logger = logging.getLogger(__name__)
 DEFAULT_ASL = str(Path(__file__).parent / "brains" / "driver.asl")              # v1: from the calls for proposals it heard
 SIGNAL_ASL = str(Path(__file__).parent / "brains" / "driver_signal.asl")        # v2: from the hubs' published load
 PROPORTIONAL_ASL = str(Path(__file__).parent / "brains" / "driver_proportional.asl")   # v3: v2 + move with probability needed/spare
-POLICIES = {"pressure": DEFAULT_ASL, "signal": SIGNAL_ASL, "proportional": PROPORTIONAL_ASL}
+EXPECTED_ASL = str(Path(__file__).parent / "brains" / "driver_expected.asl")        # v4: expected net euros of waiting elsewhere
+POLICIES = {"pressure": DEFAULT_ASL, "signal": SIGNAL_ASL, "proportional": PROPORTIONAL_ASL, "expected": EXPECTED_ASL}
 PERCEPT_TAG = frozenset([asp.Literal("source", (asp.Literal("percept"),))])
 
 
@@ -69,10 +72,11 @@ class DriverBrain(BDIAgent):
 
     def __init__(self, jid: str, password: str, driver_jid: str, asl: Optional[str] = None,
                  cooldown: Optional[float] = None, bid_policy: bool = False, drive_cost: float = 0.0015,
-                 policy: str = "pressure", seed: Optional[int] = None, **kwargs):
+                 policy: str = "pressure", seed: Optional[int] = None, margin_eur: float = 0.30, **kwargs):
         if policy not in POLICIES:
             raise ValueError(f"policy must be one of {sorted(POLICIES)}")
         self.policy = policy
+        self.margin_eur = float(margin_eur)          # policy "expected": a move must beat staying by this many euros
         asl = asl or POLICIES[policy]
         self.drive_cost = float(drive_cost)           # pressure units given up per second of driving (belief drive_cost)
         self.bid_policy = bid_policy                  # also own the driver's bid markup (opportunity cost)
@@ -176,3 +180,14 @@ class DriverBrain(BDIAgent):
             self.draws.append((p.sent_at, u))
             self._set({("draw", ""): (u,)}, "draw")
         self._set({("deficit", h): (h, d) for h, d in zip(p.hub_ids, p.deficits)}, "deficit")
+        if self.policy == "expected":
+            etas = {h: e for h, e in zip(p.hub_ids, p.etas) if e >= 0}
+            own = min(etas, key=etas.get) if etas else ""
+            gains = move_gains(p.hub_ids, own, p.demands, p.supplies, p.dists_m, p.win_value or 0.0,
+                               DRIVER_COST_PER_KM, self.margin_eur)
+            self._set({("gain", h): (h, round(g, 3)) for h, g in gains.items()}, "gain")
+            # identical drivers of a cell see the same gains: each moves with probability 1 / (free drivers here), so on average
+            # one leaves per published load and the next load (with the cruiser counted at its target) shows whether more should
+            i = p.hub_ids.index(own) if own in p.hub_ids else -1
+            chance = 1.0 / max(p.supplies[i], 1.0) if (i >= 0 and p.supplies) else 1.0
+            self._set({("move_chance", ""): (round(chance, 3),)}, "move_chance")

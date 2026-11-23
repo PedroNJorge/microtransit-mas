@@ -52,7 +52,7 @@ from common.costs import driver_cost, dwell_seconds, rate_per_second
 from common.pooling import late_join_terms, GroupPlan, fare_ceiling, footprint, reference_solo_fare, split_fare_weighted
 from common.settings import (
     DETOUR_WEIGHT, DRIVER_BASE_COST, DRIVER_COST_PER_KM, DRIVER_COST_PER_SECOND, MAX_BATCH, MAX_POOL_SIZE, PICKUP_ALLOWANCE,
-    EMISSION_G_PER_KM, NOMINAL_SPEED_KMH, HUB_NEIGHBOURS, LATE_JOIN_MARKUP, T_LATE_REPLY, OVERFLOW_AFTER, POOL_SOLVER, T_FAILOVER, T_HEARTBEAT, T_OVERFLOW_REPLY, T_POOL,
+    EMISSION_G_PER_KM, NOMINAL_SPEED_KMH, HUB_NEIGHBOURS, LATE_HOLD, LATE_JOIN_MARKUP, LATE_MIN_BIDS, T_LATE_POLL, T_LATE_REPLY, OVERFLOW_AFTER, POOL_SOLVER, T_FAILOVER, T_HEARTBEAT, T_OVERFLOW_REPLY, T_POOL,
 )
 from protocols.match_auction import AuctionContext, MATCHED, MatchAuctionFSM, RETRY
 from protocols.pool_formation import BatchWindow, QueuedRequest, handle_decline, window_closes_at
@@ -655,7 +655,8 @@ class MicrohubAgent(BaseAgent):
                  k_neighbours: int = HUB_NEIGHBOURS, t_overflow_reply: float = T_OVERFLOW_REPLY,
                  emission_g_per_km: float = EMISSION_G_PER_KM, pool_incentive_per_kg: float = 0.0,
                  late_join: bool = False, late_join_markup: float = LATE_JOIN_MARKUP, t_late_reply: float = T_LATE_REPLY,
-                 **kwargs):
+                 late_invite: bool = True, late_hold: float = LATE_HOLD, late_min_bids: int = LATE_MIN_BIDS,
+                 t_late_poll: float = T_LATE_POLL, **kwargs):
         super().__init__(jid, password, **kwargs)
         self.hub_id = hub_id                  # node id in the road network (== MicrohubNode.id)
         self.driver_jids: List[str] = [bare(j) for j in (driver_jids or [])]
@@ -723,6 +724,7 @@ class MicrohubAgent(BaseAgent):
         self.late_join = late_join                       # offer riders a seat in pools whose driver is still on the way
         self.late_join_markup = late_join_markup
         self.t_late_reply = t_late_reply
+        self.late_invite, self.late_hold, self.late_min_bids, self.t_late_poll = late_invite, late_hold, late_min_bids, t_late_poll
         self.late_waits: Dict[str, LateJoinWait] = {}    # late-join requests waiting for the driver's answer, by new pool id
         self.late_joined: List[str] = []                 # pool ids of riders that joined late (the report counts them)
         self.pool_metrics: List[PoolMetric] = []         # one per matched pool (footprint of sharing)

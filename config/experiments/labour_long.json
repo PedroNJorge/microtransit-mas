@@ -1,0 +1,32 @@
+{
+ "_note": "Exit/entry on long 07 (24 drivers + 12 reserve). fixed = the usual fixed fleet; market = drivers leave/enter (defaults: exit below 0.65 x wage twice in a row, p 0.15 per 30-min check, enter above 1.10 x wage); market_rule = market + the rolling-surplus bid rule (S* = 1 h of wage). Watch fleet_end/fleet_mean, turnover_per_hour, single_bid_share, wait_mean/p90, driver_income_hour_median. About 4.5 real hours.",
+ "speed": 15,
+ "seeds": [
+  1,
+  2,
+  3
+ ],
+ "repeats": 1,
+ "arms": {
+  "fixed": {
+   "scenario": "config/scenarios/long_07_migrating_demand.json"
+  },
+  "market": {
+   "scenario": "config/scenarios/long_07_migrating_demand.json",
+   "set": {
+    "labour_market": {
+     "reserve": 12
+    }
+   }
+  },
+  "market_rule": {
+   "scenario": "config/scenarios/long_07_migrating_demand.json",
+   "set": {
+    "labour_market": {
+     "reserve": 12
+    },
+    "drivers.surplus_scale_hours": 1
+   }
+  }
+ }
+}

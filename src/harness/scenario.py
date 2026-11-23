@@ -23,8 +23,14 @@ Schema (all sections but "graph" and "hubs" are optional):
   # optional driver intelligence (all off by default):
   #   "brains": true          every driver gets a BDI brain agent (brain_01, ...) that picks where it waits
   #   "brain_bids": true      the brain also sets the driver's bid markup (needs "brains")
-  #   "brain_policy": "signal" | "proportional" | "pressure"   what the brain decides from: the hubs' published load (all
+  #   "brain_policy": "signal" | "proportional" | "pressure" | "expected"   what the brain decides from: the hubs' published load (all
   #                    eligible drivers move, or each with probability needed/spare), or the calls it heard
+  # "lone_margin": 0.10        a lone valid bidder is paid its bid x (1 + this), at most the reserve; null = the full reserve (old rule)
+  #   "brain_margin_eur": 0.30   with brain_policy "expected": a move must beat staying by this many EUR (agents/expected_wins.py)
+  # "labour_market": {"reserve": 12, "exit_ratio": 0.65, ...}  drivers may leave and (from `reserve` offline ones) enter: harness/labour_market.py
+  #   "surplus_scale_hours": 1    turns on the rolling-surplus bid rule: a driver's price on its time falls from the wage (surplus <= 0) to 0
+  #                               (surplus >= S* = this many hours of wage) over the last 2 h; 0 = hard step at 0; default: off (agents/bid_rule.py)
+  #   "time_value_per_hour": 0   EUR/h a driver puts on its own time in a bid (default: the wage target 4.96); km cost always counts
   #   "brain_drive_cost": 0.0015   the brain's distance weight (pressure units per second of driving; larger = stays closer)
   #   "return_policy": "nearest_hub" | "start_hub" | "none"   fixed rule, no BDI (ignored when "brains")
   "riders":  {"count": 2},
@@ -53,6 +59,8 @@ demand streams are pooling-willing by default.
 "patient" (default true): nobody gives up. A hub whose auction gets no bids tries again (with a wider pickup radius)
 until a driver is free and a rider waits for as long as that takes. With false, a hub gives up after 4 attempts
 and the rider ends 'unmatched'.
+"late_invite" (default true): an auction with fewer than 2 bids holds its window open for 15 sim s after the call so that a
+driver who becomes idle meanwhile is called too (docs/auction_mechanism.md); false = the call goes only to drivers idle at the start.
 "late_join" (default true): a pooling-willing rider may join a pool already assigned to a driver who has not reached
 the hub yet (driver may refuse; see docs/late_join.md). payment.pool_incentive_per_kg / pooling_budget pay riders of shared
 trips from a pooling fund per kg of CO2 saved (default off).
@@ -95,7 +103,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
-from common.settings import DETOUR_RATIO, FULL_SNAPSHOT_EVERY, POOL_INCENTIVE_PER_KG, SUBSIDY_DISCOUNT, T_ESCROW_HOLD_MAX, T_POOL, T_TRAFFIC
+from common.settings import DETOUR_RATIO, DRIVER_WAGE_TARGET_PER_HOUR, FULL_SNAPSHOT_EVERY, LONE_BIDDER_MARGIN, POOL_INCENTIVE_PER_KG, SUBSIDY_DISCOUNT, T_ESCROW_HOLD_MAX, T_POOL, T_TRAFFIC
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]       # <root>/src/harness/scenario.py
 DEFAULT_SCENARIO = PROJECT_ROOT / "config" / "scenario.json"
@@ -188,12 +196,18 @@ class Scenario:
     detour_ratio: Optional[float] = DETOUR_RATIO   # riders' tolerance = min(cap, ratio x solo ride time); None = cap only
     patient: bool = True                       # hubs keep retrying and riders keep waiting until a driver is free
     late_join: bool = True                     # a rider may join a pool whose driver is still on the way to the hub
+    late_invite: bool = True                   # an auction with few bids stays open for drivers that become idle meanwhile
     legacy_market: bool = False                # True: hubs without the market fixes (reserve margin, pickup radius, retries)
     brains: bool = False                       # one BDI brain per driver (agents/brain.py)
     brain_bids: bool = False                   # the brain also owns the driver's bid markup
     brain_policy: str = "signal"               # "signal": decides from the hubs' published load; "pressure": from the calls it heard
     brain_drive_cost: float = 0.0015           # the brain's distance weight: pressure units given up per second of driving
     return_policy: str = "none"                # fixed baseline: none | start_hub | nearest_hub
+    brain_margin_eur: float = 0.30             # brain_policy "expected": a move must beat staying by this many EUR
+    surplus_scale_hours: Optional[float] = None   # rolling-surplus bid rule on (S* = hours x wage target); None = off
+    lone_margin: Optional[float] = LONE_BIDDER_MARGIN   # a lone valid bidder is paid bid x (1 + this), at most the reserve; null = the reserve
+    labour_market: Optional[dict] = None          # exit/entry rules (harness/labour_market.py); None = fixed fleet
+    time_value_per_hour: Optional[float] = None   # EUR/h the drivers put on their TIME in a bid (None = the wage target); km cost is separate
     source: Optional[Path] = None              # file it was loaded from (None: from_dict)
 
     # ---- addresses -------------------------------------------------------------------
@@ -215,17 +229,26 @@ class Scenario:
             if self.brains:
                 hub_kw["broadcast_demand"] = True          # the brains read demand from the hubs' calls
             specs.append(AgentSpec("microhub", hid, self.jid(hid), hub_kw))
-        width = max(2, len(str(max(self.n_drivers, 1))))
+        reserve = int(self.labour_market.get("reserve", 0)) if self.labour_market else 0     # offline drivers that can enter
+        total = self.n_drivers + reserve
+        width = max(2, len(str(max(total, 1))))
         if self.brains:                                    # brains first: their driver's percepts need a listener
-            for i in range(self.n_drivers):
+            for i in range(total):
                 specs.append(AgentSpec("driver_brain", f"brain_{i + 1:0{width}d}",
                                        self.jid(f"brain_{i + 1:0{width}d}"),
                                        {"driver_jid": self.jid(f"driver_{i + 1:0{width}d}"),
                                         "bid_policy": self.brain_bids, "drive_cost": self.brain_drive_cost,
-                                        "policy": self.brain_policy}))
-        for i in range(self.n_drivers):
+                                        "policy": self.brain_policy,
+                                        **({"margin_eur": self.brain_margin_eur} if self.brain_policy == "expected" else {})}))
+        for i in range(total):
             name = f"driver_{i + 1:0{width}d}"
             kw = {"start_hub": self.driver_start_hubs[i % len(self.driver_start_hubs)]}
+            if i >= self.n_drivers:
+                kw["start_offline"] = True
+            if self.time_value_per_hour is not None:
+                kw["cost_per_second"] = self.time_value_per_hour / 3600.0
+            if self.surplus_scale_hours is not None:
+                kw["surplus_scale"] = self.surplus_scale_hours * DRIVER_WAGE_TARGET_PER_HOUR
             if self.brains:
                 kw["brain_jid"] = self.jid(f"brain_{i + 1:0{width}d}")
             elif self.return_policy != "none":
@@ -264,7 +287,7 @@ class Scenario:
     def from_dict(cls, data: dict, default_name: str = "scenario") -> "Scenario":
         _only_keys(data, {"name", "xmpp", "clock", "graph", "hubs", "drivers", "riders",
                           "environment", "payment", "seed", "duration", "demand", "events",
-                          "forecasts", "reposition", "t_pool", "legacy_market", "late_join", "patient", "inter_hub", "detour_ratio"}, "scenario")
+                          "forecasts", "reposition", "t_pool", "legacy_market", "late_join", "late_invite", "patient", "inter_hub", "detour_ratio", "labour_market", "lone_margin"}, "scenario")
         for required in ("graph", "hubs"):
             if required not in data:
                 raise ScenarioError(f"scenario: missing required key {required!r}")
@@ -302,7 +325,7 @@ class Scenario:
 
         sel = _Selector(hub_ids, graph)
         d = dict(data.get("drivers", {}))
-        _only_keys(d, {"count", "start_hubs", "placement", "brains", "brain_bids", "brain_drive_cost", "brain_policy", "return_policy"}, "drivers")
+        _only_keys(d, {"count", "start_hubs", "placement", "brains", "brain_bids", "brain_drive_cost", "brain_policy", "return_policy", "time_value_per_hour", "surplus_scale_hours", "brain_margin_eur"}, "drivers")
         if "placement" in d:
             if "start_hubs" in d:
                 raise ScenarioError("drivers: use either start_hubs or placement, not both")
@@ -327,11 +350,20 @@ class Scenario:
         brains, brain_bids = d.get("brains", False), d.get("brain_bids", False)
         return_policy = d.get("return_policy", "none")
         brain_policy = d.get("brain_policy", "signal")
-        if brain_policy not in ("signal", "proportional", "pressure"):
-            raise ScenarioError("drivers.brain_policy must be signal, proportional or pressure")
+        if brain_policy not in ("signal", "proportional", "pressure", "expected"):
+            raise ScenarioError("drivers.brain_policy must be signal, proportional, pressure or expected")
         drive_cost = d.get("brain_drive_cost", 0.0015)
         if isinstance(drive_cost, bool) or not isinstance(drive_cost, (int, float)) or drive_cost < 0:
             raise ScenarioError("drivers.brain_drive_cost must be a number >= 0")
+        margin_eur = d.get("brain_margin_eur", 0.30)
+        if isinstance(margin_eur, bool) or not isinstance(margin_eur, (int, float)) or margin_eur < 0:
+            raise ScenarioError("drivers.brain_margin_eur must be a number >= 0 (EUR)")
+        scale_h = d.get("surplus_scale_hours")
+        if scale_h is not None and (isinstance(scale_h, bool) or not isinstance(scale_h, (int, float)) or scale_h < 0):
+            raise ScenarioError("drivers.surplus_scale_hours must be a number >= 0 (hours of wage), or left out to switch the rule off")
+        time_value = d.get("time_value_per_hour")
+        if time_value is not None and (isinstance(time_value, bool) or not isinstance(time_value, (int, float)) or time_value < 0):
+            raise ScenarioError("drivers.time_value_per_hour must be a number >= 0 (EUR per hour), or left out for the wage target")
         if not isinstance(brains, bool) or not isinstance(brain_bids, bool):
             raise ScenarioError("drivers.brains and drivers.brain_bids must be true or false")
         if brain_bids and not brains:
@@ -403,7 +435,12 @@ class Scenario:
                    else _num(data.get("detour_ratio", DETOUR_RATIO), "detour_ratio", positive=True),
                    patient=bool(data.get("patient", True)),
                    legacy_market=bool(data.get("legacy_market", False)), late_join=bool(data.get("late_join", True)),
-                   brains=brains, brain_bids=brain_bids, brain_drive_cost=float(drive_cost), brain_policy=brain_policy, return_policy=return_policy)
+                   late_invite=bool(data.get("late_invite", True)),
+                   brains=brains, brain_bids=brain_bids, brain_drive_cost=float(drive_cost), brain_policy=brain_policy, return_policy=return_policy,
+                   time_value_per_hour=None if time_value is None else float(time_value),
+                   surplus_scale_hours=None if scale_h is None else float(scale_h), brain_margin_eur=float(margin_eur),
+                   labour_market=_parse_labour(data.get("labour_market")),
+                   lone_margin=_parse_lone_margin(data.get("lone_margin", LONE_BIDDER_MARGIN)))
 
 
 # ---- helpers -------------------------------------------------------------------------------
@@ -640,6 +677,24 @@ _REPO_KEYS = {"demand_threshold", "requests_per_driver", "max_travel", "incentiv
 
 
 _INTER_HUB_KEYS = {"t_heartbeat", "t_failover", "overflow_after", "k_neighbours", "t_overflow_reply"}
+
+
+def _parse_lone_margin(v) -> Optional[float]:
+    if v is None:
+        return None
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0:
+        raise ScenarioError("lone_margin must be a number >= 0 (a lone bidder is paid bid x (1 + margin)) or null (the reserve)")
+    return float(v)
+
+
+def _parse_labour(v) -> Optional[dict]:
+    if v is None or v is False:
+        return None
+    if not isinstance(v, dict):
+        raise ScenarioError("labour_market must be an object (or false / left out for a fixed fleet)")
+    from harness.labour_market import parse_rules
+    parse_rules(v)                                   # validates the keys and ranges
+    return dict(v)
 
 
 def _parse_inter_hub(v) -> Optional[Dict[str, float]]:

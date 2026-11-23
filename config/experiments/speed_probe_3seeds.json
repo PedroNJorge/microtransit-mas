@@ -1,0 +1,30 @@
+{
+ "_note": "Speed check, step 2: speeds 15, 35, 60 on seeds 1-3 (paired by seed). Compare wait_mean, wait_p90, wait_max, wait_after_match_mean with their CIs. About 30 real minutes.",
+ "speed": 15,
+ "seeds": [
+  1,
+  2,
+  3
+ ],
+ "repeats": 1,
+ "arms": {
+  "speed_15": {
+   "scenario": "config/scenarios/07_migrating_demand.json",
+   "set": {
+    "clock.speed": 15
+   }
+  },
+  "speed_35": {
+   "scenario": "config/scenarios/07_migrating_demand.json",
+   "set": {
+    "clock.speed": 35
+   }
+  },
+  "speed_60": {
+   "scenario": "config/scenarios/07_migrating_demand.json",
+   "set": {
+    "clock.speed": 60
+   }
+  }
+ }
+}

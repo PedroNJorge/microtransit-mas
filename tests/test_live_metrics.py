@@ -111,3 +111,18 @@ def test_mover_stats_counts_moves_per_minute_and_their_dispersion():
     assert even["ticks"] == 3 and even["movers"] == 3 and even["dispersion"] == 0.0 and even["share_in_group"] == 0.0
     herd = mover_stats([[10.0, 70.0], [20.0], [30.0], [40.0]])    # four movers in minute 0, one in minute 1
     assert herd["movers"] == 5 and herd["share_in_group"] == 0.8 and herd["dispersion"] > 0
+
+
+def test_driver_income_stats_against_the_wage():
+    from harness.live_metrics import driver_income_stats
+    recs = [dict(revenue=10.0, metres=20000.0, driving_s=1800.0, hours=2.0, trips=3),     # 10 - 0.15*20 = 7 -> 3.5 EUR/h
+            dict(revenue=30.0, metres=10000.0, driving_s=3600.0, hours=2.0, trips=5),     # 30 - 1.5 = 28.5 -> 14.25 EUR/h
+            dict(revenue=0.0, metres=5000.0, driving_s=600.0, hours=2.0, trips=0)]        # nothing earned: -0.75
+    out = driver_income_stats(recs, wage=4.96, per_km=0.15)
+    assert out["driver_income_hour_max"] == pytest.approx(14.25) and out["driver_income_hour_min"] == pytest.approx(-0.375)
+    assert out["driver_wage_share"] == pytest.approx(1 / 3)                         # only the second driver reaches 4.96
+    assert out["fleet_income_hour"] == pytest.approx((7 + 28.5 - 0.75) / 6.0)
+    assert out["driver_trips_zero_share"] == pytest.approx(1 / 3)
+    assert out["driver_utilisation_mean"] == pytest.approx((0.25 + 0.5 + 600 / 7200) / 3)
+    assert 0 < out["driver_income_gini"] < 1
+    assert driver_income_stats([], 4.96, 0.15) == {}

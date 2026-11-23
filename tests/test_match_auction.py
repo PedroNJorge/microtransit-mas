@@ -14,7 +14,7 @@ from agents.microhub import MicrohubAgent
 from agents.payment import PaymentAgent
 from agents.stubs import ScriptedRider, StubDriver
 from common import clock
-from common.ontology import AuctionOutcome, EscrowStatus, FailureReason, MatchResult, Perf, TripRequest
+from common.ontology import DriverState, DriverStatus, AuctionOutcome, EscrowStatus, FailureReason, MatchResult, Perf, TripRequest
 
 from conftest import XMPP_PORT
 
@@ -144,7 +144,7 @@ async def test_unconfirmed_winner_is_skipped_and_cancelled(xmpp_server, sim_cloc
         assert Perf.CANCEL in [p for p, _ in w.drivers[0].inbox]
         assert w.drivers[1].awards and not w.drivers[0].awards
         assert ("AWARDING", "award failed: timeout") in w.trace()
-        assert match.final_fare == pytest.approx(20.0)          # lone remaining bidder pays the reserve
+        assert match.final_fare == pytest.approx(9.9)           # lone remaining bidder: its bid 9.0 + 10 %
 
 
 async def test_refusing_award_moves_to_next_bidder(xmpp_server, sim_clock):
@@ -218,3 +218,48 @@ async def test_hub_still_answers_pings(xmpp_server, sim_clock):
     from harness.ping import ping_agents
     async with World(payment=False) as w:
         assert w.hub.role == "microhub" and w.hub.subscribes_to_traffic
+
+
+# ---- late invitations: a driver who becomes idle while the auction is open is called too -------------------------------
+def _status(jid, state):
+    return DriverStatus(jid, "n00001", state, 4, 0, 1e9, 0.0)
+
+
+async def _flip_idle(w, jid, after):
+    await asyncio.sleep(after)
+    w.hub.registry[jid] = (_status(jid, DriverState.IDLE), clock.now())
+
+
+async def test_a_driver_who_becomes_idle_during_the_auction_is_called_and_wins(xmpp_server, sim_clock):
+    async with World(drivers=({"price": 8.0},), hub_kwargs=dict(t_auction=120.0, late_hold=100.0)) as w:
+        jid = str(w.drivers[0].jid.bare)
+        w.hub.registry[jid] = (_status(jid, DriverState.ON_TRIP), clock.now())     # still finishing a trip: not called
+        w.hub.t_status = 1e6                                                         # keep the entry fresh for the test
+        flip = asyncio.create_task(_flip_idle(w, jid, 0.6))
+        await w.run(timeout=30)
+        await flip
+        assert w.ctx.outcome == "matched"
+        events = [e["event"] for e in w.ctx.trace]
+        assert "late cfp: driver became idle" in events and w.ctx.match.driver_id == jid
+        assert w.ctx.attempt == 0                                                    # no retry was needed
+
+
+async def test_without_late_invitations_that_driver_is_missed_and_the_auction_has_to_retry(xmpp_server, sim_clock):
+    async with World(drivers=({"price": 8.0},), hub_kwargs=dict(t_auction=120.0, late_invite=False, max_attempts=3,
+                                                                retry_delay=2.0)) as w:
+        jid = str(w.drivers[0].jid.bare)
+        w.hub.registry[jid] = (_status(jid, DriverState.ON_TRIP), clock.now())
+        w.hub.t_status = 1e6
+        flip = asyncio.create_task(_flip_idle(w, jid, 0.6))
+        await w.run(timeout=30)
+        await flip
+        assert "late cfp: driver became idle" not in [e["event"] for e in w.ctx.trace]
+        assert any(c.attempt == 0 and not c.bids for c in w.hub.finished)            # the first attempt got no bids
+
+
+async def test_enough_bids_close_the_auction_at_once_without_waiting_for_late_drivers(xmpp_server, sim_clock):
+    async with World(drivers=({"price": 8.0}, {"price": 9.0}), hub_kwargs=dict(late_hold=100.0)) as w:
+        await w.run()
+        closed = [e for e in w.ctx.trace if e["event"] == "bidding closed"][0]
+        opened = [e for e in w.ctx.trace if e["event"] == "cfp sent"][0]
+        assert closed["bids"] == 2 and closed["t"] - opened["t"] < 20.0             # not held for the 100 s hold

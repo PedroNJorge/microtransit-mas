@@ -1,0 +1,40 @@
+{
+ "_note": "Speed probe: one seed of the base 07 scenario (1 sim hour) at several clock speeds. Look at speed_achieved (should stay close to the requested speed) and compare wait_mean, not_completed, profit_per_trip across arms. About 10 real minutes.",
+ "speed": 15,
+ "seeds": [
+  1
+ ],
+ "repeats": 1,
+ "arms": {
+  "speed_15": {
+   "scenario": "config/scenarios/07_migrating_demand.json",
+   "set": {
+    "clock.speed": 15
+   }
+  },
+  "speed_25": {
+   "scenario": "config/scenarios/07_migrating_demand.json",
+   "set": {
+    "clock.speed": 25
+   }
+  },
+  "speed_35": {
+   "scenario": "config/scenarios/07_migrating_demand.json",
+   "set": {
+    "clock.speed": 35
+   }
+  },
+  "speed_50": {
+   "scenario": "config/scenarios/07_migrating_demand.json",
+   "set": {
+    "clock.speed": 50
+   }
+  },
+  "speed_60": {
+   "scenario": "config/scenarios/07_migrating_demand.json",
+   "set": {
+    "clock.speed": 60
+   }
+  }
+ }
+}

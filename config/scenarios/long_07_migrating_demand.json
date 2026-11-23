@@ -1,0 +1,289 @@
+{
+  "name": "long-07-migrating-demand-stay-put",
+  "xmpp": {
+    "host": "localhost",
+    "port": 5222,
+    "server_port": 5269,
+    "password": "dev-password"
+  },
+  "clock": {
+    "speed": 60
+  },
+  "graph": "config/porto_graph.json",
+  "hubs": "all",
+  "duration": 28800.0,
+  "drivers": {
+    "placement": [
+      {
+        "hubs": [
+          "hub_senhora_da_hora",
+          "hub_casa_da_musica"
+        ],
+        "count": 24
+      }
+    ],
+    "return_policy": "none"
+  },
+  "riders": {
+    "count": 90
+  },
+  "demand": [
+    {
+      "id": "west_c1",
+      "hubs": [
+        "hub_senhora_da_hora",
+        "hub_casa_da_musica"
+      ],
+      "start": 0.0,
+      "end": 1200.0,
+      "count": 30,
+      "pattern": "random",
+      "max_fare": 25,
+      "pooling": 1.0
+    },
+    {
+      "id": "centre_c1",
+      "hubs": [
+        "hub_trindade",
+        "hub_aliados",
+        "hub_bolhao",
+        "hub_sao_bento"
+      ],
+      "start": 1200.0,
+      "end": 2400.0,
+      "count": 30,
+      "pattern": "random",
+      "max_fare": 25,
+      "pooling": 1.0
+    },
+    {
+      "id": "east_c1",
+      "hubs": [
+        "hub_campo_24_de_agosto",
+        "hub_campanha"
+      ],
+      "start": 2400.0,
+      "end": 3600.0,
+      "count": 30,
+      "pattern": "random",
+      "max_fare": 25,
+      "pooling": 1.0
+    },
+    {
+      "id": "west_c2",
+      "hubs": [
+        "hub_senhora_da_hora",
+        "hub_casa_da_musica"
+      ],
+      "start": 3600.0,
+      "end": 4800.0,
+      "count": 30,
+      "pattern": "random",
+      "max_fare": 25,
+      "pooling": 1.0
+    },
+    {
+      "id": "centre_c2",
+      "hubs": [
+        "hub_trindade",
+        "hub_aliados",
+        "hub_bolhao",
+        "hub_sao_bento"
+      ],
+      "start": 4800.0,
+      "end": 6000.0,
+      "count": 30,
+      "pattern": "random",
+      "max_fare": 25,
+      "pooling": 1.0
+    },
+    {
+      "id": "east_c2",
+      "hubs": [
+        "hub_campo_24_de_agosto",
+        "hub_campanha"
+      ],
+      "start": 6000.0,
+      "end": 7200.0,
+      "count": 30,
+      "pattern": "random",
+      "max_fare": 25,
+      "pooling": 1.0
+    },
+    {
+      "id": "west_c3",
+      "hubs": [
+        "hub_senhora_da_hora",
+        "hub_casa_da_musica"
+      ],
+      "start": 7200.0,
+      "end": 8400.0,
+      "count": 30,
+      "pattern": "random",
+      "max_fare": 25,
+      "pooling": 1.0
+    },
+    {
+      "id": "centre_c3",
+      "hubs": [
+        "hub_trindade",
+        "hub_aliados",
+        "hub_bolhao",
+        "hub_sao_bento"
+      ],
+      "start": 8400.0,
+      "end": 9600.0,
+      "count": 30,
+      "pattern": "random",
+      "max_fare": 25,
+      "pooling": 1.0
+    },
+    {
+      "id": "east_c3",
+      "hubs": [
+        "hub_campo_24_de_agosto",
+        "hub_campanha"
+      ],
+      "start": 9600.0,
+      "end": 10800.0,
+      "count": 30,
+      "pattern": "random",
+      "max_fare": 25,
+      "pooling": 1.0
+    },
+    {
+      "id": "west_c4",
+      "hubs": [
+        "hub_senhora_da_hora",
+        "hub_casa_da_musica"
+      ],
+      "start": 10800.0,
+      "end": 12000.0,
+      "count": 30,
+      "pattern": "random",
+      "max_fare": 25,
+      "pooling": 1.0
+    },
+    {
+      "id": "centre_c4",
+      "hubs": [
+        "hub_trindade",
+        "hub_aliados",
+        "hub_bolhao",
+        "hub_sao_bento"
+      ],
+      "start": 12000.0,
+      "end": 13200.0,
+      "count": 30,
+      "pattern": "random",
+      "max_fare": 25,
+      "pooling": 1.0
+    },
+    {
+      "id": "east_c4",
+      "hubs": [
+        "hub_campo_24_de_agosto",
+        "hub_campanha"
+      ],
+      "start": 13200.0,
+      "end": 14400.0,
+      "count": 30,
+      "pattern": "random",
+      "max_fare": 25,
+      "pooling": 1.0
+    },
+    {
+      "id": "west_c5",
+      "hubs": [
+        "hub_senhora_da_hora",
+        "hub_casa_da_musica"
+      ],
+      "start": 14400.0,
+      "end": 15600.0,
+      "count": 30,
+      "pattern": "random",
+      "max_fare": 25,
+      "pooling": 1.0
+    },
+    {
+      "id": "centre_c5",
+      "hubs": [
+        "hub_trindade",
+        "hub_aliados",
+        "hub_bolhao",
+        "hub_sao_bento"
+      ],
+      "start": 15600.0,
+      "end": 16800.0,
+      "count": 30,
+      "pattern": "random",
+      "max_fare": 25,
+      "pooling": 1.0
+    },
+    {
+      "id": "east_c5",
+      "hubs": [
+        "hub_campo_24_de_agosto",
+        "hub_campanha"
+      ],
+      "start": 16800.0,
+      "end": 18000.0,
+      "count": 30,
+      "pattern": "random",
+      "max_fare": 25,
+      "pooling": 1.0
+    },
+    {
+      "id": "west_c6",
+      "hubs": [
+        "hub_senhora_da_hora",
+        "hub_casa_da_musica"
+      ],
+      "start": 18000.0,
+      "end": 19200.0,
+      "count": 30,
+      "pattern": "random",
+      "max_fare": 25,
+      "pooling": 1.0
+    },
+    {
+      "id": "centre_c6",
+      "hubs": [
+        "hub_trindade",
+        "hub_aliados",
+        "hub_bolhao",
+        "hub_sao_bento"
+      ],
+      "start": 19200.0,
+      "end": 20400.0,
+      "count": 30,
+      "pattern": "random",
+      "max_fare": 25,
+      "pooling": 1.0
+    },
+    {
+      "id": "east_c6",
+      "hubs": [
+        "hub_campo_24_de_agosto",
+        "hub_campanha"
+      ],
+      "start": 20400.0,
+      "end": 21600.0,
+      "count": 30,
+      "pattern": "random",
+      "max_fare": 25,
+      "pooling": 1.0
+    }
+  ],
+  "environment": {
+    "t_traffic": 60,
+    "full_every": 10
+  },
+  "seed": 42,
+  "payment": {
+    "rider_balance": 100.0,
+    "subsidy_discount": 0.5,
+    "subsidy_budget": null,
+    "hold_max": 7200
+  }
+}

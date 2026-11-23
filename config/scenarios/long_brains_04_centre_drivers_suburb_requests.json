@@ -1,0 +1,114 @@
+{
+  "name": "long-04-centre-drivers-suburb-requests-brains",
+  "xmpp": {
+    "host": "localhost",
+    "port": 5222,
+    "server_port": 5269,
+    "password": "dev-password"
+  },
+  "clock": {
+    "speed": 60
+  },
+  "graph": "config/porto_graph.json",
+  "hubs": "all",
+  "duration": 27600.0,
+  "drivers": {
+    "placement": [
+      {
+        "hubs": {
+          "centre": 2
+        },
+        "count": 24
+      }
+    ],
+    "brains": true
+  },
+  "riders": {
+    "count": 72
+  },
+  "demand": [
+    {
+      "id": "suburb-demand_c1",
+      "hubs": {
+        "periphery": 4
+      },
+      "start": 300.0,
+      "end": 2400.0,
+      "count": 72,
+      "pattern": "random",
+      "max_fare": 25,
+      "pooling": 1.0
+    },
+    {
+      "id": "suburb-demand_c2",
+      "hubs": {
+        "periphery": 4
+      },
+      "start": 3900.0,
+      "end": 6000.0,
+      "count": 72,
+      "pattern": "random",
+      "max_fare": 25,
+      "pooling": 1.0
+    },
+    {
+      "id": "suburb-demand_c3",
+      "hubs": {
+        "periphery": 4
+      },
+      "start": 7500.0,
+      "end": 9600.0,
+      "count": 72,
+      "pattern": "random",
+      "max_fare": 25,
+      "pooling": 1.0
+    },
+    {
+      "id": "suburb-demand_c4",
+      "hubs": {
+        "periphery": 4
+      },
+      "start": 11100.0,
+      "end": 13200.0,
+      "count": 72,
+      "pattern": "random",
+      "max_fare": 25,
+      "pooling": 1.0
+    },
+    {
+      "id": "suburb-demand_c5",
+      "hubs": {
+        "periphery": 4
+      },
+      "start": 14700.0,
+      "end": 16800.0,
+      "count": 72,
+      "pattern": "random",
+      "max_fare": 25,
+      "pooling": 1.0
+    },
+    {
+      "id": "suburb-demand_c6",
+      "hubs": {
+        "periphery": 4
+      },
+      "start": 18300.0,
+      "end": 20400.0,
+      "count": 72,
+      "pattern": "random",
+      "max_fare": 25,
+      "pooling": 1.0
+    }
+  ],
+  "environment": {
+    "t_traffic": 60,
+    "full_every": 10
+  },
+  "seed": 42,
+  "payment": {
+    "rider_balance": 100.0,
+    "subsidy_discount": 0.5,
+    "subsidy_budget": null,
+    "hold_max": 7200
+  }
+}

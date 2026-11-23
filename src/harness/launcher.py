@@ -7,6 +7,7 @@ Start every agent of a scenario, keep them running, stop them cleanly.
     python -m harness.launcher --check                 # start, ping everyone, print table, stop
     python -m harness.launcher --run-for 30            # stop by itself after 30 real seconds
     python -m harness.launcher --no-server             # use an XMPP server you started yourself
+    python -m harness.launcher --open                  # also open the viewer page in the browser
 
 XMPP server: if nothing listens on xmpp.port the launcher starts SPADE's server with a temporary
 database file (`python -m spade.cli run --db ...`) and stops it on exit. Pass --no-server to disable that.
@@ -18,17 +19,22 @@ The simulation clock is started once, right before the first agent (t = 0).
 import argparse
 import asyncio
 import logging
+import os
 import signal
 import shutil
 import socket
 import sys
 import tempfile
+import webbrowser
+from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
 from agents.base_agent import BaseAgent
 from agents.registry import AGENT_CLASSES
 from common import clock
-from common.settings import MAX_PICKUP_ETA, RESERVE_MARGIN, RETRY_DELAY, WINDOW_SLACK
+from common.auction import AuctionRules
+from common.settings import (AUCTION_PRICING, LONE_BIDDER_MARGIN, MAX_PICKUP_ETA, RESERVE_MARGIN, RETRY_DELAY,
+                             VALUE_OF_DETOUR, VALUE_OF_REPUTATION, VALUE_OF_TIME, WINDOW_SLACK)
 from common.graph import TransitNetwork
 from common.ws_server import start_ws_server
 from harness.active import clear_active, write_active
@@ -61,6 +67,8 @@ class Harness:
         self._ws_server = None
         self.metrics: Optional[MetricsCollector] = None  # live metrics for the viewer (harness/live_metrics.py)
         self.runner: Optional[ScenarioRunner] = None    # plays the scenario's demand / events / forecasts
+        self.market_log: list = []                      # (sim time, "exit"|"enter", driver, fleet after) of the labour market
+        self._labour = None
 
     # ---- XMPP server -----------------------------------------------------------------
     async def ensure_server(self, wait: float = 20.0) -> None:
@@ -147,9 +155,12 @@ class Harness:
         if spec.role == "microhub" and sc.inter_hub is not None and len(hubs) > 1:
             opts = {k: (int(v) if k in ("overflow_after", "k_neighbours") else v) for k, v in sc.inter_hub.items()}
             kwargs.update(peer_jids={x.name: x.jid for x in hubs if x.jid != spec.jid}, **opts)
+        if spec.role == "microhub" and sc.lone_margin != LONE_BIDDER_MARGIN:
+            kwargs["rules"] = AuctionRules(pricing=AUCTION_PRICING, value_of_time=VALUE_OF_TIME, value_of_detour=VALUE_OF_DETOUR,
+                                           value_of_reputation=VALUE_OF_REPUTATION, lone_margin=sc.lone_margin)
         if spec.role == "microhub":
             kwargs.update(
-                t_pool=sc.t_pool, pool_incentive_per_kg=sc.pool_incentive_per_kg, late_join=sc.late_join, **market_settings(sc),
+                t_pool=sc.t_pool, pool_incentive_per_kg=sc.pool_incentive_per_kg, late_join=sc.late_join, late_invite=sc.late_invite, **market_settings(sc),
                 network=self.network, payment_jid=sc.jid("payment"), reputation_jid=sc.jid("reputation"),
                 regulator_jid=sc.jid("regulator"), driver_jids=[s.jid for s in sc.roster() if s.role == "driver"])
         if spec.role not in AGENT_CLASSES:
@@ -161,7 +172,8 @@ class Harness:
         await self.ensure_server()
         self.network = TransitNetwork.from_file(str(sc.graph_path))
         if self.viewer:
-            self._ws_server = await start_ws_server()   # <-- Liga o WebSocket na porta 8765
+            ws_host = os.environ.get("MAS_WS_HOST")        # "0.0.0.0" inside a container, so the host's browser can connect
+            self._ws_server = await (start_ws_server(host=ws_host) if ws_host else start_ws_server())   # port 8765
         clock.start(sc.speed)
         try:
             for spec in sc.roster():
@@ -176,6 +188,11 @@ class Harness:
             self.runner.start()
         self.metrics = MetricsCollector(self, broadcast=self.viewer)
         self.metrics.start()
+        if sc.labour_market is not None:
+            from harness import labour_market
+            self._labour = asyncio.create_task(labour_market.run(self, labour_market.parse_rules(sc.labour_market), sc.seed))
+            self._labour.add_done_callback(lambda t: t.cancelled() or t.exception() is None or logger.error(
+                "labour market stopped with an error: %r", t.exception(), exc_info=t.exception()))
         self._health = asyncio.create_task(self._watch_health())
         logger.info("Scenario %r up: %d agents", sc.name, len(self.agents))
 
@@ -203,6 +220,9 @@ class Harness:
                             dict(riders) or "none", dict(drivers))
 
     async def stop(self) -> None:
+        if self._labour is not None:
+            self._labour.cancel()
+            self._labour = None
         health = getattr(self, "_health", None)
         if health is not None:
             health.cancel()
@@ -333,6 +353,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--run-for", type=float, default=None, help="stop after N real seconds")
     ap.add_argument("--no-server", action="store_true", help="never start an XMPP server")
     ap.add_argument("--timeout", type=float, default=10.0, help="ping timeout, real seconds")
+    ap.add_argument("--open", action="store_true", help="open the viewer (porto_graph_map.html) in the default browser; the page "
+                    "reconnects by itself, so a tab left open also follows the next scenario")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args(argv)
     try:
@@ -342,6 +364,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.WARNING,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     logger.setLevel(logging.INFO)                       # the launcher's own lines: server log path, heartbeat, "scenario up"
+    if args.open:
+        viewer = Path(__file__).resolve().parents[2] / "porto_graph_map.html"
+        if viewer.exists():
+            webbrowser.open(viewer.as_uri())
+        else:
+            print(f"--open: {viewer} not found", file=sys.stderr)
     try:
         scenario = Scenario.load(args.scenario)
     except ScenarioError as e:

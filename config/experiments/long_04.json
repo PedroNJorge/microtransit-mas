@@ -1,0 +1,30 @@
+{
+  "_note": "6 cycles of the base scenario (about 6 sim hours, 25-30 real minutes per run at speed 15). tv0 = drivers value their own time at 0 EUR/h in a bid (km cost only); the others use the wage target.",
+  "speed": 15,
+  "seeds": [
+    1,
+    2,
+    3
+  ],
+  "repeats": 1,
+  "arms": {
+    "no_brain": {
+      "scenario": "config/scenarios/long_04_centre_drivers_suburb_requests.json"
+    },
+    "no_brain_tv0": {
+      "scenario": "config/scenarios/long_04_centre_drivers_suburb_requests.json",
+      "set": {
+        "drivers.time_value_per_hour": 0
+      }
+    },
+    "signal": {
+      "scenario": "config/scenarios/long_brains_04_centre_drivers_suburb_requests.json"
+    },
+    "signal_tv0": {
+      "scenario": "config/scenarios/long_brains_04_centre_drivers_suburb_requests.json",
+      "set": {
+        "drivers.time_value_per_hour": 0
+      }
+    }
+  }
+}
